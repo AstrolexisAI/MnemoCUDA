@@ -149,6 +149,7 @@ typedef struct {
     int *cache_layer;            // [expert_cache_slots]
     int *cache_expert;           // [expert_cache_slots]
     uint64_t *cache_lru;         // [expert_cache_slots] — access counter for LRU
+    uint32_t *cache_hits;        // [expert_cache_slots] — hit count for frequency scoring
     uint64_t cache_clock;        // Global clock for LRU
     bool *cache_pinned;          // [expert_cache_slots] — true = hot expert, don't evict
 
@@ -913,6 +914,14 @@ struct MnemoCudaCtx {
     uint64_t heat_total_tokens;  // Total tokens processed (for normalization)
     bool heat_pinning_active;    // Whether hot experts are pinned in cache
 
+    // Per-layer cache stats
+    uint32_t *layer_hits;        // [num_hidden_layers] cache hits per layer
+    uint32_t *layer_misses;      // [num_hidden_layers] cache misses per layer
+
+    // Current token's activated experts (for cross-layer prefetch correlation)
+    int last_activated[16];      // Expert IDs from the current layer's routing
+    int n_last_activated;        // Count
+
     // State
     volatile bool cancelled;
     bool loaded;
@@ -1334,6 +1343,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         gpu->cache_layer = NULL;
         gpu->cache_expert = NULL;
         gpu->cache_lru = NULL;
+        gpu->cache_hits = NULL;
         gpu->cache_pinned = NULL;
         gpu->cache_clock = 0;
 
@@ -1374,6 +1384,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
                 gpu->cache_layer = (int *)calloc(gpu->expert_cache_slots, sizeof(int));
                 gpu->cache_expert = (int *)calloc(gpu->expert_cache_slots, sizeof(int));
                 gpu->cache_lru = (uint64_t *)calloc(gpu->expert_cache_slots, sizeof(uint64_t));
+                gpu->cache_hits = (uint32_t *)calloc(gpu->expert_cache_slots, sizeof(uint32_t));
                 gpu->cache_pinned = (bool *)calloc(gpu->expert_cache_slots, sizeof(bool));
                 for (int s = 0; s < gpu->expert_cache_slots; s++) {
                     gpu->cache_layer[s] = -1;
@@ -1399,6 +1410,9 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
     ctx->heat_map = (uint32_t *)calloc(heat_size, sizeof(uint32_t));
     ctx->heat_total_tokens = 0;
     ctx->heat_pinning_active = false;
+    ctx->layer_hits = (uint32_t *)calloc(cfg->num_hidden_layers, sizeof(uint32_t));
+    ctx->layer_misses = (uint32_t *)calloc(cfg->num_hidden_layers, sizeof(uint32_t));
+    ctx->n_last_activated = 0;
 
     // Try to load saved heat map from previous sessions
     {
@@ -1463,6 +1477,7 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
         free(gpu->cache_layer);
         free(gpu->cache_expert);
         free(gpu->cache_lru);
+        free(gpu->cache_hits);
         free(gpu->cache_pinned);
 
         cudaStreamDestroy(gpu->stream_compute);
@@ -1490,6 +1505,8 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
 
     free(ctx->heat_map);
     ctx->heat_map = NULL;
+    free(ctx->layer_hits);
+    free(ctx->layer_misses);
 
     tokenizer_free(ctx->tokenizer);
     ctx->tokenizer = NULL;
@@ -1558,29 +1575,62 @@ static void prefetch_submit(MnemoCudaCtx *ctx, GPUState *gpu, int layer) {
     ExpertLayerFile *elf = &ctx->expert_layers[layer];
     if (elf->fd <= 0 && !elf->mmap_data) return;
 
-    // Find top K hot experts for this layer that are NOT in VRAM cache
+    // Adaptive prefetch count: fetch MORE for layers with low hit rate
+    int max_prefetch = K; // default: K experts
+    if (ctx->layer_hits && ctx->layer_misses) {
+        uint32_t lh = ctx->layer_hits[layer];
+        uint32_t lm = ctx->layer_misses[layer];
+        if (lh + lm > 20) { // enough data to judge
+            float hit_rate = (float)lh / (float)(lh + lm);
+            if (hit_rate < 0.80f) max_prefetch = K * 2; // aggressive for bad layers
+            if (hit_rate < 0.70f) max_prefetch = K * 3; // very aggressive
+        }
+    }
+    if (max_prefetch > 16) max_prefetch = 16; // cap at buffer size
+    if (max_prefetch > IO_POOL_SIZE) max_prefetch = IO_POOL_SIZE;
+
+    // Score each non-cached expert: heat + cross-layer correlation
     uint32_t *layer_heat = &ctx->heat_map[layer * NE];
     int n_to_prefetch = 0;
 
-    // Build candidates sorted by heat (simple: pick top K non-cached)
-    for (int pass = 0; pass < K && n_to_prefetch < K; pass++) {
-        uint32_t best = 0;
-        int best_eid = -1;
-        for (int e = 0; e < NE; e++) {
-            if (layer_heat[e] <= best) continue;
-            // Skip if already selected
-            int dup = 0;
-            for (int p = 0; p < n_to_prefetch; p++)
-                if (gpu->prefetch_eids[p] == e) { dup = 1; break; }
-            if (dup) continue;
-            // Skip if already in VRAM cache (no LRU bump)
-            if (expert_cache_has(gpu, layer, e)) continue;
-            best = layer_heat[e];
-            best_eid = e;
+    // Build candidates with composite scoring
+    typedef struct { int eid; float score; } PrefetchCandidate;
+    PrefetchCandidate candidates[16];
+    int n_candidates = 0;
+
+    for (int e = 0; e < NE && n_candidates < 16; e++) {
+        if (expert_cache_has(gpu, layer, e)) continue;
+        if (layer_heat[e] == 0) continue;
+
+        float score = (float)layer_heat[e]; // base: heat
+
+        // Cross-layer boost: if this expert_id was active in the previous layer,
+        // boost its score (experts with same ID tend to co-activate across layers)
+        for (int a = 0; a < ctx->n_last_activated; a++) {
+            if (ctx->last_activated[a] == e) {
+                score *= 2.0f; // 2x boost for cross-layer correlation
+                break;
+            }
         }
-        if (best_eid < 0 || best == 0) break;
-        gpu->prefetch_eids[n_to_prefetch++] = best_eid;
+
+        candidates[n_candidates].eid = e;
+        candidates[n_candidates].score = score;
+        n_candidates++;
     }
+
+    // Sort candidates by score descending (simple insertion sort, n_candidates <= 16)
+    for (int i = 1; i < n_candidates; i++) {
+        PrefetchCandidate tmp = candidates[i];
+        int j = i - 1;
+        while (j >= 0 && candidates[j].score < tmp.score) {
+            candidates[j + 1] = candidates[j]; j--;
+        }
+        candidates[j + 1] = tmp;
+    }
+
+    // Pick top max_prefetch
+    for (int i = 0; i < n_candidates && n_to_prefetch < max_prefetch; i++)
+        gpu->prefetch_eids[n_to_prefetch++] = candidates[i].eid;
 
     if (n_to_prefetch == 0) {
         gpu->prefetch_layer = -1;
@@ -1635,6 +1685,7 @@ static void *expert_cache_lookup(GPUState *gpu, int layer, int expert_id) {
     for (int s = 0; s < gpu->expert_cache_slots; s++) {
         if (gpu->cache_layer[s] == layer && gpu->cache_expert[s] == expert_id) {
             gpu->cache_lru[s] = ++gpu->cache_clock;
+            if (gpu->cache_hits) gpu->cache_hits[s]++;
             return (char *)gpu->d_expert_cache + (size_t)s * gpu->expert_slot_size;
         }
     }
@@ -1660,13 +1711,28 @@ static void *expert_cache_insert_ctx(struct MnemoCudaCtx *ctx, GPUState *gpu,
                                       cudaStream_t stream) {
     if (!gpu->d_expert_cache || gpu->expert_cache_slots == 0) return NULL;
 
-    // Find empty slot or LRU slot (skip pinned slots)
+    // Find empty slot or slot with lowest composite score (skip pinned)
+    // Score = α·recency + β·frequency + γ·heat — evict the LOWEST score
     int target = -1;
-    uint64_t min_lru = UINT64_MAX;
+    double min_score = 1e30;
     for (int s = 0; s < gpu->expert_cache_slots; s++) {
         if (gpu->cache_layer[s] == -1) { target = s; break; } // empty
         if (gpu->cache_pinned && gpu->cache_pinned[s]) continue; // pinned — don't evict
-        if (gpu->cache_lru[s] < min_lru) { min_lru = gpu->cache_lru[s]; target = s; }
+
+        // Composite eviction score: lower = more evictable
+        double recency = (double)gpu->cache_lru[s] / (double)(gpu->cache_clock + 1);
+        double frequency = gpu->cache_hits ? (double)gpu->cache_hits[s] : 0;
+        double heat = 0;
+        if (ctx && ctx->heat_map && gpu->cache_layer[s] >= 0) {
+            int NE = ctx->config.num_experts;
+            heat = (double)ctx->heat_map[gpu->cache_layer[s] * NE + gpu->cache_expert[s]];
+        }
+        // Normalize frequency and heat to [0,1] range roughly
+        double norm_freq = frequency / (frequency + 10.0);  // saturates at ~1.0
+        double norm_heat = heat / (heat + 100.0);            // saturates at ~1.0
+
+        double score = 0.5 * recency + 0.3 * norm_freq + 0.2 * norm_heat;
+        if (score < min_score) { min_score = score; target = s; }
     }
     if (target < 0) return NULL; // all slots pinned, can't evict
 
@@ -1695,6 +1761,7 @@ static void *expert_cache_insert_ctx(struct MnemoCudaCtx *ctx, GPUState *gpu,
     gpu->cache_layer[target] = layer;
     gpu->cache_expert[target] = expert_id;
     gpu->cache_lru[target] = ++gpu->cache_clock;
+    if (gpu->cache_hits) gpu->cache_hits[target] = 0; // reset frequency for new entry
 
     void *slot = (char *)gpu->d_expert_cache + (size_t)target * gpu->expert_slot_size;
     cudaMemcpyAsync(slot, host_data, data_size, cudaMemcpyHostToDevice, stream);
@@ -1950,6 +2017,7 @@ static void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
         void *cached = expert_cache_lookup(gpu, layer, eid);
         if (cached) {
             total_hits++;
+            if (ctx->layer_hits) ctx->layer_hits[layer]++;
             hit_ptrs[n_hits] = cached;
             hit_weights[n_hits++] = expert_weights_h[e];
             continue;
@@ -1988,14 +2056,22 @@ static void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
         // Level 4: NVMe miss — must read from disk
         miss_eids[n_misses] = eid;
         miss_weights[n_misses++] = expert_weights_h[e];
-
-        if (total_lookups % 5000 == 0)
-            fprintf(stderr, "[MnemoCUDA] L1(VRAM):%d L2(prefetch):%d L3(RAM):%d L4(NVMe):%d / %d (%.0f%% hit)\n",
-                    total_hits - total_prefetch_hits - total_ram_hits,
-                    total_prefetch_hits, total_ram_hits,
-                    total_lookups - total_hits,
-                    total_lookups, 100.0 * total_hits / total_lookups);
+        if (ctx->layer_misses) ctx->layer_misses[layer]++;
     }
+
+    // Save activated experts for cross-layer prefetch correlation
+    ctx->n_last_activated = 0;
+    for (int e = 0; e < K && e < 16; e++) {
+        if (expert_indices[e] >= 0 && expert_indices[e] < NE)
+            ctx->last_activated[ctx->n_last_activated++] = expert_indices[e];
+    }
+
+    if (total_lookups % 5000 == 0)
+        fprintf(stderr, "[MnemoCUDA] L1:%d L2(pf):%d L3(ram):%d L4(nvme):%d / %d (%.0f%% hit)\n",
+                total_hits - total_prefetch_hits - total_ram_hits,
+                total_prefetch_hits, total_ram_hits,
+                total_lookups - total_hits,
+                total_lookups, 100.0 * total_hits / total_lookups);
 
     // ── Upload RAM-hit experts to VRAM (fast: pinned → device DMA) ──
     for (int r = 0; r < n_ram_hits; r++) {
@@ -2660,6 +2736,34 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
             tokens_generated, total_secs, ctx->stats.tokens_per_second,
             (t_gen_start.tv_sec - t_start.tv_sec) +
             (t_gen_start.tv_nsec - t_start.tv_nsec) / 1e9);
+
+    // Per-layer cache stats — show worst 5 layers
+    if (ctx->layer_hits && ctx->layer_misses) {
+        int NL = cfg->num_hidden_layers;
+        // Find worst layers by hit rate
+        int worst[5] = {-1,-1,-1,-1,-1};
+        for (int w = 0; w < 5 && w < NL; w++) {
+            float worst_rate = 2.0f;
+            for (int l = 0; l < NL; l++) {
+                uint32_t total = ctx->layer_hits[l] + ctx->layer_misses[l];
+                if (total < 10) continue;
+                float rate = (float)ctx->layer_hits[l] / (float)total;
+                // Skip if already in worst list
+                int dup = 0;
+                for (int p = 0; p < w; p++) if (worst[p] == l) { dup = 1; break; }
+                if (dup) continue;
+                if (rate < worst_rate) { worst_rate = rate; worst[w] = l; }
+            }
+        }
+        fprintf(stderr, "[MnemoCUDA] Worst layers by hit rate:");
+        for (int w = 0; w < 5 && worst[w] >= 0; w++) {
+            int l = worst[w];
+            uint32_t t = ctx->layer_hits[l] + ctx->layer_misses[l];
+            fprintf(stderr, " L%d=%.0f%%", l,
+                    t > 0 ? 100.0 * ctx->layer_hits[l] / t : 0);
+        }
+        fprintf(stderr, "\n");
+    }
 
     free(tokens);
     free(h_logits);

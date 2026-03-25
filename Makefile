@@ -1,8 +1,8 @@
 NVCC ?= nvcc
-CC ?= gcc
+CC ?= gcc-14
 CUDA_HOME ?= /usr/local/cuda
 CFLAGS = -O2 -Wall -Isrc -I$(CUDA_HOME)/include
-NVCCFLAGS = -O2 --use_fast_math
+NVCCFLAGS = -O2 --use_fast_math -ccbin=/usr/bin/g++-14
 LDFLAGS = -L$(CUDA_HOME)/lib64 -lcudart -lpthread -lm
 
 # Auto-detect GPU architecture (default sm_75 for broad compat)
