@@ -379,17 +379,39 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "[MnemoCUDA] %s\n", mnemo_cuda_get_info(ctx));
 
-    // Pre-warm caches: run a short generation to fill VRAM cache + page cache
+    // Pre-warm caches: multi-round diverse prompts to fill VRAM + page cache.
+    // Different topics activate different experts — diverse warmup = better coverage.
     {
-        fprintf(stderr, "[MnemoCUDA] Warming caches...\n");
+        fprintf(stderr, "[MnemoCUDA] Warming caches (multi-round)...\n");
         struct timespec tw0, tw1;
         clock_gettime(CLOCK_MONOTONIC, &tw0);
-        OutputCtx warmup_out = { .fd = -1, .buf = malloc(4096), .buf_len = 0, .buf_cap = 4096 };
-        mnemo_cuda_generate(ctx, "Hello, how are you?", 3, 0.0, on_token, &warmup_out);
+        OutputCtx warmup_out = { .fd = -1, .buf = malloc(16384), .buf_len = 0, .buf_cap = 16384 };
+
+        const char *warmup_prompts[] = {
+            "Hello, how are you today?",
+            "Explain quantum physics briefly.",
+            "Escribe un poema corto en español sobre el mar.",
+            "def fibonacci(n):\n    if n <= 1: return n\n    return",
+            "What is the capital of France and why is it important?",
+            "Describe the solar system and its planets.",
+            NULL
+        };
+        int warmup_tokens[] = { 20, 30, 30, 20, 20, 30 };
+        int n_rounds = 0;
+
+        for (int i = 0; warmup_prompts[i]; i++) {
+            warmup_out.buf_len = 0;
+            warmup_out.buf[0] = '\0';
+            n_rounds++;
+            fprintf(stderr, "[MnemoCUDA] Warm-up %d/6...\n", n_rounds);
+            mnemo_cuda_generate(ctx, warmup_prompts[i], warmup_tokens[i], 0.0,
+                                on_token, &warmup_out);
+        }
+
         clock_gettime(CLOCK_MONOTONIC, &tw1);
         double warm_secs = (tw1.tv_sec - tw0.tv_sec) + (tw1.tv_nsec - tw0.tv_nsec) / 1e9;
-        MnemoCudaStats ws = mnemo_cuda_get_stats(ctx);
-        fprintf(stderr, "[MnemoCUDA] Warm-up done in %.1fs (cache ready)\n", warm_secs);
+        fprintf(stderr, "[MnemoCUDA] Warm-up done in %.1fs (%d rounds, cache hot)\n",
+                warm_secs, n_rounds);
         free(warmup_out.buf);
     }
 
