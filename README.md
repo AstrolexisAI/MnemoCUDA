@@ -1,4 +1,5 @@
 # MnemoCUDA
+> **Experimental** — Active research project by [AstroLexis](https://github.com/AstrolexisAI). API may change.
 
 **Expert streaming inference engine for MoE models larger than VRAM.**
 
@@ -226,6 +227,16 @@ MnemoCUDA/
 | vLLM | ✅ (needs 8× A100) | ❌ | ❌ |
 | Ollama | ❌ (needs full VRAM) | ✅ | ❌ |
 | ktransformers | ✅ | ✅ | ✅ Basic offloading |
+
+## Known Limitations
+
+- **Cold start is slow**: first prompt after loading processes at ~1 tok/s while VRAM cache fills. Subsequent prompts improve as cache warms up.
+- **NVMe speed is critical**: on SATA SSDs or slow NVMe (<2 GB/s), performance degrades significantly. PCIe 4.0+ NVMe recommended.
+- **Single-token generation only**: no batch prefill or parallel token processing yet. TTFT scales linearly with prompt length.
+- **Memory pressure**: large models with 8K+ context consume significant VRAM for KV cache, leaving less room for expert cache slots. Reduce context length for higher cache hit rates.
+- **No speculative decoding**: self-speculative (same model, fewer experts) doesn't help in single-engine setups. Requires separate draft model on separate hardware.
+- **Linux only**: relies on mmap, pread, pthreads, and CUDA. No Windows or macOS support.
+- **Experimental**: this is an active research project. API and file formats may change between versions.
 
 ## License
 
