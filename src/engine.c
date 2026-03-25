@@ -153,6 +153,10 @@ typedef struct {
     uint64_t cache_clock;        // Global clock for LRU
     bool *cache_pinned;          // [expert_cache_slots] — true = hot expert, don't evict
 
+    // Allocation method tracking (for correct free)
+    bool expert_buf_pinned;      // true = cudaMallocHost, false = malloc
+    bool prefetch_buf_pinned;
+
     // Prefetch buffer for next-layer prediction
     void *h_prefetch_buf;        // Pinned host buffer for speculative reads
     size_t prefetch_buf_size;
@@ -1309,7 +1313,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         cudaMalloc((void**)&gpu->d_expert_up,   EFF * sizeof(float));
         cudaMalloc((void**)&gpu->d_expert_act,  EFF * sizeof(float));
         cudaMalloc((void**)&gpu->d_expert_out,  H * sizeof(float));
-        cudaMalloc((void**)&gpu->d_moe_out,     H * K * sizeof(float));
+        cudaMalloc((void**)&gpu->d_moe_out,     (size_t)H * K * sizeof(float));
 
         // Logits only on last GPU
         if (g == ctx->n_gpus - 1)
@@ -1317,6 +1321,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
 
         // Expert I/O buffer (pinned host, K experts for parallel pread)
         gpu->expert_buf_size = max_expert_sz * K;
+        gpu->expert_buf_pinned = config.use_pinned_memory;
         if (config.use_pinned_memory)
             cudaMallocHost(&gpu->h_expert_buf, gpu->expert_buf_size);
         else
@@ -1349,6 +1354,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
 
         // Prefetch buffer — holds up to K experts for speculative next-layer reads
         gpu->prefetch_buf_size = max_expert_sz * K;
+        gpu->prefetch_buf_pinned = config.use_pinned_memory;
         if (config.use_pinned_memory)
             cudaMallocHost(&gpu->h_prefetch_buf, gpu->prefetch_buf_size);
         else
@@ -1406,7 +1412,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         memset(&ctx->ram_cache, 0, sizeof(ctx->ram_cache));
 
     // Expert heat profiling — allocate and zero (or load from disk)
-    int heat_size = cfg->num_hidden_layers * cfg->num_experts;
+    size_t heat_size = (size_t)cfg->num_hidden_layers * cfg->num_experts;
     ctx->heat_map = (uint32_t *)calloc(heat_size, sizeof(uint32_t));
     ctx->heat_total_tokens = 0;
     ctx->heat_pinning_active = false;
@@ -1472,8 +1478,14 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
         cudaFree(gpu->d_expert_buf);
         cudaFree(gpu->d_expert_cache);
 
-        if (gpu->h_expert_buf) cudaFreeHost(gpu->h_expert_buf);
-        if (gpu->h_prefetch_buf) cudaFreeHost(gpu->h_prefetch_buf);
+        if (gpu->h_expert_buf) {
+            if (gpu->expert_buf_pinned) cudaFreeHost(gpu->h_expert_buf);
+            else free(gpu->h_expert_buf);
+        }
+        if (gpu->h_prefetch_buf) {
+            if (gpu->prefetch_buf_pinned) cudaFreeHost(gpu->h_prefetch_buf);
+            else free(gpu->h_prefetch_buf);
+        }
         free(gpu->cache_layer);
         free(gpu->cache_expert);
         free(gpu->cache_lru);

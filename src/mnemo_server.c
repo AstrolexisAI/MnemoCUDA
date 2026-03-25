@@ -44,11 +44,11 @@ static void on_token(const char *text, bool is_done, void *userdata) {
     if (text && text[0]) {
         if (out->fd >= 0) {
             // HTTP SSE: data: {"token": "..."}\n\n
-            char sse[1024];
-            // Escape JSON
-            char escaped[512];
+            char sse[2048];
+            // Escape JSON — each char can expand to 2, so need 2x + margin
+            char escaped[1024];
             int j = 0;
-            for (int i = 0; text[i] && j < 500; i++) {
+            for (int i = 0; text[i] && j < (int)sizeof(escaped) - 2; i++) {
                 if (text[i] == '"') { escaped[j++] = '\\'; escaped[j++] = '"'; }
                 else if (text[i] == '\\') { escaped[j++] = '\\'; escaped[j++] = '\\'; }
                 else if (text[i] == '\n') { escaped[j++] = '\\'; escaped[j++] = 'n'; }
@@ -59,7 +59,8 @@ static void on_token(const char *text, bool is_done, void *userdata) {
             int n = snprintf(sse, sizeof(sse),
                 "data: {\"token\":\"%s\",\"done\":%s}\n\n",
                 escaped, is_done ? "true" : "false");
-            write(out->fd, sse, n);
+            if (n > 0 && n < (int)sizeof(sse))
+                write(out->fd, sse, n);
         } else {
             printf("%s", text);
             fflush(stdout);
@@ -69,11 +70,15 @@ static void on_token(const char *text, bool is_done, void *userdata) {
         int tlen = strlen(text);
         while (out->buf_len + tlen + 1 > out->buf_cap) {
             out->buf_cap *= 2;
-            out->buf = realloc(out->buf, out->buf_cap);
+            void *new_buf = realloc(out->buf, out->buf_cap);
+            if (!new_buf) { out->buf_cap /= 2; break; } // OOM: stop accumulating
+            out->buf = new_buf;
         }
-        memcpy(out->buf + out->buf_len, text, tlen);
-        out->buf_len += tlen;
-        out->buf[out->buf_len] = '\0';
+        if (out->buf_len + tlen + 1 <= out->buf_cap) {
+            memcpy(out->buf + out->buf_len, text, tlen);
+            out->buf_len += tlen;
+            out->buf[out->buf_len] = '\0';
+        }
     }
 
     if (is_done) {
@@ -302,11 +307,17 @@ static void run_http(MnemoCudaCtx *ctx, int port) {
             generate(ctx, prompt, temperature, max_tokens, &out);
 
             MnemoCudaStats stats = mnemo_cuda_get_stats(ctx);
-            char response[65536];
-            // Escape the output for JSON
-            char escaped[65536];
+            // Escape output for JSON — allocate based on actual output size
+            int out_len = out.buf_len;
+            int esc_cap = out_len * 2 + 256; // worst case: every char escapes to 2
+            char *escaped = malloc(esc_cap);
+            char *response = malloc(esc_cap + 128);
+            if (!escaped || !response) {
+                free(escaped); free(response);
+                close(client_fd); continue;
+            }
             int j = 0;
-            for (int i = 0; out.buf[i] && j < 65000; i++) {
+            for (int i = 0; i < out_len && j < esc_cap - 2; i++) {
                 if (out.buf[i] == '"') { escaped[j++] = '\\'; escaped[j++] = '"'; }
                 else if (out.buf[i] == '\\') { escaped[j++] = '\\'; escaped[j++] = '\\'; }
                 else if (out.buf[i] == '\n') { escaped[j++] = '\\'; escaped[j++] = 'n'; }
@@ -315,7 +326,7 @@ static void run_http(MnemoCudaCtx *ctx, int port) {
             }
             escaped[j] = '\0';
 
-            int rlen = snprintf(response, sizeof(response),
+            int rlen = snprintf(response, esc_cap + 128,
                 "{\"text\":\"%s\",\"tokens\":%d,\"tok_per_sec\":%.1f}",
                 escaped, stats.tokens_generated, stats.tokens_per_second);
 
@@ -328,6 +339,8 @@ static void run_http(MnemoCudaCtx *ctx, int port) {
                 "Connection: close\r\n\r\n", rlen);
             write(client_fd, hdr, hlen);
             write(client_fd, response, rlen);
+            free(escaped);
+            free(response);
         }
 
         close(client_fd);
