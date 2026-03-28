@@ -920,13 +920,21 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
 
         cudaStreamDestroy(gpu->stream_compute);
         cudaStreamDestroy(gpu->stream_io);
+
+        // Zero the entire GPUState so a second unload() is safe
+        memset(gpu, 0, sizeof(GPUState));
     }
+    ctx->n_gpus = 0;
 
     if (ctx->h_resident_mmap) {
         munmap(ctx->h_resident_mmap, ctx->resident_size);
         ctx->h_resident_mmap = NULL;
+        ctx->resident_size = 0;
     }
-    if (ctx->h_hidden_transfer) cudaFreeHost(ctx->h_hidden_transfer);
+    if (ctx->h_hidden_transfer) {
+        cudaFreeHost(ctx->h_hidden_transfer);
+        ctx->h_hidden_transfer = NULL;
+    }
 
     if (ctx->expert_layers) {
         for (int i = 0; i < ctx->config.num_hidden_layers; i++) {
@@ -936,6 +944,7 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
                 close(ctx->expert_layers[i].fd);
         }
         free(ctx->expert_layers);
+        ctx->expert_layers = NULL;
     }
 
     free(ctx->tensor_table.entries);
@@ -946,7 +955,9 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
     free(ctx->heat_map);
     ctx->heat_map = NULL;
     free(ctx->layer_hits);
+    ctx->layer_hits = NULL;
     free(ctx->layer_misses);
+    ctx->layer_misses = NULL;
 
     tokenizer_free(ctx->tokenizer);
     ctx->tokenizer = NULL;
