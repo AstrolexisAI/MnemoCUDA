@@ -123,7 +123,8 @@ static void prefetch_submit(MnemoCudaCtx *ctx, GPUState *gpu, int layer) {
         }
     }
     if (max_prefetch > 16) max_prefetch = 16; // cap at buffer size
-    if (max_prefetch > IO_POOL_SIZE) max_prefetch = IO_POOL_SIZE;
+    int pool_sz = io_pool_size();
+    if (pool_sz > 0 && max_prefetch > pool_sz) max_prefetch = pool_sz;
 
     // Score each non-cached expert: heat + cross-layer correlation
     uint32_t *layer_heat = &ctx->heat_map[layer * NE];

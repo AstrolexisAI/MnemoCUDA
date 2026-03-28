@@ -493,92 +493,85 @@ __global__ void matvec_f32(
 // ── GQA Attention kernel: Q@K^T → softmax → @V (one kernel per head) ──
 // One block per query head. Each thread handles a subset of positions.
 
+// Tile size for tiled attention (online softmax). 2048 floats = 8KB smem.
+#define ATTN_TILE 2048
+
+// Tiled attention kernel for FP32 KV cache (same online softmax approach).
 __global__ void attention_kernel(
-    const float *__restrict__ q,        // [n_heads_q * head_dim]
-    const float *__restrict__ kv_k,     // [seq_len * n_kv_heads * head_dim]
-    const float *__restrict__ kv_v,     // [seq_len * n_kv_heads * head_dim]
-    float       *__restrict__ out,      // [n_heads_q * head_dim]
+    const float *__restrict__ q, const float *__restrict__ kv_k,
+    const float *__restrict__ kv_v, float *__restrict__ out,
     int head_dim, int n_kv_heads, int seq_len, int gqa_ratio, float scale
 ) {
-    int head = blockIdx.x;          // query head index
-    int kv_head = head / gqa_ratio; // GQA: multiple Q heads share one KV head
-    int tid = threadIdx.x;
-
-    extern __shared__ float shared[];  // [seq_len] for scores + [seq_len] for softmax
-    float *scores = shared;
-
+    int head = blockIdx.x, kv_head = head / gqa_ratio, tid = threadIdx.x;
+    extern __shared__ float shared[];
+    float *tile_scores = shared;
+    __shared__ float smax[32], ssum[32];
+    int warp_id = tid / 32, lane = tid % 32;
     const float *qh = q + head * head_dim;
     int kv_stride = n_kv_heads * head_dim;
-
-    // Phase 1: Q @ K^T — each thread handles positions tid, tid+blockDim, ...
-    for (int p = tid; p < seq_len; p += blockDim.x) {
-        const float *kp = kv_k + (size_t)p * kv_stride + kv_head * head_dim;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; d++)
-            dot += qh[d] * kp[d];
-        scores[p] = dot * scale;
-    }
-    __syncthreads();
-
-    // Phase 2: Softmax over scores[0..seq_len-1]
-    // Find max (parallel reduction in shared mem)
-    float local_max = -1e30f;
-    for (int p = tid; p < seq_len; p += blockDim.x)
-        if (scores[p] > local_max) local_max = scores[p];
-
-    // Reduce max across threads (use warp shuffles + shared)
-    __shared__ float smax[32]; // one per warp
-    int warp_id = tid / 32;
-    int lane = tid % 32;
-    for (int offset = 16; offset > 0; offset >>= 1)
-        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, offset));
-    if (lane == 0) smax[warp_id] = local_max;
-    __syncthreads();
-    if (tid == 0) {
-        float m = smax[0];
-        for (int i = 1; i < (blockDim.x + 31) / 32; i++)
-            m = fmaxf(m, smax[i]);
-        smax[0] = m;
-    }
-    __syncthreads();
-    float max_val = smax[0];
-
-    // Exp and sum
-    float local_sum = 0.0f;
-    for (int p = tid; p < seq_len; p += blockDim.x) {
-        scores[p] = expf(scores[p] - max_val);
-        local_sum += scores[p];
-    }
-    // Reduce sum
-    for (int offset = 16; offset > 0; offset >>= 1)
-        local_sum += __shfl_xor_sync(0xffffffff, local_sum, offset);
-    __shared__ float ssum[32];
-    if (lane == 0) ssum[warp_id] = local_sum;
-    __syncthreads();
-    if (tid == 0) {
-        float s = ssum[0];
-        for (int i = 1; i < (blockDim.x + 31) / 32; i++)
-            s += ssum[i];
-        ssum[0] = s;
-    }
-    __syncthreads();
-    float total_sum = ssum[0];
-
-    // Normalize
-    for (int p = tid; p < seq_len; p += blockDim.x)
-        scores[p] /= total_sum;
-    __syncthreads();
-
-    // Phase 3: Weighted sum of V — each thread handles some dims
     float *out_h = out + head * head_dim;
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-        float val = 0.0f;
-        for (int p = 0; p < seq_len; p++) {
-            const float *vp = kv_v + (size_t)p * kv_stride + kv_head * head_dim;
-            val += scores[p] * vp[d];
+
+    float global_max = -1e30f, global_sum = 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x) out_h[d] = 0.0f;
+
+    for (int tile_start = 0; tile_start < seq_len; tile_start += ATTN_TILE) {
+        int tile_end = tile_start + ATTN_TILE;
+        if (tile_end > seq_len) tile_end = seq_len;
+        int tile_len = tile_end - tile_start;
+
+        for (int i = tid; i < tile_len; i += blockDim.x) {
+            int p = tile_start + i;
+            const float *kp = kv_k + (size_t)p * kv_stride + kv_head * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) dot += qh[d] * kp[d];
+            tile_scores[i] = dot * scale;
         }
-        out_h[d] = val;
+        __syncthreads();
+
+        float tile_max = -1e30f;
+        for (int i = tid; i < tile_len; i += blockDim.x)
+            if (tile_scores[i] > tile_max) tile_max = tile_scores[i];
+        for (int o = 16; o > 0; o >>= 1)
+            tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, o));
+        if (lane == 0) smax[warp_id] = tile_max;
+        __syncthreads();
+        if (tid == 0) { float m = smax[0]; for (int i = 1; i < (blockDim.x+31)/32; i++) m = fmaxf(m, smax[i]); smax[0] = m; }
+        __syncthreads();
+        tile_max = smax[0];
+
+        float new_max = fmaxf(global_max, tile_max);
+        float rescale = (global_sum > 0.0f) ? expf(global_max - new_max) : 0.0f;
+        __syncthreads();
+        for (int d = tid; d < head_dim; d += blockDim.x) out_h[d] *= rescale;
+        float new_sum = global_sum * rescale;
+
+        for (int i = tid; i < tile_len; i += blockDim.x)
+            tile_scores[i] = expf(tile_scores[i] - new_max);
+        __syncthreads();
+
+        float local_sum = 0.0f;
+        for (int i = tid; i < tile_len; i += blockDim.x) local_sum += tile_scores[i];
+        for (int o = 16; o > 0; o >>= 1)
+            local_sum += __shfl_xor_sync(0xffffffff, local_sum, o);
+        if (lane == 0) ssum[warp_id] = local_sum;
+        __syncthreads();
+        if (tid == 0) { float s = ssum[0]; for (int i = 1; i < (blockDim.x+31)/32; i++) s += ssum[i]; ssum[0] = s; }
+        __syncthreads();
+
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            float val = 0.0f;
+            for (int i = 0; i < tile_len; i++)
+                val += tile_scores[i] * kv_v[(size_t)(tile_start + i) * kv_stride + kv_head * head_dim + d];
+            out_h[d] += val;
+        }
+
+        global_max = new_max;
+        global_sum = new_sum + ssum[0];
+        __syncthreads();
     }
+
+    if (global_sum > 0.0f)
+        for (int d = tid; d < head_dim; d += blockDim.x) out_h[d] /= global_sum;
 }
 
 // ── Scaled add: out[i] += scale * x[i] (for expert accumulation) ──
@@ -717,7 +710,7 @@ void cuda_attention(const float *q, const float *kv_k, const float *kv_v,
                     int seq_len, int gqa_ratio, float scale, cudaStream_t stream) {
     // One block per query head, 256 threads per block
     int threads = 256;
-    size_t smem = seq_len * sizeof(float) + 32 * sizeof(float) * 2; // scores + smax + ssum
+    size_t smem = ATTN_TILE * sizeof(float) + 64 * sizeof(float);
     attention_kernel<<<n_heads_q, threads, smem, stream>>>(
         q, kv_k, kv_v, out, head_dim, n_kv_heads, seq_len, gqa_ratio, scale);
 }
@@ -747,6 +740,7 @@ void cuda_f32_to_f16(const float *in, void *out, int n, cudaStream_t stream) {
 
 // ── Attention with FP16 KV cache ──
 
+// Tiled attention kernel for FP16 KV cache (online softmax, same approach as F32).
 __global__ void attention_kernel_f16kv(
     const float *__restrict__ q, const __half *__restrict__ kv_k,
     const __half *__restrict__ kv_v, float *__restrict__ out,
@@ -754,53 +748,109 @@ __global__ void attention_kernel_f16kv(
 ) {
     int head = blockIdx.x, kv_head = head / gqa_ratio, tid = threadIdx.x;
     extern __shared__ float shared[];
-    float *scores = shared;
-    const float *qh = q + head * head_dim;
-    int kv_stride = n_kv_heads * head_dim;
-
-    for (int p = tid; p < seq_len; p += blockDim.x) {
-        const __half *kp = kv_k + (size_t)p * kv_stride + kv_head * head_dim;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; d++) dot += qh[d] * __half2float(kp[d]);
-        scores[p] = dot * scale;
-    }
-    __syncthreads();
-
-    // Softmax reduction
-    float local_max = -1e30f;
-    for (int p = tid; p < seq_len; p += blockDim.x)
-        if (scores[p] > local_max) local_max = scores[p];
+    float *tile_scores = shared;  // [ATTN_TILE] — fits in ~8KB
     __shared__ float smax[32], ssum[32];
     int warp_id = tid / 32, lane = tid % 32;
-    for (int o = 16; o > 0; o >>= 1) local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, o));
-    if (lane == 0) smax[warp_id] = local_max;
-    __syncthreads();
-    if (tid == 0) { float m = smax[0]; for (int i = 1; i < (blockDim.x+31)/32; i++) m = fmaxf(m, smax[i]); smax[0] = m; }
-    __syncthreads();
-    float local_sum = 0.0f;
-    for (int p = tid; p < seq_len; p += blockDim.x) { scores[p] = expf(scores[p] - smax[0]); local_sum += scores[p]; }
-    for (int o = 16; o > 0; o >>= 1) local_sum += __shfl_xor_sync(0xffffffff, local_sum, o);
-    if (lane == 0) ssum[warp_id] = local_sum;
-    __syncthreads();
-    if (tid == 0) { float s = ssum[0]; for (int i = 1; i < (blockDim.x+31)/32; i++) s += ssum[i]; ssum[0] = s; }
-    __syncthreads();
-    for (int p = tid; p < seq_len; p += blockDim.x) scores[p] /= ssum[0];
-    __syncthreads();
-
-    // Weighted V sum
+    const float *qh = q + head * head_dim;
+    int kv_stride = n_kv_heads * head_dim;
     float *out_h = out + head * head_dim;
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-        float val = 0.0f;
-        for (int p = 0; p < seq_len; p++)
-            val += scores[p] * __half2float(kv_v[(size_t)p * kv_stride + kv_head * head_dim + d]);
-        out_h[d] = val;
+
+    // Initialize output accumulator and online softmax state
+    // Each thread accumulates its own output dimensions
+    float global_max = -1e30f;
+    float global_sum = 0.0f;
+
+    // Zero output
+    for (int d = tid; d < head_dim; d += blockDim.x)
+        out_h[d] = 0.0f;
+
+    // Process tiles of positions
+    for (int tile_start = 0; tile_start < seq_len; tile_start += ATTN_TILE) {
+        int tile_end = tile_start + ATTN_TILE;
+        if (tile_end > seq_len) tile_end = seq_len;
+        int tile_len = tile_end - tile_start;
+
+        // Compute Q @ K^T for this tile
+        for (int i = tid; i < tile_len; i += blockDim.x) {
+            int p = tile_start + i;
+            const __half *kp = kv_k + (size_t)p * kv_stride + kv_head * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) dot += qh[d] * __half2float(kp[d]);
+            tile_scores[i] = dot * scale;
+        }
+        __syncthreads();
+
+        // Find tile max
+        float tile_max = -1e30f;
+        for (int i = tid; i < tile_len; i += blockDim.x)
+            if (tile_scores[i] > tile_max) tile_max = tile_scores[i];
+        for (int o = 16; o > 0; o >>= 1)
+            tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, o));
+        if (lane == 0) smax[warp_id] = tile_max;
+        __syncthreads();
+        if (tid == 0) {
+            float m = smax[0];
+            for (int i = 1; i < (blockDim.x + 31) / 32; i++) m = fmaxf(m, smax[i]);
+            smax[0] = m;
+        }
+        __syncthreads();
+        tile_max = smax[0];
+
+        // Online softmax: rescale previous accumulator if new max is larger
+        float new_max = fmaxf(global_max, tile_max);
+        float rescale = (global_sum > 0.0f) ? expf(global_max - new_max) : 0.0f;
+
+        // Rescale existing output accumulator
+        __syncthreads();
+        for (int d = tid; d < head_dim; d += blockDim.x)
+            out_h[d] *= rescale;
+        float new_sum = global_sum * rescale;
+
+        // Exp scores and compute tile sum
+        for (int i = tid; i < tile_len; i += blockDim.x)
+            tile_scores[i] = expf(tile_scores[i] - new_max);
+        __syncthreads();
+
+        float local_sum = 0.0f;
+        for (int i = tid; i < tile_len; i += blockDim.x)
+            local_sum += tile_scores[i];
+        for (int o = 16; o > 0; o >>= 1)
+            local_sum += __shfl_xor_sync(0xffffffff, local_sum, o);
+        if (lane == 0) ssum[warp_id] = local_sum;
+        __syncthreads();
+        if (tid == 0) {
+            float s = ssum[0];
+            for (int i = 1; i < (blockDim.x + 31) / 32; i++) s += ssum[i];
+            ssum[0] = s;
+        }
+        __syncthreads();
+
+        // Accumulate weighted V for this tile
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            float val = 0.0f;
+            for (int i = 0; i < tile_len; i++)
+                val += tile_scores[i] * __half2float(
+                    kv_v[(size_t)(tile_start + i) * kv_stride + kv_head * head_dim + d]);
+            out_h[d] += val;
+        }
+
+        global_max = new_max;
+        global_sum = new_sum + ssum[0];
+        __syncthreads();
+    }
+
+    // Final normalization: divide by total sum
+    if (global_sum > 0.0f) {
+        for (int d = tid; d < head_dim; d += blockDim.x)
+            out_h[d] /= global_sum;
     }
 }
 
 void cuda_attention_f16kv(const void *q, const void *kv_k, const void *kv_v,
                           float *out, int n_heads_q, int head_dim, int n_kv_heads,
                           int seq_len, int gqa_ratio, float scale, cudaStream_t stream) {
-    size_t smem = seq_len * sizeof(float) + 64 * sizeof(float);
+    // Tiled: shared memory is fixed at ATTN_TILE floats + reduction buffers
+    size_t smem = ATTN_TILE * sizeof(float) + 64 * sizeof(float);
     attention_kernel_f16kv<<<n_heads_q, 256, smem, stream>>>(
         (const float *)q, (const __half *)kv_k, (const __half *)kv_v,
         out, head_dim, n_kv_heads, seq_len, gqa_ratio, scale);

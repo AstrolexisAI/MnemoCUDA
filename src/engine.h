@@ -41,7 +41,7 @@ typedef void (*MnemoCudaTokenCB)(const char *text, bool is_done, void *userdata)
 typedef struct {
     const char *model_dir;    // Split model directory
     int context_length;       // Max context (default 8192)
-    int expert_k;             // Override active experts (0 = use config)
+    int expert_k;             // Override active experts (0 = use config, max 16)
     int gpu_ids[8];           // CUDA device IDs (default {0})
     int n_gpus;               // Number of GPUs to use (0 = auto-detect, max 8)
     int io_threads;           // pread threads (default 8)
@@ -76,6 +76,7 @@ MnemoCudaStats mnemo_cuda_get_stats(MnemoCudaCtx *ctx);
 const char *mnemo_cuda_get_info(MnemoCudaCtx *ctx);
 
 // Expert heat profiling
+#define MNEMO_MAX_EXPERT_K 16  // Max active experts per token (buffer limit in forward/kernels)
 #define HEAT_TOP_N 20
 
 typedef struct {

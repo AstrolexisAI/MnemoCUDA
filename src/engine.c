@@ -387,6 +387,12 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
     if (config.expert_k > 0)
         ctx->config.num_experts_per_tok = config.expert_k;
 
+    if (ctx->config.num_experts_per_tok > MNEMO_MAX_EXPERT_K) {
+        fprintf(stderr, "[MnemoCUDA] expert_k=%d exceeds maximum %d, clamping\n",
+                ctx->config.num_experts_per_tok, MNEMO_MAX_EXPERT_K);
+        ctx->config.num_experts_per_tok = MNEMO_MAX_EXPERT_K;
+    }
+
     ctx->config.max_position_embeddings = config.context_length;
 
     ModelConfig *cfg = &ctx->config;
@@ -869,7 +875,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
              ctx->n_gpus,
              ctx->resident_size / (1024*1024));
 
-    io_pool_init();
+    io_pool_init(config.io_threads);
     ctx->loaded = true;
     fprintf(stderr, "[MnemoCUDA] Ready: %s\n", ctx->info);
     return 0;

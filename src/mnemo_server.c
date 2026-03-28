@@ -39,29 +39,26 @@ typedef struct {
     int buf_cap;
 } OutputCtx;
 
+static char *json_escape(const char *src, int len);  // forward decl
+
 static void on_token(const char *text, bool is_done, void *userdata) {
     OutputCtx *out = (OutputCtx *)userdata;
 
     if (text && text[0]) {
-        if (out->fd >= 0) {
+        if (out->fd == -2) {
+            // Silent mode (warmup) — skip output, just accumulate below
+        } else if (out->fd >= 0) {
             // HTTP SSE: data: {"token": "..."}\n\n
-            char sse[2048];
-            // Escape JSON — each char can expand to 2, so need 2x + margin
-            char escaped[1024];
-            int j = 0;
-            for (int i = 0; text[i] && j < (int)sizeof(escaped) - 2; i++) {
-                if (text[i] == '"') { escaped[j++] = '\\'; escaped[j++] = '"'; }
-                else if (text[i] == '\\') { escaped[j++] = '\\'; escaped[j++] = '\\'; }
-                else if (text[i] == '\n') { escaped[j++] = '\\'; escaped[j++] = 'n'; }
-                else escaped[j++] = text[i];
+            char *escaped = json_escape(text, strlen(text));
+            if (escaped) {
+                char sse[4096];
+                int n = snprintf(sse, sizeof(sse),
+                    "data: {\"token\":\"%s\",\"done\":%s}\n\n",
+                    escaped, is_done ? "true" : "false");
+                if (n > 0 && n < (int)sizeof(sse))
+                    write(out->fd, sse, n);
+                free(escaped);
             }
-            escaped[j] = '\0';
-
-            int n = snprintf(sse, sizeof(sse),
-                "data: {\"token\":\"%s\",\"done\":%s}\n\n",
-                escaped, is_done ? "true" : "false");
-            if (n > 0 && n < (int)sizeof(sse))
-                write(out->fd, sse, n);
         } else {
             printf("%s", text);
             fflush(stdout);
@@ -85,7 +82,7 @@ static void on_token(const char *text, bool is_done, void *userdata) {
     if (is_done) {
         if (out->fd >= 0) {
             write(out->fd, "data: [DONE]\n\n", 14);
-        } else {
+        } else if (out->fd != -2) {
             printf("\n");
         }
     }
@@ -613,7 +610,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[MnemoCUDA] Warming caches (multi-round)...\n");
         struct timespec tw0, tw1;
         clock_gettime(CLOCK_MONOTONIC, &tw0);
-        OutputCtx warmup_out = { .fd = -1, .buf = malloc(16384), .buf_len = 0, .buf_cap = 16384 };
+
+        // Silent callback — discard generated tokens, just accumulate for cache warmth
+        OutputCtx warmup_out = { .fd = -2, .buf = malloc(16384), .buf_len = 0, .buf_cap = 16384 };
 
         const char *warmup_prompts[] = {
             "Hello, how are you today?",
