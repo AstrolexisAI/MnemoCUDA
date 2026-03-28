@@ -876,13 +876,15 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
 }
 
 void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
-    if (!ctx || !ctx->loaded) return;
+    if (!ctx) return;
 
-    // Save heat map FIRST (before freeing anything, while ctx->loaded is still true)
-    mnemo_cuda_heat_save(ctx);
+    // Only do runtime operations if fully loaded
+    if (ctx->loaded) {
+        mnemo_cuda_heat_save(ctx);
+        io_pool_shutdown();
+    }
 
-    // Shutdown I/O thread pool
-    io_pool_shutdown();
+    // Free all resources regardless of loaded state (handles partial init cleanup)
 
     for (int g = 0; g < ctx->n_gpus; g++) {
         GPUState *gpu = &ctx->gpus[g];
@@ -926,13 +928,15 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
     }
     if (ctx->h_hidden_transfer) cudaFreeHost(ctx->h_hidden_transfer);
 
-    for (int i = 0; i < ctx->config.num_hidden_layers; i++) {
-        if (ctx->expert_layers && ctx->expert_layers[i].mmap_data)
-            munmap(ctx->expert_layers[i].mmap_data, ctx->expert_layers[i].mmap_size);
-        if (ctx->expert_layers && ctx->expert_layers[i].fd > 0)
-            close(ctx->expert_layers[i].fd);
+    if (ctx->expert_layers) {
+        for (int i = 0; i < ctx->config.num_hidden_layers; i++) {
+            if (ctx->expert_layers[i].mmap_data)
+                munmap(ctx->expert_layers[i].mmap_data, ctx->expert_layers[i].mmap_size);
+            if (ctx->expert_layers[i].fd > 0)
+                close(ctx->expert_layers[i].fd);
+        }
+        free(ctx->expert_layers);
     }
-    free(ctx->expert_layers);
 
     free(ctx->tensor_table.entries);
     memset(&ctx->tensor_table, 0, sizeof(TensorTable));
