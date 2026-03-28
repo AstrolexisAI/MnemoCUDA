@@ -35,6 +35,36 @@
 #include "engine_internal.h"
 #include "forward.h"
 
+// ── I/O helpers (retry on partial read/write) ──
+
+static ssize_t write_full(int fd, const void *buf, size_t count) {
+    size_t written = 0;
+    while (written < count) {
+        ssize_t n = write(fd, (const char *)buf + written, count - written);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) break;
+        written += (size_t)n;
+    }
+    return (ssize_t)written;
+}
+
+static ssize_t read_full(int fd, void *buf, size_t count) {
+    size_t total = 0;
+    while (total < count) {
+        ssize_t n = read(fd, (char *)buf + total, count - total);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) break;  // EOF
+        total += (size_t)n;
+    }
+    return (ssize_t)total;
+}
+
 static const char *json_next_string(const char *p, char *out, int maxlen) {
     p = strchr(p, '"');
     if (!p) return NULL;
@@ -469,6 +499,10 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         ctx->n_gpus = config.n_gpus;
         for (int i = 0; i < ctx->n_gpus; i++)
             ctx->gpus[i].gpu_id = config.gpu_ids[i];
+    }
+    if (ctx->n_gpus <= 0) {
+        fprintf(stderr, "[MnemoCUDA] No CUDA GPUs detected\n");
+        return -3;
     }
 
     fprintf(stderr, "[MnemoCUDA] Loading: hidden=%d, layers=%d, experts=%d (K=%d), GPUs=%d\n",
@@ -1015,15 +1049,20 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
         close(pipe_in[0]);
         close(pipe_out[1]);
 
-        write(pipe_in[1], chatml, strlen(chatml));
+        write_full(pipe_in[1], chatml, strlen(chatml));
         close(pipe_in[1]);
 
         // Read binary response: [4B n_tokens] [4B token_id]*n
         uint32_t n_tok;
-        if (read(pipe_out[0], &n_tok, 4) == 4) {
+        if (read_full(pipe_out[0], &n_tok, 4) == 4 && n_tok > 0 && n_tok < 1000000) {
             n_tokens = (int)n_tok;
             tokens = malloc(n_tokens * sizeof(int));
-            read(pipe_out[0], tokens, n_tokens * sizeof(int));
+            ssize_t expected = (ssize_t)(n_tokens * sizeof(int));
+            if (read_full(pipe_out[0], tokens, expected) != expected) {
+                free(tokens);
+                tokens = NULL;
+                n_tokens = 0;
+            }
         }
         close(pipe_out[0]);
 
@@ -1036,8 +1075,13 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
     if (!tokens || n_tokens == 0) {
         // Fallback to built-in BPE tokenizer
         fprintf(stderr, "[MnemoCUDA] Python tokenizer failed, using built-in BPE\n");
-        chatml = malloc(strlen(prompt) + 128);
-        sprintf(chatml, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", prompt);
+        if (strncmp(prompt, "<|im_start|>", 12) == 0) {
+            // Already raw ChatML — pass through without re-wrapping
+            chatml = strdup(prompt);
+        } else {
+            chatml = malloc(strlen(prompt) + 128);
+            sprintf(chatml, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", prompt);
+        }
         int max_prompt_tokens = cfg->max_position_embeddings - max_tokens;
         if (max_prompt_tokens < 32) max_prompt_tokens = 32;
         tokens = malloc(max_prompt_tokens * sizeof(int));

@@ -233,7 +233,7 @@ static char *http_read_request(int fd, char **body_out, int *body_len_out) {
     *body_len_out = 0;
 
     // Read headers first (up to HTTP_MAX_HEADERS)
-    char *buf = malloc(HTTP_MAX_HEADERS + HTTP_MAX_BODY);
+    char *buf = malloc(HTTP_MAX_HEADERS + HTTP_MAX_BODY + 1);  // +1 for NUL
     if (!buf) return NULL;
 
     int total = 0;
@@ -273,7 +273,11 @@ static char *http_read_request(int fd, char **body_out, int *body_len_out) {
     while (body_received < content_length) {
         int want = content_length - body_received;
         int n = read(fd, buf + total, want);
-        if (n <= 0) break;  // connection closed
+        if (n <= 0) {
+            // Connection closed before full body received — reject
+            free(buf);
+            return NULL;
+        }
         total += n;
         body_received += n;
     }
