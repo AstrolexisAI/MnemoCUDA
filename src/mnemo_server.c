@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <signal.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -179,6 +180,230 @@ static void run_repl(MnemoCudaCtx *ctx) {
     free(out.buf);
 }
 
+// ── HTTP helpers ──
+
+#define HTTP_MAX_HEADERS 8192
+#define HTTP_MAX_BODY    (1024 * 1024)  // 1 MB max request body
+
+static void http_respond_error(int fd, int code, const char *msg) {
+    char buf[512];
+    int blen = snprintf(buf, sizeof(buf),
+        "{\"error\":\"%s\",\"code\":%d}", msg, code);
+    char hdr[256];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n\r\n",
+        code, msg, blen);
+    write(fd, hdr, hlen);
+    write(fd, buf, blen);
+}
+
+static void http_respond_json(int fd, const char *json, int json_len) {
+    char hdr[256];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n\r\n", json_len);
+    write(fd, hdr, hlen);
+    write(fd, json, json_len);
+}
+
+static void http_respond_cors_preflight(int fd) {
+    const char *resp =
+        "HTTP/1.1 204 No Content\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type\r\n"
+        "Access-Control-Max-Age: 86400\r\n"
+        "Connection: close\r\n\r\n";
+    write(fd, resp, strlen(resp));
+}
+
+// Read full HTTP request: headers + body (respects Content-Length).
+// Returns dynamically allocated buffer containing full request, or NULL.
+// Sets *body_out to point into the buffer at the start of the body.
+// Caller must free the returned buffer.
+static char *http_read_request(int fd, char **body_out, int *body_len_out) {
+    *body_out = NULL;
+    *body_len_out = 0;
+
+    // Read headers first (up to HTTP_MAX_HEADERS)
+    char *buf = malloc(HTTP_MAX_HEADERS + HTTP_MAX_BODY);
+    if (!buf) return NULL;
+
+    int total = 0;
+    int headers_end = -1;
+
+    // Read until we find \r\n\r\n (end of headers)
+    while (total < HTTP_MAX_HEADERS) {
+        int n = read(fd, buf + total, HTTP_MAX_HEADERS - total);
+        if (n <= 0) { free(buf); return NULL; }
+        total += n;
+        buf[total] = '\0';
+
+        char *hend = strstr(buf, "\r\n\r\n");
+        if (hend) {
+            headers_end = (int)(hend - buf) + 4;
+            break;
+        }
+    }
+    if (headers_end < 0) { free(buf); return NULL; }
+
+    // Parse Content-Length from headers
+    int content_length = 0;
+    char *cl = strcasestr(buf, "Content-Length:");
+    if (cl) {
+        cl += 15;
+        while (*cl == ' ') cl++;
+        content_length = atoi(cl);
+    }
+    if (content_length < 0) content_length = 0;
+    if (content_length > HTTP_MAX_BODY) {
+        free(buf);
+        return NULL;  // body too large
+    }
+
+    // Read remaining body bytes if we haven't received them all
+    int body_received = total - headers_end;
+    while (body_received < content_length) {
+        int want = content_length - body_received;
+        int n = read(fd, buf + total, want);
+        if (n <= 0) break;  // connection closed
+        total += n;
+        body_received += n;
+    }
+    buf[total] = '\0';
+
+    *body_out = buf + headers_end;
+    *body_len_out = body_received;
+    return buf;
+}
+
+// Extract a JSON string value for a given key from a flat JSON object.
+// Handles basic escapes (\", \\, \n, \t, \/, \uXXXX).
+// Returns dynamically allocated string, or NULL if key not found.
+static char *json_extract_string(const char *json, const char *key) {
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return NULL;
+    p += strlen(pattern);
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+    if (*p != '"') return NULL;
+    p++;  // skip opening quote
+
+    // Estimate max output size (input length is safe upper bound)
+    int cap = strlen(p) + 1;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+
+    int i = 0;
+    while (*p && *p != '"' && i < cap - 1) {
+        if (*p == '\\' && *(p + 1)) {
+            p++;
+            switch (*p) {
+                case '"':  out[i++] = '"'; break;
+                case '\\': out[i++] = '\\'; break;
+                case 'n':  out[i++] = '\n'; break;
+                case 't':  out[i++] = '\t'; break;
+                case 'r':  out[i++] = '\r'; break;
+                case '/':  out[i++] = '/'; break;
+                case 'u': {
+                    unsigned cp = 0;
+                    for (int j = 0; j < 4 && p[1 + j]; j++) {
+                        char c = p[1 + j];
+                        cp = cp * 16 + (c >= 'a' ? c - 'a' + 10 :
+                                        c >= 'A' ? c - 'A' + 10 : c - '0');
+                    }
+                    p += 4;
+                    // UTF-8 encode
+                    if (cp < 0x80) {
+                        out[i++] = (char)cp;
+                    } else if (cp < 0x800) {
+                        out[i++] = (char)(0xC0 | (cp >> 6));
+                        out[i++] = (char)(0x80 | (cp & 0x3F));
+                    } else {
+                        out[i++] = (char)(0xE0 | (cp >> 12));
+                        out[i++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        out[i++] = (char)(0x80 | (cp & 0x3F));
+                    }
+                    break;
+                }
+                default: out[i++] = *p; break;
+            }
+        } else {
+            out[i++] = *p;
+        }
+        p++;
+    }
+    out[i] = '\0';
+    return out;
+}
+
+static int json_extract_int(const char *json, const char *key, int def) {
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return def;
+    p += strlen(pattern);
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+    return atoi(p);
+}
+
+static float json_extract_float(const char *json, const char *key, float def) {
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return def;
+    p += strlen(pattern);
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+    return (float)atof(p);
+}
+
+static int json_extract_bool(const char *json, const char *key, int def) {
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return def;
+    p += strlen(pattern);
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+    if (strncmp(p, "true", 4) == 0) return 1;
+    if (strncmp(p, "false", 5) == 0) return 0;
+    return def;
+}
+
+// Escape a string for JSON output. Returns malloc'd buffer.
+static char *json_escape(const char *src, int len) {
+    int cap = len * 2 + 1;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    int j = 0;
+    for (int i = 0; i < len && j < cap - 6; i++) {
+        switch (src[i]) {
+            case '"':  out[j++] = '\\'; out[j++] = '"'; break;
+            case '\\': out[j++] = '\\'; out[j++] = '\\'; break;
+            case '\n': out[j++] = '\\'; out[j++] = 'n'; break;
+            case '\t': out[j++] = '\\'; out[j++] = 't'; break;
+            case '\r': out[j++] = '\\'; out[j++] = 'r'; break;
+            case '\b': out[j++] = '\\'; out[j++] = 'b'; break;
+            case '\f': out[j++] = '\\'; out[j++] = 'f'; break;
+            default:
+                if ((unsigned char)src[i] < 0x20) {
+                    j += snprintf(out + j, 7, "\\u%04x", (unsigned char)src[i]);
+                } else {
+                    out[j++] = src[i];
+                }
+        }
+    }
+    out[j] = '\0';
+    return out;
+}
+
 // ── HTTP server mode ──
 
 static void run_http(MnemoCudaCtx *ctx, int port) {
@@ -210,13 +435,28 @@ static void run_http(MnemoCudaCtx *ctx, int port) {
         int client_fd = accept(server_fd, (struct sockaddr *)&client, &clen);
         if (client_fd < 0) continue;
 
-        // Read HTTP request
-        char req[8192];
-        int n = read(client_fd, req, sizeof(req) - 1);
-        if (n <= 0) { close(client_fd); continue; }
-        req[n] = '\0';
+        // Set socket timeout to avoid blocking forever on slow clients
+        struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-        // Handle GET /heat — return heat stats as JSON
+        // Read full HTTP request (headers + body via Content-Length)
+        char *body = NULL;
+        int body_len = 0;
+        char *req = http_read_request(client_fd, &body, &body_len);
+        if (!req) {
+            http_respond_error(client_fd, 400, "Bad Request");
+            close(client_fd);
+            continue;
+        }
+
+        // CORS preflight
+        if (strncmp(req, "OPTIONS ", 8) == 0) {
+            http_respond_cors_preflight(client_fd);
+            free(req); close(client_fd);
+            continue;
+        }
+
+        // GET /heat — return heat stats as JSON
         if (strncmp(req, "GET /heat", 9) == 0) {
             MnemoCudaHeatStats hs = mnemo_cuda_get_heat_stats(ctx);
             char json[8192];
@@ -246,52 +486,43 @@ static void run_http(MnemoCudaCtx *ctx, int port) {
                 "],\"ram\":{\"slots\":%d,\"used\":%d,\"hits\":%d,\"misses\":%d}}",
                 hs.ram_slots, hs.ram_used, hs.ram_hits, hs.ram_misses);
 
-            char hdr[256];
-            int hlen = snprintf(hdr, sizeof(hdr),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: application/json\r\n"
-                "Content-Length: %d\r\n"
-                "Access-Control-Allow-Origin: *\r\n"
-                "Connection: close\r\n\r\n", off);
-            write(client_fd, hdr, hlen);
-            write(client_fd, json, off);
-            close(client_fd);
+            http_respond_json(client_fd, json, off);
+            free(req); close(client_fd);
             continue;
         }
 
-        // Parse prompt from JSON body (minimal)
-        char *body = strstr(req, "\r\n\r\n");
-        if (!body) { close(client_fd); continue; }
-        body += 4;
-
-        // Extract "prompt": "..."
-        char *pp = strstr(body, "\"prompt\"");
-        if (!pp) { close(client_fd); continue; }
-        pp = strchr(pp + 8, '"');
-        if (!pp) { close(client_fd); continue; }
-        pp++;
-        char prompt[4096];
-        int pi = 0;
-        while (*pp && *pp != '"' && pi < 4090) {
-            if (*pp == '\\' && *(pp+1) == '"') { prompt[pi++] = '"'; pp += 2; }
-            else if (*pp == '\\' && *(pp+1) == 'n') { prompt[pi++] = '\n'; pp += 2; }
-            else prompt[pi++] = *pp++;
+        // Only POST to /v1/completions from here
+        if (strncmp(req, "POST ", 5) != 0) {
+            http_respond_error(client_fd, 405, "Method Not Allowed");
+            free(req); close(client_fd);
+            continue;
         }
-        prompt[pi] = '\0';
+        if (!body || body_len == 0) {
+            http_respond_error(client_fd, 400, "Empty body");
+            free(req); close(client_fd);
+            continue;
+        }
 
-        // Extract max_tokens and temperature
-        int max_tokens = 256;
-        float temperature = 0.7;
-        char *mt = strstr(body, "\"max_tokens\"");
-        if (mt) { mt = strchr(mt + 12, ':'); if (mt) max_tokens = atoi(mt + 1); }
-        char *tp = strstr(body, "\"temperature\"");
-        if (tp) { tp = strchr(tp + 13, ':'); if (tp) temperature = atof(tp + 1); }
+        // Extract fields from JSON body
+        char *prompt = json_extract_string(body, "prompt");
+        if (!prompt || prompt[0] == '\0') {
+            http_respond_error(client_fd, 400, "Missing or empty prompt");
+            free(prompt); free(req); close(client_fd);
+            continue;
+        }
 
-        // Check if streaming requested
-        int stream = (strstr(body, "\"stream\":true") || strstr(body, "\"stream\": true")) ? 1 : 0;
+        int max_tokens = json_extract_int(body, "max_tokens", 256);
+        float temperature = json_extract_float(body, "temperature", 0.7f);
+        int stream = json_extract_bool(body, "stream", 0);
+        int raw_prompt = json_extract_bool(body, "raw_prompt", 0);
+
+        if (max_tokens <= 0) max_tokens = 256;
+        if (max_tokens > 32768) max_tokens = 32768;
+
+        if (raw_prompt)
+            fprintf(stderr, "[MnemoCUDA] raw_prompt=true, passing prompt as-is\n");
 
         if (stream) {
-            // SSE streaming response
             const char *hdr = "HTTP/1.1 200 OK\r\n"
                               "Content-Type: text/event-stream; charset=utf-8\r\n"
                               "Cache-Control: no-cache\r\n"
@@ -302,47 +533,30 @@ static void run_http(MnemoCudaCtx *ctx, int port) {
             generate(ctx, prompt, temperature, max_tokens, &out);
             out.fd = -1;
         } else {
-            // Non-streaming: generate full response, return JSON
             out.fd = -1;
             generate(ctx, prompt, temperature, max_tokens, &out);
 
             MnemoCudaStats stats = mnemo_cuda_get_stats(ctx);
-            // Escape output for JSON — allocate based on actual output size
-            int out_len = out.buf_len;
-            int esc_cap = out_len * 2 + 256; // worst case: every char escapes to 2
-            char *escaped = malloc(esc_cap);
-            char *response = malloc(esc_cap + 128);
-            if (!escaped || !response) {
-                free(escaped); free(response);
-                close(client_fd); continue;
+            char *escaped = json_escape(out.buf, out.buf_len);
+            if (!escaped) {
+                http_respond_error(client_fd, 500, "Internal Server Error");
+                free(prompt); free(req); close(client_fd);
+                continue;
             }
-            int j = 0;
-            for (int i = 0; i < out_len && j < esc_cap - 2; i++) {
-                if (out.buf[i] == '"') { escaped[j++] = '\\'; escaped[j++] = '"'; }
-                else if (out.buf[i] == '\\') { escaped[j++] = '\\'; escaped[j++] = '\\'; }
-                else if (out.buf[i] == '\n') { escaped[j++] = '\\'; escaped[j++] = 'n'; }
-                else if (out.buf[i] == '\t') { escaped[j++] = '\\'; escaped[j++] = 't'; }
-                else escaped[j++] = out.buf[i];
-            }
-            escaped[j] = '\0';
 
-            int rlen = snprintf(response, esc_cap + 128,
+            int resp_cap = strlen(escaped) + 128;
+            char *response = malloc(resp_cap);
+            int rlen = snprintf(response, resp_cap,
                 "{\"text\":\"%s\",\"tokens\":%d,\"tok_per_sec\":%.1f}",
                 escaped, stats.tokens_generated, stats.tokens_per_second);
 
-            char hdr[256];
-            int hlen = snprintf(hdr, sizeof(hdr),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: application/json\r\n"
-                "Content-Length: %d\r\n"
-                "Access-Control-Allow-Origin: *\r\n"
-                "Connection: close\r\n\r\n", rlen);
-            write(client_fd, hdr, hlen);
-            write(client_fd, response, rlen);
+            http_respond_json(client_fd, response, rlen);
             free(escaped);
             free(response);
         }
 
+        free(prompt);
+        free(req);
         close(client_fd);
     }
 
@@ -367,11 +581,10 @@ int main(int argc, char **argv) {
 
     const char *model_dir = argv[1];
 
-    // Context length: 8K default (maximizes expert VRAM cache)
-    // Override with --context N
-    int context_len = 8192;
+    // Context length from config_default(), override with --context N
+    MnemoCudaConfig config = mnemo_cuda_config_default();
     for (int i = 2; i < argc - 1; i++) {
-        if (strcmp(argv[i], "--context") == 0) context_len = atoi(argv[i+1]);
+        if (strcmp(argv[i], "--context") == 0) config.context_length = atoi(argv[i+1]);
     }
 
     fprintf(stderr, "[MnemoCUDA] Loading model from %s...\n", model_dir);
@@ -379,9 +592,7 @@ int main(int argc, char **argv) {
     MnemoCudaCtx *ctx = mnemo_cuda_create();
     if (!ctx) { fprintf(stderr, "Failed to create context\n"); return 1; }
 
-    MnemoCudaConfig config = mnemo_cuda_config_default();
     config.model_dir = model_dir;
-    config.context_length = context_len;
 
     int result = mnemo_cuda_load(ctx, config);
     if (result != 0) {

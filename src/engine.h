@@ -40,10 +40,10 @@ typedef void (*MnemoCudaTokenCB)(const char *text, bool is_done, void *userdata)
 // Configuration
 typedef struct {
     const char *model_dir;    // Split model directory
-    int context_length;       // Max context (default 2048)
+    int context_length;       // Max context (default 8192)
     int expert_k;             // Override active experts (0 = use config)
     int gpu_ids[8];           // CUDA device IDs (default {0})
-    int n_gpus;               // Number of GPUs to use (default 1, max 8)
+    int n_gpus;               // Number of GPUs to use (0 = auto-detect, max 8)
     int io_threads;           // pread threads (default 8)
     bool use_pinned_memory;   // Use cudaMallocHost for DMA (default true)
 } MnemoCudaConfig;
