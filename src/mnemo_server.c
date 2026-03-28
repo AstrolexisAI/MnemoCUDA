@@ -380,11 +380,11 @@ static int json_extract_bool(const char *json, const char *key, int def) {
 
 // Escape a string for JSON output. Returns malloc'd buffer.
 static char *json_escape(const char *src, int len) {
-    int cap = len * 2 + 1;
+    int cap = len * 6 + 1;  // worst case: every byte is \u00XX (6 chars each)
     char *out = malloc(cap);
     if (!out) return NULL;
     int j = 0;
-    for (int i = 0; i < len && j < cap - 6; i++) {
+    for (int i = 0; i < len; i++) {
         switch (src[i]) {
             case '"':  out[j++] = '\\'; out[j++] = '"'; break;
             case '\\': out[j++] = '\\'; out[j++] = '\\'; break;
