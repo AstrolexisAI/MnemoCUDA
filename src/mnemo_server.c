@@ -572,12 +572,20 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
         if (strncmp(req, "GET /status", 11) == 0) {
             MnemoCudaStats s = mnemo_cuda_get_stats(ctx);
             MnemoCudaHeatStats hs = mnemo_cuda_get_heat_stats(ctx);
+            // Sum cache stats across all GPUs
+            int total_slots = 0, total_used = 0, total_pinned = 0;
+            for (int g = 0; g < 8 && hs.cache_slots[g] > 0; g++) {
+                total_slots += hs.cache_slots[g];
+                total_used += hs.cache_used[g];
+                total_pinned += hs.cache_pinned[g];
+            }
             char json[1024];
             int off = snprintf(json, sizeof(json),
                 "{\"status\":\"%s\",\"model\":\"%s\","
                 "\"gpus\":%d,\"vram_mb\":%.0f,\"resident_mb\":%.0f,"
                 "\"heat_tokens\":%lu,\"pinning_active\":%s,"
-                "\"active_experts\":%d,\"cache_slots\":%d,\"cache_used\":%d,"
+                "\"active_experts\":%d,"
+                "\"cache_slots\":%d,\"cache_used\":%d,\"cache_pinned\":%d,"
                 "\"last_ttft\":%.3f,\"last_tok_s\":%.1f}",
                 generating ? "busy" : "ready",
                 mnemo_cuda_get_info(ctx),
@@ -587,7 +595,7 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
                 (unsigned long)hs.total_tokens,
                 hs.pinning_active ? "true" : "false",
                 hs.active_experts,
-                hs.cache_slots[0], hs.cache_used[0],
+                total_slots, total_used, total_pinned,
                 s.ttft_seconds, s.tokens_per_second);
             http_respond_json(client_fd, json, off);
             free(req); close(client_fd);

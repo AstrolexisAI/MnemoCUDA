@@ -762,7 +762,8 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         int bad_tensors = 0;
         for (int i = 0; i < ctx->tensor_table.n_entries; i++) {
             TensorEntry *e = &ctx->tensor_table.entries[i];
-            if (e->offset + e->size > ctx->resident_size) {
+            if (e->size > ctx->resident_size ||
+                e->offset > ctx->resident_size - e->size) {
                 LOG_ERROR("Tensor '%s' offset+size (%zu+%zu) exceeds resident file (%zu)",
                           e->name, e->offset, e->size, ctx->resident_size);
                 bad_tensors++;
@@ -1316,6 +1317,7 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
 
     // ── 3. Autoregressive generation ──
     int tokens_generated = 0;
+    int gen_error = 0;
     struct timespec t_gen_start;
     clock_gettime(CLOCK_MONOTONIC, &t_gen_start);
 
@@ -1366,7 +1368,7 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
 
         // Forward pass for next token
         int rc = forward_pass(ctx, next_id, ctx->kv_pos, h_logits);
-        if (rc != 0) break;
+        if (rc != 0) { gen_error = rc; break; }
         ctx->kv_pos++;
     }
 
@@ -1447,7 +1449,7 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
 
     free(tokens);
     free(h_logits);
-    return 0;
+    return gen_error;
 }
 
 MnemoCudaStats mnemo_cuda_get_stats(MnemoCudaCtx *ctx) {
