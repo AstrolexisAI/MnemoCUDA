@@ -902,15 +902,14 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
     int V = cfg->vocab_size;
     int K = cfg->num_experts_per_tok;
 
-    // Determine max expert size from already-opened expert files
-    size_t max_expert_sz = 16UL * 1024 * 1024;
-    for (int i = 0; i < cfg->num_hidden_layers; i++)
-        if (ctx->expert_layers[i].expert_size > 0 &&
-            ctx->expert_layers[i].expert_size < max_expert_sz)
-            max_expert_sz = ctx->expert_layers[i].expert_size; // use actual, not default
+    // Determine max expert size across ALL layers (buffers must fit the largest)
+    size_t max_expert_sz = 0;
     for (int i = 0; i < cfg->num_hidden_layers; i++)
         if (ctx->expert_layers[i].expert_size > max_expert_sz)
             max_expert_sz = ctx->expert_layers[i].expert_size;
+    if (max_expert_sz == 0)
+        max_expert_sz = 16UL * 1024 * 1024;  // fallback default
+    LOG_INFO("Max expert size: %.1f MB", (double)max_expert_sz / (1024*1024));
 
     for (int g = 0; g < ctx->n_gpus; g++) {
         GPUState *gpu = &ctx->gpus[g];
