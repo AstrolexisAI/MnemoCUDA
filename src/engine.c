@@ -705,6 +705,29 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
                 ctx->n_expert_layers, cfg->num_hidden_layers, (double)total_mmap / (1024*1024*1024));
     }
 
+    // Warn if expert layers don't match expected count
+    if (ctx->n_expert_layers > 0 && ctx->n_expert_layers < cfg->num_hidden_layers) {
+        LOG_WARN("Only %d/%d expert layer files found — some layers will have no MoE",
+                 ctx->n_expert_layers, cfg->num_hidden_layers);
+    }
+
+    // Validate expert file sizes match manifest
+    for (int i = 0; i < cfg->num_hidden_layers; i++) {
+        ExpertLayerFile *elf = &ctx->expert_layers[i];
+        if (elf->fd <= 0 && !elf->mmap_data) continue;
+        if (elf->expert_size == 0) {
+            LOG_WARN("Layer %d expert_size is 0, skipping validation", i);
+            continue;
+        }
+        size_t expected = (size_t)elf->n_experts * elf->expert_size;
+        if (elf->mmap_size > 0 && elf->mmap_size < expected) {
+            LOG_ERROR("Layer %d expert file too small: %zu bytes, expected %zu (%d experts x %zu)",
+                      i, elf->mmap_size, expected, elf->n_experts, elf->expert_size);
+            mnemo_cuda_unload(ctx);
+            return MNEMO_ERR_BAD_CONFIG;
+        }
+    }
+
     // Assign layer ranges to GPUs (pipeline parallelism)
     int layers_per_gpu = cfg->num_hidden_layers / ctx->n_gpus;
     int extra_layers = cfg->num_hidden_layers % ctx->n_gpus;
@@ -733,6 +756,24 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
     ctx->h_resident_mmap = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
     if (ctx->h_resident_mmap == MAP_FAILED) { close(fd); mnemo_cuda_unload(ctx); return -2; }
     close(fd);
+
+    // Cross-validate: resident manifest offsets must fit within the file
+    {
+        int bad_tensors = 0;
+        for (int i = 0; i < ctx->tensor_table.n_entries; i++) {
+            TensorEntry *e = &ctx->tensor_table.entries[i];
+            if (e->offset + e->size > ctx->resident_size) {
+                LOG_ERROR("Tensor '%s' offset+size (%zu+%zu) exceeds resident file (%zu)",
+                          e->name, e->offset, e->size, ctx->resident_size);
+                bad_tensors++;
+            }
+        }
+        if (bad_tensors > 0) {
+            LOG_ERROR("%d tensor(s) have invalid offsets", bad_tensors);
+            mnemo_cuda_unload(ctx);
+            return MNEMO_ERR_BAD_CONFIG;
+        }
+    }
 
     // Sanitize NaN/Inf in F32 resident tensors (some GGUFs have corrupt weights)
     int nan_fixed = 0;
@@ -1126,7 +1167,8 @@ void mnemo_cuda_cancel(MnemoCudaCtx *ctx) {
 // ── Generate: tokenize → prefill → autoregressive decode ──
 
 int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
-                        float temperature, MnemoCudaTokenCB callback, void *userdata) {
+                        float temperature, bool raw_prompt,
+                        MnemoCudaTokenCB callback, void *userdata) {
     if (!ctx || !ctx->loaded) return MNEMO_ERR_BAD_CONFIG;
     if (!ctx->tokenizer) { callback("Error: tokenizer not loaded", true, userdata); return MNEMO_ERR_TOKENIZER; }
 
@@ -1140,11 +1182,12 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
     // ── 1. Tokenize prompt ──
-    // If prompt already starts with <|im_start|>, treat as raw ChatML (multi-turn)
-    // Otherwise, wrap in ChatML single-turn format
+    // raw_prompt=true: pass prompt as-is (already ChatML-formatted)
+    // raw_prompt=false: wrap in ChatML single-turn format
+    // Also auto-detect if prompt starts with <|im_start|> for backward compat
     char *chatml;
-    if (strncmp(prompt, "<|im_start|>", 12) == 0) {
-        chatml = strdup(prompt); // raw ChatML from client
+    if (raw_prompt || strncmp(prompt, "<|im_start|>", 12) == 0) {
+        chatml = strdup(prompt);
     } else {
         chatml = malloc(strlen(prompt) + 128);
         sprintf(chatml, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", prompt);
@@ -1234,8 +1277,7 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
     if (!tokens || n_tokens == 0) {
         // Fallback to built-in BPE tokenizer
         fprintf(stderr, "[MnemoCUDA] Python tokenizer failed, using built-in BPE\n");
-        if (strncmp(prompt, "<|im_start|>", 12) == 0) {
-            // Already raw ChatML — pass through without re-wrapping
+        if (raw_prompt || strncmp(prompt, "<|im_start|>", 12) == 0) {
             chatml = strdup(prompt);
         } else {
             chatml = malloc(strlen(prompt) + 128);

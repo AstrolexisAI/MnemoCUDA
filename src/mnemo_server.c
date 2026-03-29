@@ -20,11 +20,13 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <stdint.h>
 #include "engine.h"
 #include "log.h"
 
 static volatile int running = 1;
-static volatile int generating = 0;  // 1 when a request is being processed
+static volatile int generating = 0;
+static uint64_t request_counter = 0;
 
 static void sigint_handler(int sig) {
     (void)sig;
@@ -93,14 +95,15 @@ static void on_token(const char *text, bool is_done, void *userdata) {
 
 // ── Generate with stats ──
 
-static int generate(MnemoCudaCtx *ctx, const char *prompt, float temp, int max_tokens, OutputCtx *out) {
+static int generate(MnemoCudaCtx *ctx, const char *prompt, float temp, int max_tokens,
+                    bool raw_prompt, OutputCtx *out, uint64_t req_id) {
     out->buf_len = 0;
     out->buf[0] = '\0';
 
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    int rc = mnemo_cuda_generate(ctx, prompt, max_tokens, temp, on_token, out);
+    int rc = mnemo_cuda_generate(ctx, prompt, max_tokens, temp, raw_prompt, on_token, out);
 
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -108,11 +111,13 @@ static int generate(MnemoCudaCtx *ctx, const char *prompt, float temp, int max_t
 
     MnemoCudaStats stats = mnemo_cuda_get_stats(ctx);
     if (rc == 0) {
-        fprintf(stderr, "[MnemoCUDA] %d tokens in %.1fs (%.1f tok/s, prefill %.1fs)\n",
-                stats.tokens_generated, elapsed, stats.tokens_per_second,
-                elapsed - (stats.tokens_generated > 0 ? stats.tokens_generated / stats.tokens_per_second : 0));
+        LOG_INFO("req=%lu prompt=%d gen=%d ttft=%.3fs tok/s=%.1f total=%.1fs",
+                 (unsigned long)req_id, stats.prompt_tokens,
+                 stats.tokens_generated, stats.ttft_seconds,
+                 stats.tokens_per_second, elapsed);
     } else {
-        fprintf(stderr, "[MnemoCUDA] Generation failed: error %d\n", rc);
+        LOG_ERROR("req=%lu failed: %s (code %d)",
+                  (unsigned long)req_id, mnemo_cuda_strerror(rc), rc);
     }
     return rc;
 }
@@ -180,7 +185,7 @@ static void run_repl(MnemoCudaCtx *ctx) {
             continue;
         }
 
-        generate(ctx, line, 0.7, 512, &out);
+        generate(ctx, line, 0.7, 512, false, &out, ++request_counter);
     }
     free(out.buf);
 }
@@ -630,10 +635,10 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
         if (max_tokens <= 0) max_tokens = 256;
         if (max_tokens > 32768) max_tokens = 32768;
 
-        if (raw_prompt)
-            fprintf(stderr, "[MnemoCUDA] raw_prompt=true, passing prompt as-is\n");
+        // raw_prompt is now passed through to mnemo_cuda_generate
 
         generating = 1;
+        uint64_t req_id = ++request_counter;
 
         if (stream) {
             const char *hdr = "HTTP/1.1 200 OK\r\n"
@@ -643,7 +648,7 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
                               "Connection: close\r\n\r\n";
             write(client_fd, hdr, strlen(hdr));
             out.fd = client_fd;
-            int rc = generate(ctx, prompt, temperature, max_tokens, &out);
+            int rc = generate(ctx, prompt, temperature, max_tokens, raw_prompt, &out, req_id);
             out.fd = -1;
             if (rc != 0) {
                 // Emit SSE error event before closing
@@ -654,7 +659,7 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
             }
         } else {
             out.fd = -1;
-            int rc = generate(ctx, prompt, temperature, max_tokens, &out);
+            int rc = generate(ctx, prompt, temperature, max_tokens, raw_prompt, &out, req_id);
 
             if (rc != 0) {
                 int http_code = (rc == MNEMO_ERR_TOKENIZER) ? 503 : 500;
@@ -789,7 +794,7 @@ int main(int argc, char **argv) {
             n_rounds++;
             fprintf(stderr, "[MnemoCUDA] Warm-up %d/%d...\n", n_rounds, max_warmup);
             mnemo_cuda_generate(ctx, warmup_prompts[i], warmup_tokens[i], 0.0,
-                                on_token, &warmup_out);
+                                false, on_token, &warmup_out);
         }
 
         clock_gettime(CLOCK_MONOTONIC, &tw1);
@@ -813,7 +818,7 @@ int main(int argc, char **argv) {
     } else if (argc >= 3) {
         // Single prompt
         OutputCtx out = { .fd = -1, .buf = malloc(65536), .buf_len = 0, .buf_cap = 65536 };
-        generate(ctx, argv[2], 0.7, 512, &out);
+        generate(ctx, argv[2], 0.7, 512, false, &out, ++request_counter);
         free(out.buf);
     }
 

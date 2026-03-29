@@ -71,8 +71,11 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx);
 void mnemo_cuda_destroy(MnemoCudaCtx *ctx);
 
 // Generation
+// raw_prompt: if true, prompt is passed as-is (no ChatML wrapping).
+//             if false, prompt is wrapped in ChatML single-turn format.
 int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
-                        float temperature, MnemoCudaTokenCB callback, void *userdata);
+                        float temperature, bool raw_prompt,
+                        MnemoCudaTokenCB callback, void *userdata);
 void mnemo_cuda_cancel(MnemoCudaCtx *ctx);
 
 // Info

@@ -298,7 +298,7 @@ static void test_full_cycle(const char *model_dir) {
 
     // Generate with temp=0 for determinism
     GenResult result = {0};
-    rc = mnemo_cuda_generate(ctx, "Hello", 8, 0.0, on_token, &result);
+    rc = mnemo_cuda_generate(ctx, "Hello", 8, 0.0, false, on_token, &result);
     ASSERT_EQ(rc, 0, "generate failed");
     ASSERT_TRUE(result.got_done, "callback never received done=true");
     ASSERT_TRUE(result.token_count > 0, "no tokens generated");
@@ -336,7 +336,7 @@ static void test_cancel(const char *model_dir) {
 
     // Request 1000 tokens but cancel after first
     rc = mnemo_cuda_generate(ctx, "Tell me a long story", 1000, 0.7,
-                             on_token_cancel, &ctx);
+                             false, on_token_cancel, &ctx);
     // Should have stopped early (cancel returns -3 or 0 depending on timing)
     MnemoCudaStats stats = mnemo_cuda_get_stats(ctx);
     ASSERT_TRUE(stats.tokens_generated < 100, "cancel didn't stop generation early");
@@ -361,7 +361,7 @@ static void test_heat_after_generate(const char *model_dir) {
     ASSERT_EQ(rc, 0, "load failed");
 
     GenResult result = {0};
-    mnemo_cuda_generate(ctx, "Test heat profiling", 4, 0.0, on_token, &result);
+    mnemo_cuda_generate(ctx, "Test heat profiling", 4, 0.0, false, on_token, &result);
 
     MnemoCudaHeatStats hs = mnemo_cuda_get_heat_stats(ctx);
     ASSERT_TRUE(hs.total_tokens > 0, "heat total_tokens should be > 0");
