@@ -59,9 +59,13 @@ $(BUILD_DIR)/test_engine: tests/test_engine.c $(BUILD_DIR)/kernels.o $(ENGINE_OB
 $(BUILD_DIR)/test_heat: tests/test_heat.c
 	$(CC) -O2 -Wall -o $@ $< -lm
 
-test: $(BUILD_DIR)/test_heat $(BUILD_DIR)/test_engine
+$(BUILD_DIR)/test_server: tests/test_server.c | $(BUILD_DIR)
+	$(CC) -O2 -Wall -o $@ $<
+
+test: $(BUILD_DIR)/test_heat $(BUILD_DIR)/test_engine $(BUILD_DIR)/test_server
 	$(BUILD_DIR)/test_heat
 	$(BUILD_DIR)/test_engine
+	$(BUILD_DIR)/test_server
 
 install: $(BUILD_DIR)/mnemo_server
 	install -m 755 $(BUILD_DIR)/mnemo_server /usr/local/bin/mnemo_server

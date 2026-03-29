@@ -3,6 +3,7 @@
  */
 
 #include "forward.h"
+#include "log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,7 +90,7 @@ static void matvec(const void *w, const float *x, float *y,
         case 13: cuda_matvec_q5k(w, x, y, rows, cols, stream); break;
         case 14: cuda_matvec_q6k(w, x, y, rows, cols, stream); break;
         default:
-            fprintf(stderr, "[MnemoCUDA] Warning: unsupported type_id %d for matvec\n", type_id);
+            LOG_WARN("Unsupported type_id %d for matvec", type_id);
             break;
     }
 }
@@ -509,7 +510,7 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
     }
 
     if (total_lookups % 5000 == 0)
-        fprintf(stderr, "[MnemoCUDA] L1:%d L2(pf):%d L3(ram):%d L4(nvme):%d / %d (%.0f%% hit)\n",
+        LOG_INFO("L1:%d L2(pf):%d L3(ram):%d L4(nvme):%d / %d (%.0f%% hit)",
                 total_hits - total_prefetch_hits - total_ram_hits,
                 total_prefetch_hits, total_ram_hits,
                 total_lookups - total_hits,
@@ -587,7 +588,7 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
 
                 // Skip experts with I/O errors
                 if (io_pool_task_error(b) != 0) {
-                    fprintf(stderr, "[MnemoCUDA] I/O error loading layer %d expert %d, skipping\n",
+                    LOG_ERROR("I/O error loading layer %d expert %d, skipping",
                             layer, miss_eids[i]);
                     continue;
                 }
@@ -663,14 +664,14 @@ int forward_pass(MnemoCudaCtx *ctx, int token_id, int pos, float *h_logits) {
     int V = cfg->vocab_size;
 
     if (pos >= cfg->max_position_embeddings) {
-        fprintf(stderr, "[MnemoCUDA] pos %d exceeds context length %d\n",
+        LOG_ERROR("pos %d exceeds context length %d",
                 pos, cfg->max_position_embeddings);
         return -4;
     }
 
     // ── 1. Token embedding lookup ──
     TensorEntry *embd = tensor_get(ctx, "token_embd.weight");
-    if (!embd) { fprintf(stderr, "[MnemoCUDA] Missing token_embd.weight\n"); return -1; }
+    if (!embd) { LOG_ERROR("Missing token_embd.weight"); return -1; }
 
     // Embedding is quantized — extract one row on host, then upload
     // Row size depends on quant type
@@ -887,7 +888,7 @@ int forward_pass(MnemoCudaCtx *ctx, int token_id, int pos, float *h_logits) {
     cudaStreamSynchronize(cs);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
-        fprintf(stderr, "[MnemoCUDA] CUDA error before logits copy: %s\n", cudaGetErrorString(err));
+        LOG_ERROR("CUDA error before logits copy: %s", cudaGetErrorString(err));
     cudaMemcpy(h_logits, last_gpu->d_logits, V * sizeof(float), cudaMemcpyDeviceToHost);
 
     return 0;

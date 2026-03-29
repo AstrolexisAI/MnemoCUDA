@@ -3,6 +3,7 @@
  */
 
 #include "tokenizer.h"
+#include "log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,7 +24,7 @@ Tokenizer *tokenizer_load(const char *model_dir) {
     snprintf(path, sizeof(path), "%s/tokenizer.bin", model_dir);
     FILE *f = fopen(path, "rb");
     if (!f) {
-        fprintf(stderr, "[MnemoCUDA] No tokenizer.bin — run prep_tokenizer.py first\n");
+        LOG_WARN("No tokenizer.bin — run prep_tokenizer.py first");
         return NULL;
     }
 
@@ -33,7 +34,7 @@ Tokenizer *tokenizer_load(const char *model_dir) {
     uint32_t magic, vocab_size, n_merges, n_special, eos_id, im_start_id, im_end_id;
     TOK_READ(&magic, 4, 1, f);
     if (magic != 0x4D544F4B) {
-        fprintf(stderr, "[MnemoCUDA] Bad tokenizer magic: 0x%08X\n", magic);
+        LOG_ERROR("Bad tokenizer magic: 0x%08X", magic);
         fclose(f); return NULL;
     }
     TOK_READ(&vocab_size, 4, 1, f);
@@ -45,7 +46,7 @@ Tokenizer *tokenizer_load(const char *model_dir) {
 
     // Sanity checks on sizes
     if (vocab_size > TOK_MAX_VOCAB || n_merges > TOK_MAX_MERGES || n_special > TOK_MAX_SPECIAL) {
-        fprintf(stderr, "[MnemoCUDA] Tokenizer sizes out of range: vocab=%u merges=%u special=%u\n",
+        LOG_ERROR("Tokenizer sizes out of range: vocab=%u merges=%u special=%u",
                 vocab_size, n_merges, n_special);
         fclose(f); return NULL;
     }
@@ -107,12 +108,12 @@ Tokenizer *tokenizer_load(const char *model_dir) {
     }
 
     fclose(f);
-    fprintf(stderr, "[MnemoCUDA] Tokenizer: %d vocab, %d merges, %d special\n",
+    LOG_INFO("Tokenizer: %d vocab, %d merges, %d special",
             tok->vocab_size, tok->n_merges, tok->n_special);
     return tok;
 
 tok_fail:
-    fprintf(stderr, "[MnemoCUDA] Tokenizer load failed: corrupt or truncated tokenizer.bin\n");
+    LOG_ERROR("Tokenizer load failed: corrupt or truncated tokenizer.bin");
     fclose(f);
     tokenizer_free(tok);
     return NULL;

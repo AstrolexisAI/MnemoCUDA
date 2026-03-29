@@ -6,6 +6,7 @@
  */
 
 #include "engine_internal.h"
+#include "log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -112,14 +113,14 @@ void mnemo_cuda_heat_pin(MnemoCudaCtx *ctx) {
         }
 
         total_pinned += pinned;
-        fprintf(stderr, "[MnemoCUDA] GPU %d: pinned %d/%d hot experts (%.0f%% of cache)\n",
+        LOG_INFO("GPU %d: pinned %d/%d hot experts (%.0f%% of cache)",
                 gpu->gpu_id, pinned, gpu->expert_cache_slots,
                 100.0 * pinned / gpu->expert_cache_slots);
     }
 
     ctx->heat_pinning_active = true;
-    fprintf(stderr, "[MnemoCUDA] Heat pinning active: %d experts pinned across %d GPUs "
-            "(based on %lu tokens of profiling)\n",
+    LOG_INFO("Heat pinning active: %d experts pinned across %d GPUs "
+            "(based on %lu tokens of profiling)",
             total_pinned, ctx->n_gpus, (unsigned long)ctx->heat_total_tokens);
 
     free(sorted);
@@ -135,7 +136,7 @@ void mnemo_cuda_heat_save(MnemoCudaCtx *ctx) {
 
     FILE *f = fopen(heat_path, "wb");
     if (!f) {
-        fprintf(stderr, "[MnemoCUDA] Failed to save heat map: %s\n", heat_path);
+        LOG_ERROR("Failed to save heat map: %s", heat_path);
         return;
     }
 
@@ -149,7 +150,7 @@ void mnemo_cuda_heat_save(MnemoCudaCtx *ctx) {
     fwrite(ctx->heat_map, sizeof(uint32_t), n_layers * n_experts, f);
     fclose(f);
 
-    fprintf(stderr, "[MnemoCUDA] Heat map saved: %s (%lu tokens)\n",
+    LOG_INFO("Heat map saved: %s (%lu tokens)",
             heat_path, (unsigned long)ctx->heat_total_tokens);
 }
 

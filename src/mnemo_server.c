@@ -128,7 +128,7 @@ static void run_repl(MnemoCudaCtx *ctx) {
     OutputCtx out = { .fd = -1, .buf = malloc(4096), .buf_len = 0, .buf_cap = 4096 };
     char line[4096];
 
-    fprintf(stderr, "[MnemoCUDA] REPL ready. Type a prompt (Ctrl+C to exit):\n");
+    LOG_INFO("REPL ready. Type a prompt (Ctrl+C to exit)");
     while (running) {
         printf("\n> ");
         fflush(stdout);
@@ -433,7 +433,7 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
         .sin_port = htons(port),
     };
     if (inet_pton(AF_INET, bind_addr, &addr.sin_addr) != 1) {
-        fprintf(stderr, "[MnemoCUDA] Invalid bind address: %s\n", bind_addr);
+        LOG_ERROR("Invalid bind address: %s", bind_addr);
         close(server_fd); return;
     }
 
@@ -442,8 +442,8 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
     }
     listen(server_fd, 5);
 
-    fprintf(stderr, "[MnemoCUDA] HTTP server on %s:%d\n", bind_addr, port);
-    fprintf(stderr, "[MnemoCUDA] POST /v1/completions {\"prompt\":\"...\", \"max_tokens\":256, \"temperature\":0.7}\n");
+    LOG_INFO("HTTP server on %s:%d", bind_addr, port);
+    LOG_INFO("POST /v1/completions to generate");
 
     OutputCtx out = { .fd = -1, .buf = malloc(65536), .buf_len = 0, .buf_cap = 65536 };
 
@@ -757,7 +757,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    fprintf(stderr, "[MnemoCUDA] Loading model from %s...\n", model_dir);
+    LOG_INFO("Loading model from %s...", model_dir);
 
     MnemoCudaCtx *ctx = mnemo_cuda_create();
     if (!ctx) { fprintf(stderr, "Failed to create context\n"); return 1; }
@@ -771,11 +771,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    fprintf(stderr, "[MnemoCUDA] %s\n", mnemo_cuda_get_info(ctx));
+    LOG_INFO("%s", mnemo_cuda_get_info(ctx));
 
     // Pre-warm caches (configurable via --warmup off|light|full)
     if (warmup_mode > 0) {
-        fprintf(stderr, "[MnemoCUDA] Warming caches (%s)...\n",
+        LOG_INFO("Warming caches (%s)...",
                 warmup_mode == 1 ? "light" : "full");
         struct timespec tw0, tw1;
         clock_gettime(CLOCK_MONOTONIC, &tw0);
@@ -800,14 +800,14 @@ int main(int argc, char **argv) {
             warmup_out.buf_len = 0;
             warmup_out.buf[0] = '\0';
             n_rounds++;
-            fprintf(stderr, "[MnemoCUDA] Warm-up %d/%d...\n", n_rounds, max_warmup);
+            LOG_INFO("Warm-up %d/%d...", n_rounds, max_warmup);
             mnemo_cuda_generate(ctx, warmup_prompts[i], warmup_tokens[i], 0.0,
                                 false, on_token, &warmup_out);
         }
 
         clock_gettime(CLOCK_MONOTONIC, &tw1);
         double warm_secs = (tw1.tv_sec - tw0.tv_sec) + (tw1.tv_nsec - tw0.tv_nsec) / 1e9;
-        fprintf(stderr, "[MnemoCUDA] Warm-up done in %.1fs (%d rounds, cache hot)\n",
+        LOG_INFO("Warm-up done in %.1fs (%d rounds, cache hot)",
                 warm_secs, n_rounds);
         free(warmup_out.buf);
     }
@@ -830,7 +830,7 @@ int main(int argc, char **argv) {
         free(out.buf);
     }
 
-    fprintf(stderr, "[MnemoCUDA] Cleaning up...\n");
+    LOG_INFO("Cleaning up...");
     mnemo_cuda_destroy(ctx);
     return 0;
 }
