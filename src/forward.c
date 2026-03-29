@@ -787,7 +787,25 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
         int next_layer = layer + 1;
         if (next_layer < cfg->num_hidden_layers &&
             next_layer >= gpu->layer_start && next_layer < gpu->layer_end) {
-            prefetch_submit(ctx, gpu, next_layer);
+            // For SSM layers (no MoE), skip to the next MoE layer
+            if (cfg->full_attention_interval > 0) {
+                // Find next layer that has MoE (all layers have MoE in Qwen3.5)
+                prefetch_submit(ctx, gpu, next_layer);
+            } else {
+                prefetch_submit(ctx, gpu, next_layer);
+            }
+        }
+
+        // Extra prefetch: also prefetch layer+2 for deeper pipelining
+        if (ctx->extra_prefetch) {
+            int layer2 = layer + 2;
+            if (layer2 < cfg->num_hidden_layers &&
+                layer2 >= gpu->layer_start && layer2 < gpu->layer_end) {
+                // Only submit if pool has capacity (don't block current I/O)
+                // We rely on the fact that prefetch_submit for layer+1 already
+                // submitted and this will be queued after it completes
+                prefetch_submit(ctx, gpu, layer2);
+            }
         }
     }
 

@@ -198,6 +198,7 @@ struct MnemoCudaCtx {
     int last_activated[16];
     int n_last_activated;
 
+    int extra_prefetch;       // 1 = prefetch layer+2 as well as layer+1
     volatile bool cancelled;
     bool loaded;
     MnemoCudaStats stats;

@@ -724,6 +724,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  --bind ADDR     Bind address for HTTP (default 127.0.0.1)\n");
         fprintf(stderr, "  --warmup MODE   Warmup mode: off, light (1 prompt), full (6 prompts, default)\n");
         fprintf(stderr, "  --auth TOKEN    Require Bearer token for HTTP requests\n");
+        fprintf(stderr, "  --io-threads N  I/O pool threads (default 8, max 16)\n");
+        fprintf(stderr, "  --cache-pct N   VRAM %% for expert cache (default: auto)\n");
+        fprintf(stderr, "  --extra-prefetch  Enable 2-layer-ahead prefetch for higher throughput\n");
         return 1;
     }
 
@@ -737,7 +740,12 @@ int main(int argc, char **argv) {
     const char *bind_addr = "127.0.0.1";
     const char *auth_token = getenv("MNEMO_AUTH_TOKEN");
     int warmup_mode = 2;  // 0=off, 1=light, 2=full
-    for (int i = 2; i < argc - 1; i++) {
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--extra-prefetch") == 0) {
+            config.extra_prefetch = 1;
+            continue;
+        }
+        if (i + 1 >= argc) continue;  // remaining flags need a value
         if (strcmp(argv[i], "--context") == 0) {
             char *end;
             long val = strtol(argv[i+1], &end, 10);
@@ -754,6 +762,20 @@ int main(int argc, char **argv) {
             else if (strcmp(argv[i+1], "light") == 0) warmup_mode = 1;
             else if (strcmp(argv[i+1], "full") == 0) warmup_mode = 2;
             else { fprintf(stderr, "Invalid --warmup: off|light|full\n"); return 1; }
+        }
+        if (strcmp(argv[i], "--io-threads") == 0) {
+            char *end; long val = strtol(argv[i+1], &end, 10);
+            if (*end != '\0' || val < 1 || val > 16) {
+                fprintf(stderr, "Invalid --io-threads '%s' (1-16)\n", argv[i+1]); return 1;
+            }
+            config.io_threads = (int)val;
+        }
+        if (strcmp(argv[i], "--cache-pct") == 0) {
+            char *end; long val = strtol(argv[i+1], &end, 10);
+            if (*end != '\0' || val < 1 || val > 90) {
+                fprintf(stderr, "Invalid --cache-pct '%s' (1-90)\n", argv[i+1]); return 1;
+            }
+            config.cache_percent = (int)val;
         }
     }
 

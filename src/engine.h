@@ -58,7 +58,9 @@ typedef struct {
     int expert_k;             // Override active experts (0 = use config, max 16)
     int gpu_ids[8];           // CUDA device IDs (default {0})
     int n_gpus;               // Number of GPUs to use (0 = auto-detect, max 8)
-    int io_threads;           // pread threads (default 8)
+    int io_threads;           // pread threads (default 8, max 16)
+    int cache_percent;        // VRAM % for expert cache (0 = auto, 1-90)
+    int extra_prefetch;       // Prefetch depth: 0=normal, 1=also prefetch layer+2
     bool use_pinned_memory;   // Use cudaMallocHost for DMA (default true)
 } MnemoCudaConfig;
 

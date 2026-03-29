@@ -1037,7 +1037,15 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         size_t headroom = 256UL * 1024 * 1024; // 256 MB safety margin
 
         if (vram_free > headroom + max_expert_sz * 4) {
-            size_t cache_budget = vram_free - headroom;
+            size_t cache_budget;
+            if (config.cache_percent > 0 && config.cache_percent <= 90) {
+                // Use explicit percentage of total VRAM
+                cache_budget = (size_t)vram_total * config.cache_percent / 100;
+                if (cache_budget > vram_free - headroom)
+                    cache_budget = vram_free - headroom;
+            } else {
+                cache_budget = vram_free - headroom;
+            }
             gpu->expert_cache_slots = (int)(cache_budget / max_expert_sz);
             gpu->expert_cache_size = (size_t)gpu->expert_cache_slots * max_expert_sz;
 
@@ -1119,6 +1127,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
              ctx->resident_size / (1024*1024));
 
     io_pool_init(config.io_threads);
+    ctx->extra_prefetch = config.extra_prefetch;
     ctx->loaded = true;
     LOG_INFO("Ready: %s", ctx->info);
     return 0;
