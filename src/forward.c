@@ -533,77 +533,101 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
         }
     }
 
-    // ── Load NVMe misses: mmap memcpy (page cache) or pread ──
+    // ── Load NVMe misses: batch I/O in chunks of io_pool_size() ──
     if (n_misses > 0) {
-        IOTask io_tasks[16];
-        for (int i = 0; i < n_misses; i++) {
-            io_tasks[i].dst = (char *)gpu->h_expert_buf + (size_t)i * expert_size;
-            io_tasks[i].size = expert_size;
-            io_tasks[i].done = 0;
-            if (elf->mmap_data) {
-                io_tasks[i].fd = -1;
-                io_tasks[i].src = (char *)elf->mmap_data + (size_t)miss_eids[i] * expert_size;
-            } else {
-                io_tasks[i].fd = elf->fd;
-                io_tasks[i].src = NULL;
-                io_tasks[i].offset = (off_t)miss_eids[i] * (off_t)expert_size;
+        int pool_sz = io_pool_size();
+        if (pool_sz < 1) pool_sz = 1;
+        int hits_computed = 0;
+
+        // Process misses in batches that fit the I/O pool
+        for (int batch_start = 0; batch_start < n_misses; batch_start += pool_sz) {
+            int batch_end = batch_start + pool_sz;
+            if (batch_end > n_misses) batch_end = n_misses;
+            int batch_n = batch_end - batch_start;
+
+            // Submit this batch of I/O tasks
+            IOTask io_tasks[16];
+            for (int b = 0; b < batch_n; b++) {
+                int i = batch_start + b;
+                io_tasks[b].dst = (char *)gpu->h_expert_buf + (size_t)i * expert_size;
+                io_tasks[b].size = expert_size;
+                io_tasks[b].done = 0;
+                io_tasks[b].error = 0;
+                if (elf->mmap_data) {
+                    io_tasks[b].fd = -1;
+                    io_tasks[b].src = (char *)elf->mmap_data + (size_t)miss_eids[i] * expert_size;
+                } else {
+                    io_tasks[b].fd = elf->fd;
+                    io_tasks[b].src = NULL;
+                    io_tasks[b].offset = (off_t)miss_eids[i] * (off_t)expert_size;
+                }
+            }
+            io_pool_submit(io_tasks, batch_n);
+
+            // Overlap: compute cache hits while first batch is loading
+            if (!hits_computed) {
+                for (int h = 0; h < n_hits; h++) {
+                    void *d = hit_ptrs[h];
+                    matvec(d, gpu->d_normed, gpu->d_expert_gate, EFF, H, 12, cs);
+                    matvec((char *)d + gate_sz, gpu->d_normed, gpu->d_expert_up, EFF, H, 12, cs);
+                    cuda_swiglu(gpu->d_expert_gate, gpu->d_expert_up, gpu->d_expert_act, EFF, cs);
+                    matvec((char *)d + gate_sz + up_sz, gpu->d_expert_act, gpu->d_expert_out, H, EFF, down_type_id, cs);
+                    cuda_scaled_add(gpu->d_moe_out, gpu->d_expert_out, hit_weights[h], H, cs);
+                }
+                cudaStreamSynchronize(cs);
+                hits_computed = 1;
+            }
+
+            // Wait for this batch
+            io_pool_wait(batch_n);
+
+            // Process loaded experts
+            for (int b = 0; b < batch_n; b++) {
+                int i = batch_start + b;
+
+                // Skip experts with I/O errors
+                if (io_pool_task_error(b) != 0) {
+                    fprintf(stderr, "[MnemoCUDA] I/O error loading layer %d expert %d, skipping\n",
+                            layer, miss_eids[i]);
+                    continue;
+                }
+
+                void *h_buf = (char *)gpu->h_expert_buf + (size_t)i * expert_size;
+
+                ram_cache_insert(&ctx->ram_cache, layer, miss_eids[i], h_buf, expert_size);
+
+                void *d = expert_cache_insert_ctx(ctx, gpu, layer, miss_eids[i], h_buf,
+                                                   expert_size, gpu->stream_io);
+                if (!d) {
+                    cudaMemcpyAsync(gpu->d_expert_buf, h_buf, expert_size,
+                                    cudaMemcpyHostToDevice, gpu->stream_io);
+                    d = gpu->d_expert_buf;
+                }
+
+                cudaEvent_t upload_done;
+                cudaEventCreateWithFlags(&upload_done, cudaEventDisableTiming);
+                cudaEventRecord(upload_done, gpu->stream_io);
+                cudaStreamWaitEvent(cs, upload_done, 0);
+                cudaEventDestroy(upload_done);
+
+                matvec(d, gpu->d_normed, gpu->d_expert_gate, EFF, H, 12, cs);
+                matvec((char *)d + gate_sz, gpu->d_normed, gpu->d_expert_up, EFF, H, 12, cs);
+                cuda_swiglu(gpu->d_expert_gate, gpu->d_expert_up, gpu->d_expert_act, EFF, cs);
+                matvec((char *)d + gate_sz + up_sz, gpu->d_expert_act, gpu->d_expert_out, H, EFF, down_type_id, cs);
+                cuda_scaled_add(gpu->d_moe_out, gpu->d_expert_out, miss_weights[i], H, cs);
             }
         }
-        io_pool_submit(io_tasks, n_misses);
 
-        // ── While I/O runs, compute ALL cache hits on GPU (free!) ──
-        for (int h = 0; h < n_hits; h++) {
-            void *d = hit_ptrs[h];
-            matvec(d, gpu->d_normed, gpu->d_expert_gate, EFF, H, 12, cs);
-            matvec((char *)d + gate_sz, gpu->d_normed, gpu->d_expert_up, EFF, H, 12, cs);
-            cuda_swiglu(gpu->d_expert_gate, gpu->d_expert_up, gpu->d_expert_act, EFF, cs);
-            matvec((char *)d + gate_sz + up_sz, gpu->d_expert_act, gpu->d_expert_out, H, EFF, down_type_id, cs);
-            cuda_scaled_add(gpu->d_moe_out, gpu->d_expert_out, hit_weights[h], H, cs);
-        }
-
-        // ── Wait for I/O ──
-        io_pool_wait(n_misses);
-
-        // ── Pipeline: upload miss[i] + compute, overlap upload[i+1] with compute[i] ──
-        // Use CUDA events for stream sync instead of blocking cudaStreamSynchronize
-        cudaStreamSynchronize(cs); // ensure hits are done before touching cache slots
-
-        for (int i = 0; i < n_misses; i++) {
-            // Skip experts with I/O errors (corrupt/truncated reads)
-            if (io_pool_task_error(i) != 0) {
-                fprintf(stderr, "[MnemoCUDA] I/O error loading layer %d expert %d, skipping\n",
-                        layer, miss_eids[i]);
-                continue;
+        // If there were no misses batches but we have hits, compute them now
+        if (!hits_computed) {
+            for (int h = 0; h < n_hits; h++) {
+                void *d = hit_ptrs[h];
+                matvec(d, gpu->d_normed, gpu->d_expert_gate, EFF, H, 12, cs);
+                matvec((char *)d + gate_sz, gpu->d_normed, gpu->d_expert_up, EFF, H, 12, cs);
+                cuda_swiglu(gpu->d_expert_gate, gpu->d_expert_up, gpu->d_expert_act, EFF, cs);
+                matvec((char *)d + gate_sz + up_sz, gpu->d_expert_act, gpu->d_expert_out, H, EFF, down_type_id, cs);
+                cuda_scaled_add(gpu->d_moe_out, gpu->d_expert_out, hit_weights[h], H, cs);
             }
-
-            void *h_buf = (char *)gpu->h_expert_buf + (size_t)i * expert_size;
-
-            // Insert NVMe miss into RAM cache (so next time it's a RAM hit, not NVMe)
-            ram_cache_insert(&ctx->ram_cache, layer, miss_eids[i], h_buf, expert_size);
-
-            // Upload to VRAM cache (with demotion of evicted expert to RAM)
-            void *d = expert_cache_insert_ctx(ctx, gpu, layer, miss_eids[i], h_buf,
-                                               expert_size, gpu->stream_io);
-            if (!d) {
-                cudaMemcpyAsync(gpu->d_expert_buf, h_buf, expert_size,
-                                cudaMemcpyHostToDevice, gpu->stream_io);
-                d = gpu->d_expert_buf;
-            }
-
-            // Use CUDA event to sync: compute stream waits for this upload
-            // WITHOUT blocking the CPU (allows next upload to start immediately)
-            cudaEvent_t upload_done;
-            cudaEventCreateWithFlags(&upload_done, cudaEventDisableTiming);
-            cudaEventRecord(upload_done, gpu->stream_io);
-            cudaStreamWaitEvent(cs, upload_done, 0);
-            cudaEventDestroy(upload_done);
-
-            // Compute this miss on compute stream (will wait for upload via event)
-            matvec(d, gpu->d_normed, gpu->d_expert_gate, EFF, H, 12, cs);
-            matvec((char *)d + gate_sz, gpu->d_normed, gpu->d_expert_up, EFF, H, 12, cs);
-            cuda_swiglu(gpu->d_expert_gate, gpu->d_expert_up, gpu->d_expert_act, EFF, cs);
-            matvec((char *)d + gate_sz + up_sz, gpu->d_expert_act, gpu->d_expert_out, H, EFF, down_type_id, cs);
-            cuda_scaled_add(gpu->d_moe_out, gpu->d_expert_out, miss_weights[i], H, cs);
         }
     } else {
         // All hits — just compute
