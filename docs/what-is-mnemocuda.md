@@ -1,200 +1,97 @@
 # What Is MnemoCUDA?
 
-## Overview
+## Executive overview
+MnemoCUDA is an inference engine that lets very large Mixture-of-Experts (MoE)
+language models run on consumer-grade NVIDIA GPUs by **streaming expert weights from
+NVMe storage while keeping only the resident tensors in VRAM**. Rather than assuming
+the entire model must be resident, MnemoCUDA treats experts like a working set that is
+loaded on demand and cached in decreasingly fast tiers.
 
-MnemoCUDA is an **expert-streaming inference engine for Mixture-of-Experts (MoE) language models** that are too large to fit fully in GPU VRAM.
+The project targets pilot/demo-grade and emerging enterprise deployments where low
+latency is less important than being able to run huge models without datacenter
+footprints. Productivity matters: it exposes a C API, a hardened HTTP server, tests,
+and documentation covering deployment, troubleshooting, and model formats.
 
-Its purpose is to make very large MoE models practical on **consumer NVIDIA GPUs** by keeping only the always-needed model weights in VRAM and streaming expert weights from fast NVMe storage on demand.
+## Architecture at a glance
 
-In short:
+- **Resident tensors** (attention, norms, router, embeddings, output) are partitioned
+  per GPU and bound into evenly sized buffers aligned to 256 bytes. Each GPU only
+  loads what it needs, reducing VRAM use by roughly `(n_gpus - 1) * layer_weight`.
+- **Expert tensors** stay on disk until the router selects them. The engine maintains
+  a three-tier cache: VRAM (hot experts + pinned heat), host pinned memory (prefetch
+  buffers), and the OS page cache / NVMe storage.
+- **Heat profiling** tracks activation frequency for pinning and eviction decisions.
+  Persisted heat data makes the cache smarter after warmup.
+- **Forward pass** is extracted into `forward.c` with helper layers for expert cache
+  lookup/insert, prefetch submission, and batched I/O. Tensor reads go through a
+  unified `tensor_ptr_on_gpu()` that understands the new offset map.
 
-- **Resident weights** stay in GPU memory
-- **Expert weights** stay on disk until needed
-- **Hot experts** are cached in VRAM
-- **Predicted experts** are prefetched into host memory
-- **Heat profiling** improves cache behavior over time
+## Expert streaming pipeline
 
-This allows models that would normally require datacenter-scale GPU memory to run on much smaller and cheaper hardware.
+1. Load resident weights, router, and tokenizer during initialization (`engine.c`).
+2. For each token, run attention and routing on the partitions of each GPU it owns.
+3. Determine the active experts, check VRAM cache, and if missing submit I/O tasks
+   through the `io_pool` with retry-safe `read_full`/`pread_full` and batch-aware
+   error reporting.
+4. Prefetch predicted experts into host pinned memory while overlapping compute.
+5. Upload or pin experts in VRAM, run expert kernels with tiled attention safeguards,
+   and update heat statistics.
+6. Evict cold experts via LRU/heat heuristics, clamp `expert_k` to `MNEMO_MAX_EXPERT_K`
+   (default 16) to avoid OOB.
 
-## The Problem It Solves
+Every stage reacts to failures: CUDA calls are wrapped with `CUDA_LOAD_CHECK`, I/O
+errors set flags that skip failing experts, and decode errors surface through a
+`gen_error` returned by `mnemo_cuda_generate()`.
 
-Large MoE models activate only a small subset of experts per token, but traditional inference engines still assume the full model should be resident in memory.
+## Multi-GPU, observability, and telemetry
 
-That creates a mismatch:
+- GPUs own sequential layers (e.g., GPU 0 has layers 0..L0, GPU 1 has L0+1..L1).
+  Global tensors go to GPU 0 while outputs go to the final GPU. Tensor offset bounds
+  are validated against `resident_weights.bin` and `expert_size` entries from the
+  manifest.
+- Every GPU has its own KV cache, expert cache, heat stats, and `tensor_offsets`
+  remapping table, so no GPU copies unneeded tensors.
+- `/status`, `/health`, `/ready`, `/live`, and `/heat` expose TTFT, prompt tokens,
+  cache slots, pinned counts, and generation metrics. Logs include structured `req=N`
+  fields, ISO timestamps, and error strings via `mnemo_cuda_strerror()`.
+- Numeric metrics cover TTFT, prompt tokens consumed, warmup progress, token/s, heat
+  stats, and VRAM usage (excluding host-only prefetch buffers).
 
-- total model size is enormous
-- per-token active working set is much smaller
-- VRAM is the limiting resource
+## Reliability, error handling, and tests
 
-MnemoCUDA is built around the idea that **you do not need all expert weights in VRAM at once**.
+- Input validation enforces ranges for `n_gpus`, `context_length`, `gpu_ids`,
+  `expert_k`, HTTP port, and bind address.
+- `mnemo_cuda_unload()` is idempotent: resources are nulled after freeing, and `n_gpus`
+  is zeroed to stop loops. Load errors clean up immediately and return specific
+  `MnemoError` codes (`MNEMO_ERR_FATAL`, `MNEMO_ERR_UNSUPPORTED`, …
+  `MNEMO_ERR_RESOURCE`). HTTP 500/503 reflect runtime failures, SSE sends terminal
+  error events, and non-streaming requests get status-specific JSON.
+- Legacy `fprintf` calls are replaced with structured `LOG_` macros (`LOG_ERROR`,
+  `LOG_WARN`, `LOG_INFO`), and `write_full()` plus `read_full()` guarantee pipe
+  integrity with retries for partial reads/writes.
+- A suite of 24 tests covers engine lifecycle, config parsing, tensor classification,
+  error code handling, stats defaults, config validation, and GPU/non-GPU paths.
 
-## Core Idea
+## Security and deployment hardening
 
-MnemoCUDA splits model execution into two classes of weights:
+- HTTP server defaults to `127.0.0.1`, accepts `--bind`, enforces Bearer token auth via
+  `MNEMO_AUTH_TOKEN`, rejects unknown paths, and handles `OPTIONS`/CORS.
+- Prompts are parsed safely with `json_extract_string()`/`json_escape()` supporting
+  full escape sequences and preventing truncation; inputs that start with `<|im_start|>`
+  bypass ChatML wrapping via the `raw_prompt` flag.
+- Socket timeouts (30s `SO_RCVTIMEO`) protect against slow clients, and `max_tokens`
+  caps ensure KV cache limits are respected.
+- Docs cover deployment patterns (Nginx, systemd, tuning, security checklist),
+  troubleshooting (error codes + fixes), and the complete model format.
 
-- **Resident weights**
-  - attention
-  - norms
-  - router weights
-  - embeddings
-  - output head
-- **Expert weights**
-  - MoE FFN experts, loaded only when selected by the router
+## Who should look at MnemoCUDA?
 
-At runtime, the engine:
+- Teams building pilots or demos of MoE models on constrained hardware.
+- Researchers studying expert locality, heat profiling, or cache trade-offs.
+- Organizations that need a C API or HTTP/SSE frontend with clear error codes,
+  authentication, and observability hooks before committing to larger serving
+  infrastructure.
 
-1. loads resident weights into GPU memory
-2. runs attention and routing on GPU
-3. finds the active experts for the current token
-4. checks whether those experts are already in VRAM cache
-5. if not, reads them from disk into pinned host memory
-6. uploads them to GPU
-7. runs expert computation
-8. updates heat/cache statistics for future tokens
-
-## Cache Hierarchy
-
-MnemoCUDA uses a multi-level hierarchy:
-
-- **L1: VRAM cache**
-  - active and recently used experts
-  - LRU eviction with heat-aware pinning
-- **L2: Prefetch buffer**
-  - pinned host memory for predicted next-layer experts
-- **L3: OS page cache**
-  - file-backed caching through `mmap`
-- **L4: NVMe SSD**
-  - cold expert storage
-
-This is the heart of the design. The engine tries to keep the active working set close to the GPU while relying on SSD only when needed.
-
-## What Makes It Different
-
-MnemoCUDA is not just an HTTP wrapper around CUDA kernels. Its differentiator is the runtime strategy:
-
-- expert streaming from disk
-- VRAM expert cache
-- persistent heat profiling
-- prefetch based on recent and historical activation patterns
-- partitioned resident weights for multi-GPU execution
-- tiled attention that supports long contexts without shared-memory blowups
-
-The point is not only “run a model,” but “run a model that normally would not fit.”
-
-## Multi-GPU Model
-
-MnemoCUDA supports multiple GPUs using pipeline-style layer partitioning.
-
-Each GPU gets:
-
-- the resident tensors for the layers it owns
-- global tensors it actually needs
-- its own KV cache
-- its own expert cache
-
-Hidden state is transferred between GPUs using pinned host memory.
-
-This keeps the design simpler than a fully distributed inference engine while still giving meaningful scaling and VRAM savings.
-
-## Heat Profiling
-
-MnemoCUDA tracks which experts are used most often.
-
-That data is used to:
-
-- pin hot experts in VRAM
-- improve eviction decisions
-- improve prefetch decisions
-- persist behavior across restarts
-
-As a result, the engine can get faster after warmup and across repeated sessions.
-
-## Current Interfaces
-
-MnemoCUDA currently exposes:
-
-- a C API in [`src/engine.h`](/home/curly/MnemoCUDA/src/engine.h)
-- an HTTP server in [`src/mnemo_server.c`](/home/curly/MnemoCUDA/src/mnemo_server.c)
-- an async Python client in [`src/async_client.py`](/home/curly/MnemoCUDA/src/async_client.py)
-
-The HTTP server supports:
-
-- `/v1/completions`
-- `/live`
-- `/ready`
-- `/health`
-- `/status`
-- `/heat`
-
-It also supports:
-
-- localhost-only bind by default
-- optional Bearer auth
-- warmup modes
-- structured request logging
-
-## Model Format
-
-MnemoCUDA expects a split model directory containing:
-
-- `config.json`
-- `resident_weights.bin`
-- `resident_manifest.json`
-- `tokenizer.bin`
-- `experts/layer_XX.bin`
-- optionally `expert_manifest.json`
-
-See [`docs/model-format.md`](/home/curly/MnemoCUDA/docs/model-format.md) for the full specification.
-
-## What It Is Good For
-
-MnemoCUDA is well-suited for:
-
-- very large MoE models
-- cost-sensitive deployments
-- single-model dedicated serving
-- technical demos and pilots
-- research into expert locality and cache behavior
-
-It is especially attractive where:
-
-- model size exceeds VRAM
-- NVMe is fast
-- latency is acceptable in exchange for much lower hardware cost
-
-## What It Is Not
-
-MnemoCUDA is not currently:
-
-- a generic high-throughput multi-tenant inference platform
-- a batch-optimized serving engine
-- a drop-in replacement for large distributed serving systems
-- a mature enterprise orchestration stack by itself
-
-Today it is best understood as a **specialized MoE inference engine** with a strong cost/performance story.
-
-## Current Maturity
-
-MnemoCUDA is significantly more mature than an experimental prototype:
-
-- modularized engine
-- validated error codes
-- health/readiness endpoints
-- safer load-time validation
-- improved CUDA failure handling
-- structured logging
-- deployment and troubleshooting docs
-
-At the same time, it is still best described as:
-
-- strong for demos
-- strong for controlled pilots
-- improving toward production hardening
-
-## Why It Matters
-
-The strategic value of MnemoCUDA is simple:
-
-it makes it possible to run classes of models that are usually associated with expensive datacenter infrastructure on far cheaper hardware, by exploiting the sparse activation structure of MoE models instead of treating them like dense models.
-
-That is the central idea, and everything else in the project exists to make that idea practical.
+MnemoCUDA is not a drop-in distributed serving system; it is instead a specialized
+engine that **keeps hardware costs low by streaming MoE experts while still
+providing enterprise-level validation, security, and logging**.

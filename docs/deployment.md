@@ -144,6 +144,8 @@ WantedBy=multi-user.target
 | RAM | 32 GB | 64 GB (for page cache) |
 | CPU | 4 cores | 8+ cores (I/O pool) |
 
+**Hybrid MoE+SSM models** (e.g., Qwen3.5-122B) require additional VRAM for persistent SSM state buffers (~240 MB for 56 SSM layers). This is allocated automatically and reduces the VRAM available for expert cache.
+
 ## Tuning
 
 | Parameter | Effect |

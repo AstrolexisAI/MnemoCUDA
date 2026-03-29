@@ -95,6 +95,19 @@ Per-layer tensors use the format `blk.{N}.{component}`:
 | `output_norm.weight` | Final RMS norm |
 | `output.weight` | LM head |
 
+**SSM/Mamba layer tensors** (hybrid models with `full_attention_interval > 0`):
+
+| Tensor | Description |
+|--------|-------------|
+| `blk.N.ssm_in.weight` | Input projection [2*inner_size, H] |
+| `blk.N.ssm_conv1d.weight` | Causal conv1d [inner_size, conv_kernel] |
+| `blk.N.ssm_conv1d.bias` | Conv bias [inner_size] |
+| `blk.N.ssm_a.weight` | State transition A [inner_size, state_size] (log-domain) |
+| `blk.N.ssm_b.weight` | Input matrix B [group_count, state_size] |
+| `blk.N.ssm_c.weight` | Output matrix C [group_count, state_size] |
+| `blk.N.ssm_dt.bias` | Time-step bias [inner_size] |
+| `blk.N.ssm_out.weight` | Output projection [H, inner_size] |
+
 ### Validation
 
 The loader validates:

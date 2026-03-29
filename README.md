@@ -45,9 +45,12 @@ For comparison, this model normally requires 8x A100 80GB ($100K+ of GPUs). Mnem
 Any GGUF MoE model split with the preparation pipeline (see `tools/`):
 
 - Qwen3-235B, Qwen3-30B-MoE
+- **Qwen3.5-122B** (hybrid MoE+SSM with Mamba layers)
+- **GLM-4.5-128x9.4B** (MoE)
 - DeepSeek-V2/V3
 - Mixtral 8x7B, 8x22B
 - Any model with `expert_count` in GGUF metadata
+- Hybrid MoE+SSM models with `full_attention_interval` are supported
 
 ## Quick Start
 

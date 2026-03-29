@@ -145,6 +145,21 @@ curl -H "Authorization: Bearer YOUR_TOKEN" ...
 export MNEMO_AUTH_TOKEN=your_token
 ```
 
+### Hybrid MoE+SSM model (Qwen3.5, GLM-4.5)
+
+```
+[WARN] Hybrid MoE+SSM model: 18 attention layers, 56 SSM layers (interval=4).
+```
+
+This is informational. MnemoCUDA supports hybrid models with both attention and SSM (Mamba) layers. The SSM path executes automatically for non-attention layers.
+
+**Extra VRAM required:** ~240 MB for SSM state buffers (persistent recurrent state + conv sliding window). This is allocated in addition to KV cache and expert VRAM cache.
+
+**If SSM quality seems degraded:**
+- Verify the model's `ssm.*` config keys are being read (check log for `ssm_inner_size`)
+- SSM weights (`blk.N.ssm_in.weight`, `ssm_conv1d.weight`, `ssm_a/b/c.weight`, etc.) must be in resident_weights.bin
+- Check that `full_attention_interval` matches the model's architecture
+
 ## Performance Issues
 
 ### Low cache hit rate (<80%)
