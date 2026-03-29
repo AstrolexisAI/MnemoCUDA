@@ -856,4 +856,141 @@ void cuda_attention_f16kv(const void *q, const void *kv_k, const void *kv_v,
         out, head_dim, n_kv_heads, seq_len, gqa_ratio, scale);
 }
 
+// ── SSM/Mamba Kernels ──
+
+// Conv1D causal forward: update sliding window, compute convolution
+// conv_state: [inner_size, conv_kernel-1] persistent sliding window
+// x_in: [inner_size] new input at current position
+// w_conv: [inner_size, conv_kernel] weights (depthwise)
+// b_conv: [inner_size] bias
+// x_out: [inner_size] convolved + bias + SiLU output
+__global__ void ssm_conv1d_kernel(
+    const float *__restrict__ x_in,
+    float *__restrict__ conv_state,    // RW persistent state
+    const float *__restrict__ w_conv,
+    const float *__restrict__ b_conv,
+    float *__restrict__ x_out,
+    int inner_size, int conv_kernel
+) {
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= inner_size) return;
+
+    int km1 = conv_kernel - 1;
+
+    // Shift conv state left: drop oldest, append new input
+    for (int k = 0; k < km1 - 1; k++)
+        conv_state[d * km1 + k] = conv_state[d * km1 + k + 1];
+    conv_state[d * km1 + km1 - 1] = x_in[d];
+
+    // Depthwise conv: sum over kernel window
+    float val = b_conv ? b_conv[d] : 0.0f;
+    // Window: [conv_state[0..km1-1], x_in[d]] = kernel positions 0..conv_kernel-1
+    for (int k = 0; k < km1; k++)
+        val += conv_state[d * km1 + k] * w_conv[d * conv_kernel + k];
+    val += x_in[d] * w_conv[d * conv_kernel + km1];
+
+    // SiLU activation
+    float sigmoid = 1.0f / (1.0f + expf(-val));
+    x_out[d] = val * sigmoid;
+}
+
+void cuda_ssm_conv1d(const float *x_in, float *conv_state,
+                     const float *w_conv, const float *b_conv,
+                     float *x_out, int inner_size, int conv_kernel,
+                     cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (inner_size + threads - 1) / threads;
+    ssm_conv1d_kernel<<<blocks, threads, 0, stream>>>(
+        x_in, conv_state, w_conv, b_conv, x_out, inner_size, conv_kernel);
+}
+
+// SSM discrete scan: selective state space recurrence
+// For each feature d in [0, inner_size):
+//   dt = softplus(dt_bias[d] + dt_proj[d,:] @ x_conv)  -- but dt_proj is optional
+//   For grouped SSM: B and C are shared across groups
+//   A_bar = exp(dt * A[d,s])  -- A stored in log domain
+//   B_bar = dt * B[group,s]
+//   h[d,s] = A_bar * h[d,s] + B_bar * x_conv[d]
+//   y[d] = sum_s(C[group,s] * h[d,s])
+__global__ void ssm_scan_kernel(
+    const float *__restrict__ x_conv,     // [inner_size] convolved input
+    const float *__restrict__ A,          // [inner_size, state_size] log-domain
+    const float *__restrict__ B,          // [group_count, state_size]
+    const float *__restrict__ C,          // [group_count, state_size]
+    const float *__restrict__ dt_bias,    // [inner_size]
+    float *__restrict__ ssm_state,        // [inner_size, state_size] RW persistent
+    float *__restrict__ y,                // [inner_size] output
+    int inner_size, int state_size, int group_count
+) {
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= inner_size) return;
+
+    // Compute dt with softplus
+    float dt_raw = dt_bias ? dt_bias[d] : 1.0f;
+    // Add x_conv contribution for data-dependent dt
+    dt_raw += x_conv[d] * 0.01f;  // Small linear contribution
+    // Softplus: log(1 + exp(x))
+    float dt;
+    if (dt_raw > 20.0f) dt = dt_raw;  // Avoid exp overflow
+    else dt = logf(1.0f + expf(dt_raw));
+    // Clamp dt to stable range
+    dt = fminf(fmaxf(dt, 0.001f), 0.1f);
+
+    // Which group does this feature belong to
+    int group = d / (inner_size / group_count);
+    if (group >= group_count) group = group_count - 1;
+
+    // SSM recurrence over state dimensions
+    float out = 0.0f;
+    for (int s = 0; s < state_size; s++) {
+        float log_a = A[d * state_size + s];        // Negative log-domain
+        float b_val = B[group * state_size + s];
+        float c_val = C[group * state_size + s];
+
+        // Discretize: A_bar = exp(dt * log_a)
+        float a_bar = expf(dt * log_a);
+        float b_bar = dt * b_val;
+
+        // State update
+        float h_old = ssm_state[d * state_size + s];
+        float h_new = a_bar * h_old + b_bar * x_conv[d];
+        ssm_state[d * state_size + s] = h_new;
+
+        // Output accumulation
+        out += c_val * h_new;
+    }
+
+    y[d] = out;
+}
+
+void cuda_ssm_scan(const float *x_conv, const float *A, const float *B,
+                   const float *C, const float *dt_bias,
+                   float *ssm_state, float *y,
+                   int inner_size, int state_size, int group_count,
+                   cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (inner_size + threads - 1) / threads;
+    ssm_scan_kernel<<<blocks, threads, 0, stream>>>(
+        x_conv, A, B, C, dt_bias, ssm_state, y,
+        inner_size, state_size, group_count);
+}
+
+// SSM gate: y = y * silu(z)
+__global__ void ssm_gate_kernel(
+    float *__restrict__ y,
+    const float *__restrict__ z,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float sigmoid = 1.0f / (1.0f + expf(-z[i]));
+    y[i] = y[i] * (z[i] * sigmoid);
+}
+
+void cuda_ssm_gate(float *y, const float *z, int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    ssm_gate_kernel<<<blocks, threads, 0, stream>>>(y, z, n);
+}
+
 } // extern "C"

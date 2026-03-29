@@ -41,6 +41,17 @@ extern void cuda_f32_to_f16(const float *in, void *out, int n, cudaStream_t stre
 extern void cuda_attention_f16kv(const void *q, const void *kv_k, const void *kv_v,
                                  float *out, int n_heads_q, int head_dim, int n_kv_heads,
                                  int seq_len, int gqa_ratio, float scale, cudaStream_t stream);
+// SSM/Mamba kernels
+extern void cuda_ssm_conv1d(const float *x_in, float *conv_state,
+                            const float *w_conv, const float *b_conv,
+                            float *x_out, int inner_size, int conv_kernel,
+                            cudaStream_t stream);
+extern void cuda_ssm_scan(const float *x_conv, const float *A, const float *B,
+                          const float *C, const float *dt_bias,
+                          float *ssm_state, float *y,
+                          int inner_size, int state_size, int group_count,
+                          cudaStream_t stream);
+extern void cuda_ssm_gate(float *y, const float *z, int n, cudaStream_t stream);
 
 // ── Helper: get tensor data on specific GPU ──
 
@@ -301,6 +312,120 @@ void *expert_cache_insert(GPUState *gpu, int layer, int expert_id,
     return expert_cache_insert_ctx(NULL, gpu, layer, expert_id, host_data, data_size, stream);
 }
 
+// ── SSM/Mamba forward for hybrid layers ──
+
+static void forward_ssm_block(MnemoCudaCtx *ctx, int layer, int gpu_idx) {
+    GPUState *gpu = &ctx->gpus[gpu_idx];
+    ModelConfig *cfg = &ctx->config;
+    int H = cfg->hidden_size;
+    int INNER = cfg->ssm_inner_size;
+    int SS = cfg->ssm_state_size;
+    int CK = cfg->ssm_conv_kernel;
+    int GC = cfg->ssm_group_count;
+    float eps = cfg->rms_norm_eps;
+    cudaStream_t cs = gpu->stream_compute;
+    char tname[128];
+
+    if (!gpu->d_ssm_state || !gpu->d_ssm_x || INNER <= 0) return;
+
+    // Find SSM layer index for this GPU's state buffers
+    int ssm_idx = -1;
+    for (int i = 0; i < gpu->n_ssm_layers; i++) {
+        if (gpu->ssm_layer_map[i] == layer) { ssm_idx = i; break; }
+    }
+    if (ssm_idx < 0) return;
+
+    // Pointers into per-layer persistent state
+    float *layer_ssm_state = gpu->d_ssm_state + (size_t)ssm_idx * INNER * SS;
+    float *layer_conv_state = gpu->d_conv_state + (size_t)ssm_idx * INNER * (CK - 1);
+
+    // ── 1. Pre-SSM RMS norm (uses attn_norm for SSM layers in Qwen3.5) ──
+    snprintf(tname, sizeof(tname), "blk.%d.attn_norm.weight", layer);
+    void *norm_w = tensor_data_on_gpu(ctx, tname, gpu_idx);
+    if (norm_w)
+        cuda_rms_norm(gpu->d_hidden, (float *)norm_w, gpu->d_normed, H, eps, cs);
+
+    // Save residual
+    cudaMemcpyAsync(gpu->d_residual, gpu->d_hidden, H * sizeof(float),
+                    cudaMemcpyDeviceToDevice, cs);
+
+    // ── 2. Input projection: [H] → [2*INNER] split into x[INNER] and z[INNER] ──
+    snprintf(tname, sizeof(tname), "blk.%d.ssm_in.weight", layer);
+    TensorEntry *w_in = tensor_get(ctx, tname);
+    if (!w_in) return;
+
+    // Project to 2*INNER: first half is x, second half is z (gate)
+    // We compute x and z separately using two matvecs with offsets
+    void *w_in_ptr = tensor_ptr_on_gpu(ctx, w_in, gpu_idx);
+    if (!w_in_ptr) return;
+
+    // x = W_in[0:INNER, :] @ normed
+    matvec(w_in_ptr, gpu->d_normed, gpu->d_ssm_x, INNER, H, w_in->type_id, cs);
+    // z = W_in[INNER:2*INNER, :] @ normed
+    // Offset into weight matrix by INNER rows
+    size_t row_bytes;
+    int block_values, block_bytes_size;
+    switch (w_in->type_id) {
+        case 12: block_values = 256; block_bytes_size = 144; break;
+        case 14: block_values = 256; block_bytes_size = 210; break;
+        case 8:  block_values = 32;  block_bytes_size = 34; break;
+        default: block_values = 1; block_bytes_size = 4; break;
+    }
+    row_bytes = (size_t)((H + block_values - 1) / block_values) * block_bytes_size;
+    matvec((char *)w_in_ptr + INNER * row_bytes,
+           gpu->d_normed, gpu->d_ssm_z, INNER, H, w_in->type_id, cs);
+
+    // ── 3. Causal convolution ──
+    snprintf(tname, sizeof(tname), "blk.%d.ssm_conv1d.weight", layer);
+    TensorEntry *w_conv = tensor_get(ctx, tname);
+    snprintf(tname, sizeof(tname), "blk.%d.ssm_conv1d.bias", layer);
+    TensorEntry *b_conv = tensor_get(ctx, tname);
+
+    float *conv_w_ptr = w_conv ? (float *)tensor_ptr_on_gpu(ctx, w_conv, gpu_idx) : NULL;
+    float *conv_b_ptr = b_conv ? (float *)tensor_ptr_on_gpu(ctx, b_conv, gpu_idx) : NULL;
+
+    if (conv_w_ptr) {
+        cuda_ssm_conv1d(gpu->d_ssm_x, layer_conv_state,
+                        conv_w_ptr, conv_b_ptr,
+                        gpu->d_ssm_x, INNER, CK, cs);
+    }
+
+    // ── 4. SSM scan (selective state space recurrence) ──
+    snprintf(tname, sizeof(tname), "blk.%d.ssm_a.weight", layer);
+    TensorEntry *w_a = tensor_get(ctx, tname);
+    snprintf(tname, sizeof(tname), "blk.%d.ssm_b.weight", layer);
+    TensorEntry *w_b = tensor_get(ctx, tname);
+    snprintf(tname, sizeof(tname), "blk.%d.ssm_c.weight", layer);
+    TensorEntry *w_c = tensor_get(ctx, tname);
+    snprintf(tname, sizeof(tname), "blk.%d.ssm_dt.bias", layer);
+    TensorEntry *w_dt_bias = tensor_get(ctx, tname);
+
+    float *a_ptr = w_a ? (float *)tensor_ptr_on_gpu(ctx, w_a, gpu_idx) : NULL;
+    float *b_ptr = w_b ? (float *)tensor_ptr_on_gpu(ctx, w_b, gpu_idx) : NULL;
+    float *c_ptr = w_c ? (float *)tensor_ptr_on_gpu(ctx, w_c, gpu_idx) : NULL;
+    float *dt_bias_ptr = w_dt_bias ? (float *)tensor_ptr_on_gpu(ctx, w_dt_bias, gpu_idx) : NULL;
+
+    if (a_ptr && b_ptr && c_ptr) {
+        cuda_ssm_scan(gpu->d_ssm_x, a_ptr, b_ptr, c_ptr, dt_bias_ptr,
+                      layer_ssm_state, gpu->d_ssm_y,
+                      INNER, SS, GC, cs);
+    }
+
+    // ── 5. Gate: y = y * silu(z) ──
+    cuda_ssm_gate(gpu->d_ssm_y, gpu->d_ssm_z, INNER, cs);
+
+    // ── 6. Output projection: [INNER] → [H] ──
+    snprintf(tname, sizeof(tname), "blk.%d.ssm_out.weight", layer);
+    TensorEntry *w_out = tensor_get(ctx, tname);
+    if (w_out) {
+        matvec(tensor_ptr_on_gpu(ctx, w_out, gpu_idx),
+               gpu->d_ssm_y, gpu->d_hidden, H, INNER, w_out->type_id, cs);
+    }
+
+    // ── 7. Residual connection ──
+    cuda_residual_add(gpu->d_hidden, gpu->d_residual, gpu->d_hidden, H, cs);
+}
+
 void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
     GPUState *gpu = &ctx->gpus[gpu_idx];
     cudaSetDevice(gpu->gpu_id);
@@ -401,10 +526,10 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
                         gpu->d_attn_out, gpu->d_hidden, H, NH * HD, wo->type_id, cs);
 
         cuda_residual_add(gpu->d_hidden, gpu->d_residual, gpu->d_hidden, H, cs);
+    } else {
+        // SSM/Mamba layer: run SSM recurrence instead of attention
+        forward_ssm_block(ctx, layer, gpu_idx);
     }
-    // SSM layers: attention block skipped (SSM/Mamba not yet implemented).
-    // Hidden state passes through to the MoE/FFN block unchanged.
-    // This produces degraded output but prevents crashes on hybrid models.
 
     // ── 8. Pre-FFN RMS norm ──
     snprintf(tname, sizeof(tname), "blk.%d.ffn_norm.weight", layer);

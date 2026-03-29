@@ -427,6 +427,11 @@ static int load_config_json(MnemoCudaCtx *ctx, const char *path) {
     CFG_FLOAT(rms_norm_eps, "attention.layer_norm_rms_epsilon", 1e-6f);
     CFG_INT(max_position_embeddings, "context_length", 40960);
     CFG_INT(full_attention_interval, "full_attention_interval", 0);
+    CFG_INT(ssm_inner_size, "ssm.inner_size", 0);
+    CFG_INT(ssm_state_size, "ssm.state_size", 0);
+    CFG_INT(ssm_conv_kernel, "ssm.conv_kernel", 4);
+    CFG_INT(ssm_group_count, "ssm.group_count", 1);
+    CFG_INT(ssm_dt_rank, "ssm.time_step_rank", 64);
 
     // Read vocab_size from metadata (try multiple common keys)
     int vs = json_get_int(json, "tokenizer.ggml.tokens_count", 0);
@@ -980,6 +985,53 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         gpu->n_prefetched = 0;
         gpu->prefetch_ready = 0;
 
+        // SSM/Mamba state buffers (hybrid models only)
+        gpu->d_ssm_state = NULL;
+        gpu->d_conv_state = NULL;
+        gpu->d_ssm_x = NULL;
+        gpu->d_ssm_z = NULL;
+        gpu->d_ssm_y = NULL;
+        gpu->n_ssm_layers = 0;
+        gpu->ssm_layer_map = NULL;
+
+        if (cfg->full_attention_interval > 0 && cfg->ssm_inner_size > 0) {
+            int INNER = cfg->ssm_inner_size;
+            int SS = cfg->ssm_state_size;
+            int CK = cfg->ssm_conv_kernel;
+
+            // Count SSM layers on this GPU
+            int n_ssm = 0;
+            for (int l = gpu->layer_start; l < gpu->layer_end; l++)
+                if (l % cfg->full_attention_interval != 0) n_ssm++;
+
+            if (n_ssm > 0) {
+                gpu->n_ssm_layers = n_ssm;
+                gpu->ssm_layer_map = (int *)malloc(n_ssm * sizeof(int));
+                int idx = 0;
+                for (int l = gpu->layer_start; l < gpu->layer_end; l++)
+                    if (l % cfg->full_attention_interval != 0)
+                        gpu->ssm_layer_map[idx++] = l;
+
+                // Persistent state: ssm_state[n_ssm][INNER][SS] + conv_state[n_ssm][INNER][CK-1]
+                size_t ssm_state_sz = (size_t)n_ssm * INNER * SS * sizeof(float);
+                size_t conv_state_sz = (size_t)n_ssm * INNER * (CK - 1) * sizeof(float);
+                CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_ssm_state, ssm_state_sz));
+                CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_conv_state, conv_state_sz));
+                cudaMemset(gpu->d_ssm_state, 0, ssm_state_sz);
+                cudaMemset(gpu->d_conv_state, 0, conv_state_sz);
+
+                // Temp buffers (reused across layers)
+                CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_ssm_x, INNER * sizeof(float)));
+                CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_ssm_z, INNER * sizeof(float)));
+                CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_ssm_y, INNER * sizeof(float)));
+
+                LOG_INFO("GPU %d: %d SSM layers, state %.1f MB, conv %.1f MB",
+                         gpu->gpu_id, n_ssm,
+                         (double)ssm_state_sz / (1024*1024),
+                         (double)conv_state_sz / (1024*1024));
+            }
+        }
+
         size_t vram_free = 0, vram_total = 0;
         cudaMemGetInfo(&vram_free, &vram_total);
         size_t headroom = 256UL * 1024 * 1024; // 256 MB safety margin
@@ -1114,6 +1166,14 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
         free(gpu->cache_hits);
         free(gpu->cache_pinned);
         free(gpu->tensor_offsets);
+
+        // SSM buffers
+        cudaFree(gpu->d_ssm_state);
+        cudaFree(gpu->d_conv_state);
+        cudaFree(gpu->d_ssm_x);
+        cudaFree(gpu->d_ssm_z);
+        cudaFree(gpu->d_ssm_y);
+        free(gpu->ssm_layer_map);
 
         cudaStreamDestroy(gpu->stream_compute);
         cudaStreamDestroy(gpu->stream_io);
