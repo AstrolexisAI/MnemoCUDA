@@ -203,11 +203,13 @@ static void prefetch_wait(GPUState *gpu, int n) {
     gpu->prefetch_ready = 1;
 }
 
-// Check if an expert is in the prefetch buffer; returns host pointer or NULL
+// Check if an expert is in the prefetch buffer; returns host pointer or NULL.
+// Returns NULL if the I/O for that slot had an error.
 static void *prefetch_lookup(GPUState *gpu, int layer, int expert_id, size_t expert_size) {
     if (gpu->prefetch_layer != layer || !gpu->prefetch_ready) return NULL;
     for (int i = 0; i < gpu->n_prefetched; i++) {
         if (gpu->prefetch_eids[i] == expert_id) {
+            if (io_pool_task_error(i) != 0) return NULL;  // I/O failed
             return (char *)gpu->h_prefetch_buf + (size_t)i * expert_size;
         }
     }
@@ -567,6 +569,13 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
         cudaStreamSynchronize(cs); // ensure hits are done before touching cache slots
 
         for (int i = 0; i < n_misses; i++) {
+            // Skip experts with I/O errors (corrupt/truncated reads)
+            if (io_pool_task_error(i) != 0) {
+                fprintf(stderr, "[MnemoCUDA] I/O error loading layer %d expert %d, skipping\n",
+                        layer, miss_eids[i]);
+                continue;
+            }
+
             void *h_buf = (char *)gpu->h_expert_buf + (size_t)i * expert_size;
 
             // Insert NVMe miss into RAM cache (so next time it's a RAM hit, not NVMe)

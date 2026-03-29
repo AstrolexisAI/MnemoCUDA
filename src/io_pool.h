@@ -27,5 +27,6 @@ int  io_pool_size(void);           // current pool size (0 if not init'd)
 void io_pool_submit_wait(IOTask *tasks, int n);
 void io_pool_submit(IOTask *tasks, int n);
 void io_pool_wait(int n);
+int  io_pool_task_error(int idx);     // error code for completed task idx (0 = ok)
 
 #endif

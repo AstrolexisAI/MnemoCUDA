@@ -498,7 +498,8 @@ static void run_http(MnemoCudaCtx *ctx, int port) {
             free(req); close(client_fd);
             continue;
         }
-        if (strncmp(req + 5, "/v1/completions", 15) != 0) {
+        if (strncmp(req + 5, "/v1/completions ", 16) != 0 &&
+            strncmp(req + 5, "/v1/completions\r", 16) != 0) {
             http_respond_error(client_fd, 404, "Not Found");
             free(req); close(client_fd);
             continue;

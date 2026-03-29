@@ -119,3 +119,8 @@ void io_pool_wait(int n) {
     for (int i = 0; i < n; i++)
         sem_wait(&g_io_pool.task_done[i]);
 }
+
+int io_pool_task_error(int idx) {
+    if (idx < 0 || idx >= g_io_pool.size) return -1;
+    return g_io_pool.tasks[idx].error;
+}

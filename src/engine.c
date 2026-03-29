@@ -1215,9 +1215,9 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
     for (int g = 0; g < ctx->n_gpus; g++) {
         GPUState *gpu = &ctx->gpus[g];
         vram += gpu->resident_size;
-        vram += gpu->expert_buf_size;
-        vram += gpu->expert_cache_size;
-        vram += gpu->prefetch_buf_size;
+        vram += gpu->expert_buf_size;  // device expert staging buffer
+        vram += gpu->expert_cache_size; // device expert LRU cache
+        // Note: prefetch_buf is pinned HOST memory, not VRAM
         // KV cache: 2 * n_layers * ctx_len * NKV * HD * sizeof(fp16)
         int n_layers = gpu->layer_end - gpu->layer_start;
         size_t kv_per_tok = (size_t)cfg->num_key_value_heads * cfg->head_dim * sizeof(uint16_t);
