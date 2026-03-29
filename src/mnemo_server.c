@@ -53,7 +53,7 @@ static void on_token(const char *text, bool is_done, void *userdata) {
         if (out->fd == -2) {
             // Silent mode (warmup) — skip output, just accumulate below
         } else if (out->fd >= 0) {
-            // HTTP SSE: data: {"token": "..."}\n\n
+            // HTTP SSE: emit raw bytes — proxy handles UTF-8 assembly
             char *escaped = json_escape(text, strlen(text));
             if (escaped) {
                 char sse[4096];
@@ -74,7 +74,7 @@ static void on_token(const char *text, bool is_done, void *userdata) {
         while (out->buf_len + tlen + 1 > out->buf_cap) {
             out->buf_cap *= 2;
             void *new_buf = realloc(out->buf, out->buf_cap);
-            if (!new_buf) { out->buf_cap /= 2; break; } // OOM: stop accumulating
+            if (!new_buf) { out->buf_cap /= 2; break; }
             out->buf = new_buf;
         }
         if (out->buf_len + tlen + 1 <= out->buf_cap) {
