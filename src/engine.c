@@ -380,9 +380,11 @@ static int load_config_json(MnemoCudaCtx *ctx, const char *path) {
     json[size] = '\0';
     fclose(f);
 
-    // Auto-detect architecture prefix
+    // Auto-detect architecture prefix (order matters: longer prefixes first)
     const char *prefix = "qwen3moe";
-    if (strstr(json, "\"qwen3next.")) prefix = "qwen3next";
+    if (strstr(json, "\"qwen35moe.")) prefix = "qwen35moe";
+    else if (strstr(json, "\"glm4moe.")) prefix = "glm4moe";
+    else if (strstr(json, "\"qwen3next.")) prefix = "qwen3next";
     else if (strstr(json, "\"llama.")) prefix = "llama";
     else if (strstr(json, "\"qwen2.")) prefix = "qwen2";
     LOG_INFO("Config prefix: %s", prefix);
