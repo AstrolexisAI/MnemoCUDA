@@ -21,6 +21,7 @@
 #include <arpa/inet.h>
 #include <time.h>
 #include "engine.h"
+#include "log.h"
 
 static volatile int running = 1;
 
@@ -413,7 +414,8 @@ static char *json_escape(const char *src, int len) {
 
 // ── HTTP server mode ──
 
-static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr) {
+static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
+                     const char *auth_token) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) { perror("socket"); return; }
 
@@ -466,6 +468,25 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr) {
             continue;
         }
 
+        // Bearer token authentication (if configured)
+        if (auth_token) {
+            char expected[512];
+            snprintf(expected, sizeof(expected), "Bearer %s", auth_token);
+            char *auth_hdr = strcasestr(req, "Authorization:");
+            int authorized = 0;
+            if (auth_hdr) {
+                auth_hdr += 14;
+                while (*auth_hdr == ' ') auth_hdr++;
+                if (strncmp(auth_hdr, expected, strlen(expected)) == 0)
+                    authorized = 1;
+            }
+            if (!authorized) {
+                http_respond_error(client_fd, 401, "Unauthorized");
+                free(req); close(client_fd);
+                continue;
+            }
+        }
+
         // GET /heat — return heat stats as JSON
         if (strncmp(req, "GET /heat", 9) == 0) {
             MnemoCudaHeatStats hs = mnemo_cuda_get_heat_stats(ctx);
@@ -496,6 +517,22 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr) {
                 "],\"ram\":{\"slots\":%d,\"used\":%d,\"hits\":%d,\"misses\":%d}}",
                 hs.ram_slots, hs.ram_used, hs.ram_hits, hs.ram_misses);
 
+            http_respond_json(client_fd, json, off);
+            free(req); close(client_fd);
+            continue;
+        }
+
+        // GET /health — readiness check with basic stats
+        if (strncmp(req, "GET /health", 11) == 0) {
+            MnemoCudaStats s = mnemo_cuda_get_stats(ctx);
+            char json[512];
+            int off = snprintf(json, sizeof(json),
+                "{\"status\":\"ready\",\"model\":\"%s\","
+                "\"vram_mb\":%.0f,\"resident_mb\":%.0f,\"gpus\":%d}",
+                mnemo_cuda_get_info(ctx),
+                (double)s.vram_used_bytes / (1024*1024),
+                (double)s.resident_size_bytes / (1024*1024),
+                s.n_gpus_active);
             http_respond_json(client_fd, json, off);
             free(req); close(client_fd);
             continue;
@@ -608,6 +645,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "\nOptions:\n");
         fprintf(stderr, "  --context N     Context length (default 8192, range 128-131072)\n");
         fprintf(stderr, "  --bind ADDR     Bind address for HTTP (default 127.0.0.1)\n");
+        fprintf(stderr, "  --warmup MODE   Warmup mode: off, light (1 prompt), full (6 prompts, default)\n");
+        fprintf(stderr, "  --auth TOKEN    Require Bearer token for HTTP requests\n");
         return 1;
     }
 
@@ -618,7 +657,9 @@ int main(int argc, char **argv) {
 
     // Parse CLI options
     MnemoCudaConfig config = mnemo_cuda_config_default();
-    const char *bind_addr = "127.0.0.1";  // safe default: localhost only
+    const char *bind_addr = "127.0.0.1";
+    const char *auth_token = NULL;
+    int warmup_mode = 2;  // 0=off, 1=light, 2=full
     for (int i = 2; i < argc - 1; i++) {
         if (strcmp(argv[i], "--context") == 0) {
             long val = strtol(argv[i+1], NULL, 10);
@@ -629,6 +670,13 @@ int main(int argc, char **argv) {
             config.context_length = (int)val;
         }
         if (strcmp(argv[i], "--bind") == 0) bind_addr = argv[i+1];
+        if (strcmp(argv[i], "--auth") == 0) auth_token = argv[i+1];
+        if (strcmp(argv[i], "--warmup") == 0) {
+            if (strcmp(argv[i+1], "off") == 0) warmup_mode = 0;
+            else if (strcmp(argv[i+1], "light") == 0) warmup_mode = 1;
+            else if (strcmp(argv[i+1], "full") == 0) warmup_mode = 2;
+            else { fprintf(stderr, "Invalid --warmup: off|light|full\n"); return 1; }
+        }
     }
 
     fprintf(stderr, "[MnemoCUDA] Loading model from %s...\n", model_dir);
@@ -647,10 +695,10 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "[MnemoCUDA] %s\n", mnemo_cuda_get_info(ctx));
 
-    // Pre-warm caches: multi-round diverse prompts to fill VRAM + page cache.
-    // Different topics activate different experts — diverse warmup = better coverage.
-    {
-        fprintf(stderr, "[MnemoCUDA] Warming caches (multi-round)...\n");
+    // Pre-warm caches (configurable via --warmup off|light|full)
+    if (warmup_mode > 0) {
+        fprintf(stderr, "[MnemoCUDA] Warming caches (%s)...\n",
+                warmup_mode == 1 ? "light" : "full");
         struct timespec tw0, tw1;
         clock_gettime(CLOCK_MONOTONIC, &tw0);
 
@@ -669,11 +717,12 @@ int main(int argc, char **argv) {
         int warmup_tokens[] = { 20, 30, 30, 20, 20, 30 };
         int n_rounds = 0;
 
-        for (int i = 0; warmup_prompts[i]; i++) {
+        int max_warmup = (warmup_mode == 1) ? 1 : 6;
+        for (int i = 0; warmup_prompts[i] && i < max_warmup; i++) {
             warmup_out.buf_len = 0;
             warmup_out.buf[0] = '\0';
             n_rounds++;
-            fprintf(stderr, "[MnemoCUDA] Warm-up %d/6...\n", n_rounds);
+            fprintf(stderr, "[MnemoCUDA] Warm-up %d/%d...\n", n_rounds, max_warmup);
             mnemo_cuda_generate(ctx, warmup_prompts[i], warmup_tokens[i], 0.0,
                                 on_token, &warmup_out);
         }
@@ -694,7 +743,7 @@ int main(int argc, char **argv) {
             mnemo_cuda_destroy(ctx);
             return 1;
         }
-        run_http(ctx, (int)port, bind_addr);
+        run_http(ctx, (int)port, bind_addr, auth_token);
     } else if (argc >= 3) {
         // Single prompt
         OutputCtx out = { .fd = -1, .buf = malloc(65536), .buf_len = 0, .buf_cap = 65536 };

@@ -37,11 +37,11 @@ Tested on **Qwen3-235B-A22B** (128 experts/layer, K=8, 94 layers, Q4_K_M):
 | RTX 4090 + RTX 5090 | 43 GB (3,690 slots) | 88% | ~5 | 9.3s |
 | RTX 4090 (single) | 17 GB (1,478 slots) | ~75% | ~2.5 | ~18s |
 
-For comparison, this model normally requires 8× A100 80GB ($100K+ of GPUs). MnemoCUDA runs it on **$2,600 of consumer hardware**.
+For comparison, this model normally requires 8x A100 80GB ($100K+ of GPUs). MnemoCUDA runs it on **$2,600 of consumer hardware**.
 
 ## Supported Models
 
-Any GGUF MoE model split with `tools/gguf_expert_split.py`:
+Any GGUF MoE model split with the preparation pipeline (see `tools/`):
 
 - Qwen3-235B, Qwen3-30B-MoE
 - DeepSeek-V2/V3
@@ -56,6 +56,7 @@ Any GGUF MoE model split with `tools/gguf_expert_split.py`:
 - CUDA Toolkit 12.x
 - Fast NVMe SSD (PCIe 4.0+ recommended, >3 GB/s)
 - Linux (kernel 5.x+)
+- GCC or compatible C compiler
 
 ### Build
 
@@ -67,20 +68,22 @@ make
 
 The build auto-detects your GPU architecture. Override with `GPU_ARCH=sm_89 make`.
 
+To override the compiler: `CC=gcc CXX=g++ make`.
+
 ### Prepare a Model
 
-Split a GGUF MoE model into the streaming format:
+Split a GGUF MoE model into the streaming format using the tools in `tools/`:
 
-```bash
-pip install gguf numpy
-python tools/gguf_expert_split.py /path/to/model.gguf /path/to/output_dir/
-```
+1. `tools/prep_tokenizer.py` — Convert HuggingFace tokenizer to binary format
+2. Split model weights into resident + per-layer expert files
 
-This produces:
+The output structure:
 ```
 output_dir/
 ├── config.json              # Model config (layers, experts, dimensions)
 ├── resident_weights.bin     # Non-expert tensors (~5 GB)
+├── resident_manifest.json   # Tensor index for resident weights
+├── expert_manifest.json     # Expert size/layout metadata
 ├── tokenizer.bin            # BPE tokenizer (binary format)
 └── experts/
     ├── layer_00.bin          # Expert weights for layer 0
@@ -91,14 +94,23 @@ output_dir/
 ### Run
 
 ```bash
-# HTTP API server (production)
+# HTTP API server (binds to localhost by default)
 ./build/mnemo_server /path/to/split_model --http 8095
+
+# Public access (use behind reverse proxy in production)
+./build/mnemo_server /path/to/split_model --http 8095 --bind 0.0.0.0
+
+# With authentication
+./build/mnemo_server /path/to/split_model --http 8095 --auth YOUR_SECRET_TOKEN
 
 # Interactive REPL
 ./build/mnemo_server /path/to/split_model --repl
 
 # Single prompt
 ./build/mnemo_server /path/to/split_model "Explain quantum computing"
+
+# Skip warmup for faster startup
+./build/mnemo_server /path/to/split_model --http 8095 --warmup off
 ```
 
 ### HTTP API
@@ -109,8 +121,24 @@ curl -X POST http://localhost:8095/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Hello", "max_tokens": 256, "temperature": 0.7, "stream": true}'
 
+# Non-streaming
+curl -X POST http://localhost:8095/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Hello", "max_tokens": 256, "stream": false}'
+
+# Health check
+curl http://localhost:8095/health
+
 # Expert heat profiling stats
 curl http://localhost:8095/heat
+```
+
+With authentication:
+```bash
+curl -X POST http://localhost:8095/v1/completions \
+  -H "Authorization: Bearer YOUR_SECRET_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Hello", "max_tokens": 256}'
 ```
 
 ## Architecture
@@ -147,21 +175,25 @@ Token → Embedding → [Layer 0..N] → LM Head → Next Token
 
 The VRAM cache uses **heat-aware LRU eviction**:
 
-1. Each expert activation is counted in a **heat map** (layer × expert_id)
+1. Each expert activation is counted in a **heat map** (layer x expert_id)
 2. After warmup, the **hottest 50%** of cache slots are **pinned** — never evicted
 3. A **prefetch engine** reads predicted experts for layer N+1 while GPU computes layer N
 4. **CUDA events** (not `cudaStreamSynchronize`) allow upload and compute to truly overlap
 
 ### Multi-GPU Support
 
-MnemoCUDA distributes layers across GPUs via pipeline parallelism:
+MnemoCUDA distributes layers across GPUs via pipeline parallelism with **partitioned resident weights** — each GPU only loads the tensors for its assigned layers:
 
 ```
-GPU 0 (RTX 4090, 24 GB): Layers 0-46   — 17 GB VRAM cache
-GPU 1 (RTX 5090, 32 GB): Layers 47-93  — 26 GB VRAM cache
+GPU 0 (RTX 4090, 24 GB): Layers 0-46   — resident + embeddings
+GPU 1 (RTX 5090, 32 GB): Layers 47-93  — resident + output head
 ```
 
 Hidden state transfers between GPUs use pinned host memory.
+
+### Tiled Attention
+
+Attention uses **tiled online softmax** (Flash Attention style) with fixed shared memory (~8 KB), enabling arbitrarily long contexts without SM shared memory overflow.
 
 ## REPL Commands
 
@@ -180,7 +212,10 @@ Hidden state transfers between GPUs use pinned host memory.
 |----------|---------|-------------|
 | `--http <port>` | — | Run as HTTP server |
 | `--repl` | — | Interactive mode |
-| `--context <n>` | 8192 | Max context length (affects KV cache VRAM usage) |
+| `--context <n>` | 8192 | Max context length (128-131072) |
+| `--bind <addr>` | 127.0.0.1 | Bind address for HTTP server |
+| `--warmup <mode>` | full | Warmup mode: `off`, `light` (1 prompt), `full` (6 prompts) |
+| `--auth <token>` | — | Require Bearer token for HTTP requests |
 
 Lower context = more VRAM for expert cache = higher hit rate = faster generation.
 
@@ -189,21 +224,27 @@ Lower context = more VRAM for expert cache = higher hit rate = faster generation
 ```
 MnemoCUDA/
 ├── src/
-│   ├── engine.c           # Core inference engine (2,500+ lines)
-│   ├── engine.h           # Public C API
-│   ├── kernels.cu         # CUDA kernels (matvec, attention, SwiGLU, RoPE, topK)
-│   ├── mnemo_server.c     # HTTP/REPL server
-│   └── async_client.py    # Python async HTTP client
+│   ├── engine.c              # Lifecycle, config loading, sampling, generate
+│   ├── engine.h              # Public C API
+│   ├── engine_internal.h     # Shared internal types (ModelConfig, GPUState, etc.)
+│   ├── forward.c/h           # Forward pass, expert cache, prefetch, matvec dispatch
+│   ├── tokenizer.c/h         # BPE tokenizer (binary format)
+│   ├── io_pool.c/h           # Persistent I/O thread pool
+│   ├── heat.c/h              # Expert heat profiling and pinning
+│   ├── log.h                 # Leveled logging macros
+│   ├── kernels.cu            # CUDA kernels (matvec, attention, SwiGLU, RoPE, topK)
+│   ├── mnemo_server.c        # HTTP/REPL server with auth and health check
+│   └── async_client.py       # Python async HTTP/SSE client
 ├── tests/
-│   ├── test_heat.c        # Heat profiling unit tests (12 tests)
-│   └── test_engine.c      # Engine integration test
+│   ├── test_heat.c           # Heat profiling tests (12 tests)
+│   └── test_engine.c         # Engine structural + GPU smoke tests (9+3 tests)
 ├── tools/
-│   ├── prep_tokenizer.py  # Convert HuggingFace tokenizer to binary
-│   ├── tokenize.py        # Standalone tokenizer test
-│   ├── validate_dequant.py    # Dequantization validation
-│   └── validate_rope_norm.py  # RoPE and RMS norm validation
+│   ├── prep_tokenizer.py     # Convert HuggingFace tokenizer to binary
+│   ├── tokenize.py           # Standalone tokenizer for Python-bridge tokenization
+│   ├── validate_dequant.py   # Dequantization validation
+│   └── validate_rope_norm.py # RoPE and RMS norm validation
 ├── Makefile
-├── LICENSE                # AGPL-3.0
+├── LICENSE                   # AGPL-3.0
 └── README.md
 ```
 
@@ -211,32 +252,49 @@ MnemoCUDA/
 
 | Format | Block Size | Bits/Weight | Supported |
 |--------|-----------|-------------|-----------|
-| Q4_K   | 256 values | 4.5 bpw | ✅ Primary |
-| Q6_K   | 256 values | 6.5 bpw | ✅ |
-| Q8_0   | 32 values  | 8.5 bpw | ✅ |
-| Q3_K   | 256 values | 3.4 bpw | ✅ |
-| Q5_K   | 256 values | 5.5 bpw | ✅ |
-| F32    | 1 value    | 32 bpw  | ✅ |
+| Q4_K   | 256 values | 4.5 bpw | Primary |
+| Q6_K   | 256 values | 6.5 bpw | Yes |
+| Q8_0   | 32 values  | 8.5 bpw | Yes |
+| Q3_K   | 256 values | 3.4 bpw | Yes |
+| Q5_K   | 256 values | 5.5 bpw | Yes |
+| F32    | 1 value    | 32 bpw  | Yes |
+
+## Deployment
+
+### Development / Demo
+
+```bash
+./build/mnemo_server /path/to/model --http 8095 --warmup light
+```
+
+### Production (behind reverse proxy)
+
+```bash
+# Start MnemoCUDA bound to localhost with auth
+./build/mnemo_server /path/to/model --http 8095 --auth $MNEMO_TOKEN
+
+# Nginx/Envoy handles TLS, rate limiting, and public access
+# upstream mnemo { server 127.0.0.1:8095; }
+```
 
 ## How It Compares
 
 | Engine | Can run 235B? | Consumer GPU? | Expert Streaming? |
 |--------|:---:|:---:|:---:|
-| **MnemoCUDA** | ✅ | ✅ | ✅ Heat-profiled, multi-level cache |
-| llama.cpp | ❌ (needs full VRAM) | ✅ | ❌ |
-| vLLM | ✅ (needs 8× A100) | ❌ | ❌ |
-| Ollama | ❌ (needs full VRAM) | ✅ | ❌ |
-| ktransformers | ✅ | ✅ | ✅ Basic offloading |
+| **MnemoCUDA** | Yes | Yes | Heat-profiled, multi-level cache |
+| llama.cpp | No (needs full VRAM) | Yes | No |
+| vLLM | Yes (needs 8x A100) | No | No |
+| Ollama | No (needs full VRAM) | Yes | No |
+| ktransformers | Yes | Yes | Basic offloading |
 
 ## Known Limitations
 
-- **Cold start is slow**: first prompt after loading processes at ~1 tok/s while VRAM cache fills. Subsequent prompts improve as cache warms up.
+- **Cold start is slow**: first prompt after loading processes at ~1 tok/s while VRAM cache fills. Subsequent prompts improve as cache warms up. Use `--warmup full` to pre-fill caches.
 - **NVMe speed is critical**: on SATA SSDs or slow NVMe (<2 GB/s), performance degrades significantly. PCIe 4.0+ NVMe recommended.
 - **Single-token generation only**: no batch prefill or parallel token processing yet. TTFT scales linearly with prompt length.
+- **Single-client HTTP**: the server processes one request at a time. Use a request queue or load balancer for multi-client scenarios.
 - **Memory pressure**: large models with 8K+ context consume significant VRAM for KV cache, leaving less room for expert cache slots. Reduce context length for higher cache hit rates.
-- **No speculative decoding**: self-speculative (same model, fewer experts) doesn't help in single-engine setups. Requires separate draft model on separate hardware.
 - **Linux only**: relies on mmap, pread, pthreads, and CUDA. No Windows or macOS support.
-- **Experimental**: this is an active research project. API and file formats may change between versions.
 
 ## License
 
@@ -249,7 +307,7 @@ Created by [AstroLexis](https://github.com/AstrolexisAI).
 Contributions welcome. Areas of active research:
 
 - **Speculative decoding** with small draft models on separate hardware
-- **Dual-quant VRAM cache** — Q2_K warm tier for 2× effective cache size
+- **Dual-quant VRAM cache** — Q2_K warm tier for 2x effective cache size
 - **io_uring** for kernel-bypass NVMe reads
 - **Batch prefill** — process multiple prompt tokens simultaneously
-- **Layer importance scoring** — skip redundant MoE layers
+- **Concurrent HTTP** — worker threads or async I/O for multi-client serving

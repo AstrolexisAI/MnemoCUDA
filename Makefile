@@ -1,9 +1,15 @@
 NVCC ?= nvcc
-CC ?= gcc-14
+CC ?= gcc
+CXX ?= g++
 CUDA_HOME ?= /usr/local/cuda
 CFLAGS = -O2 -Wall -Isrc -I$(CUDA_HOME)/include
-NVCCFLAGS = -O2 --use_fast_math -ccbin=/usr/bin/g++-14
+NVCCFLAGS = -O2 --use_fast_math
 LDFLAGS = -L$(CUDA_HOME)/lib64 -lcudart -lpthread -lm
+
+# Use CXX as nvcc host compiler if available
+ifneq ($(shell which $(CXX) 2>/dev/null),)
+  NVCCFLAGS += -ccbin=$(CXX)
+endif
 
 # Auto-detect GPU architecture (default sm_75 for broad compat)
 GPU_ARCH ?= $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.' | sed 's/^/sm_/' || echo "sm_75")
@@ -23,7 +29,7 @@ $(BUILD_DIR)/kernels.o: src/kernels.cu | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) -arch=$(GPU_ARCH) -Xcompiler -fPIC -c $< -o $@
 
 # Engine modules
-$(BUILD_DIR)/engine.o: src/engine.c src/engine.h src/engine_internal.h | $(BUILD_DIR)
+$(BUILD_DIR)/engine.o: src/engine.c src/engine.h src/engine_internal.h src/log.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -fPIC -c $< -o $@
 
 $(BUILD_DIR)/tokenizer.o: src/tokenizer.c src/tokenizer.h | $(BUILD_DIR)
@@ -43,7 +49,7 @@ $(BUILD_DIR)/libmnemo_cuda.so: $(BUILD_DIR)/kernels.o $(ENGINE_OBJS)
 	$(NVCC) -shared -o $@ $^ $(LDFLAGS)
 
 # Server binary
-$(BUILD_DIR)/mnemo_server: src/mnemo_server.c $(BUILD_DIR)/kernels.o $(ENGINE_OBJS)
+$(BUILD_DIR)/mnemo_server: src/mnemo_server.c src/log.h $(BUILD_DIR)/kernels.o $(ENGINE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $< $(BUILD_DIR)/kernels.o $(ENGINE_OBJS) $(LDFLAGS)
 
 # Tests

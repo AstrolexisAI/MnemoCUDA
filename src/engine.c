@@ -34,6 +34,10 @@
 
 #include "engine_internal.h"
 #include "forward.h"
+#include "log.h"
+
+// Default log level: INFO
+MnemoLogLevel mnemo_log_level = MNEMO_LOG_INFO;
 
 // ── I/O helpers (retry on partial read/write) ──
 
@@ -328,47 +332,108 @@ float json_get_float(const char *json, const char *key, float default_val) {
     return (float)atof(p);
 }
 
+// Helper: read a required int from config, return -1 if missing
+static int cfg_require_int(const char *json, const char *key, int *out) {
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return -1;
+    p += strlen(pattern);
+    while (*p == ' ' || *p == '\t') p++;
+    *out = (int)strtol(p, NULL, 10);
+    return 0;
+}
+
 static int load_config_json(MnemoCudaCtx *ctx, const char *path) {
     FILE *f = fopen(path, "r");
-    if (!f) return -1;
+    if (!f) {
+        fprintf(stderr, "[MnemoCUDA] Cannot open config: %s\n", path);
+        return -1;
+    }
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
+    if (size <= 0 || size > 10 * 1024 * 1024) {
+        fprintf(stderr, "[MnemoCUDA] Config file invalid size: %ld\n", size);
+        fclose(f); return -1;
+    }
     fseek(f, 0, SEEK_SET);
     char *json = malloc(size + 1);
-    fread(json, 1, size, f);
+    if (!json) { fclose(f); return -1; }
+    if (fread(json, 1, size, f) != (size_t)size) {
+        fprintf(stderr, "[MnemoCUDA] Config read error\n");
+        free(json); fclose(f); return -1;
+    }
     json[size] = '\0';
     fclose(f);
 
-    // Auto-detect architecture prefix (qwen3moe, qwen3next, llama, etc.)
+    // Auto-detect architecture prefix
     const char *prefix = "qwen3moe";
     if (strstr(json, "\"qwen3next.")) prefix = "qwen3next";
     else if (strstr(json, "\"llama.")) prefix = "llama";
     else if (strstr(json, "\"qwen2.")) prefix = "qwen2";
-    fprintf(stderr, "[MnemoCUDA] Config prefix: %s\n", prefix);
+    LOG_INFO("Config prefix: %s", prefix);
 
     char key[256];
+    int missing = 0;
+
     #define CFG_INT(field, suffix, def) \
         snprintf(key, sizeof(key), "%s.%s", prefix, suffix); \
         ctx->config.field = json_get_int(json, key, def)
     #define CFG_FLOAT(field, suffix, def) \
         snprintf(key, sizeof(key), "%s.%s", prefix, suffix); \
         ctx->config.field = json_get_float(json, key, def)
+    #define CFG_REQUIRE(field, suffix) do { \
+        snprintf(key, sizeof(key), "%s.%s", prefix, suffix); \
+        if (cfg_require_int(json, key, &ctx->config.field) != 0) { \
+            LOG_ERROR("Missing required config key: %s", key); \
+            missing++; \
+        } \
+    } while(0)
 
-    CFG_INT(hidden_size, "embedding_length", 4096);
+    // Required fields — fail if any missing
+    CFG_REQUIRE(hidden_size, "embedding_length");
+    CFG_REQUIRE(num_hidden_layers, "block_count");
+    CFG_REQUIRE(num_attention_heads, "attention.head_count");
+    CFG_REQUIRE(num_key_value_heads, "attention.head_count_kv");
+
+    if (missing > 0) {
+        LOG_ERROR("Config missing %d required field(s), cannot load", missing);
+        free(json);
+        return -1;
+    }
+
+    // Optional fields with defaults
     CFG_INT(moe_intermediate_size, "expert_feed_forward_length", 1536);
-    CFG_INT(num_attention_heads, "attention.head_count", 64);
-    CFG_INT(num_key_value_heads, "attention.head_count_kv", 4);
     CFG_INT(head_dim, "attention.key_length", 128);
-    CFG_INT(num_hidden_layers, "block_count", 94);
-    ctx->config.vocab_size = 151936;
     CFG_INT(num_experts, "expert_count", 128);
     CFG_INT(num_experts_per_tok, "expert_used_count", 8);
     CFG_FLOAT(rope_theta, "rope.freq_base", 1000000.0f);
     CFG_FLOAT(rms_norm_eps, "attention.layer_norm_rms_epsilon", 1e-6f);
     CFG_INT(max_position_embeddings, "context_length", 40960);
 
+    // Read vocab_size from metadata (try multiple common keys)
+    int vs = json_get_int(json, "tokenizer.ggml.tokens_count", 0);
+    if (vs <= 0) vs = json_get_int(json, "vocab_size", 0);
+    if (vs <= 0) {
+        // Fallback: read from tokenizer if loaded later, use common default for now
+        vs = 151936;
+        LOG_WARN("vocab_size not in config, using default %d", vs);
+    }
+    ctx->config.vocab_size = vs;
+
     #undef CFG_INT
     #undef CFG_FLOAT
+    #undef CFG_REQUIRE
+
+    // Sanity checks on loaded values
+    if (ctx->config.hidden_size <= 0 || ctx->config.hidden_size > 65536) {
+        fprintf(stderr, "[MnemoCUDA] Invalid hidden_size: %d\n", ctx->config.hidden_size);
+        free(json); return -1;
+    }
+    if (ctx->config.num_hidden_layers <= 0 || ctx->config.num_hidden_layers > 1024) {
+        fprintf(stderr, "[MnemoCUDA] Invalid num_hidden_layers: %d\n", ctx->config.num_hidden_layers);
+        free(json); return -1;
+    }
 
     free(json);
     return 0;
@@ -392,7 +457,10 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
     // Load config
     char path[1200];
     snprintf(path, sizeof(path), "%s/config.json", config.model_dir);
-    load_config_json(ctx, path);
+    if (load_config_json(ctx, path) != 0) {
+        fprintf(stderr, "[MnemoCUDA] Failed to load model config\n");
+        return -1;
+    }
 
     if (config.expert_k > 0)
         ctx->config.num_experts_per_tok = config.expert_k;
@@ -420,7 +488,11 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
     // Load tokenizer
     ctx->tokenizer = tokenizer_load(config.model_dir);
     if (!ctx->tokenizer) {
-        fprintf(stderr, "[MnemoCUDA] Warning: tokenizer not loaded, inference will fail\n");
+        LOG_WARN("Tokenizer not loaded, inference will fail");
+    } else if (ctx->tokenizer->vocab_size > 0 && ctx->config.vocab_size != ctx->tokenizer->vocab_size) {
+        fprintf(stderr, "[MnemoCUDA] Using tokenizer vocab_size=%d (config had %d)\n",
+                ctx->tokenizer->vocab_size, ctx->config.vocab_size);
+        ctx->config.vocab_size = ctx->tokenizer->vocab_size;
     }
 
     // Load resident_manifest.json → build tensor hash table
@@ -519,7 +591,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
     int device_count = 0;
     cudaGetDeviceCount(&device_count);
     if (device_count <= 0) {
-        fprintf(stderr, "[MnemoCUDA] No CUDA GPUs detected\n");
+        LOG_ERROR("No CUDA GPUs detected");
         return -3;
     }
 
@@ -922,7 +994,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
 
     io_pool_init(config.io_threads);
     ctx->loaded = true;
-    fprintf(stderr, "[MnemoCUDA] Ready: %s\n", ctx->info);
+    LOG_INFO("Ready: %s", ctx->info);
     return 0;
 }
 
