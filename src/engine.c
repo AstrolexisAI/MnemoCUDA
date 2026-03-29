@@ -74,7 +74,7 @@ static const char *json_next_string(const char *p, char *out, int maxlen) {
     if (!p) return NULL;
     p++; // skip opening quote
     int i = 0;
-    while (*p && *p != '"' && i < maxlen - 1) {
+    while (*p && *p != '"' && i < maxlen - 4) {  // -4: room for worst-case \uXXXX (3 bytes + NUL)
         if (*p == '\\' && *(p+1)) {
             p++;
             switch (*p) {
@@ -84,14 +84,12 @@ static const char *json_next_string(const char *p, char *out, int maxlen) {
                 case '"': out[i++] = '"'; break;
                 case '/': out[i++] = '/'; break;
                 case 'u': {
-                    // Parse \uXXXX
                     unsigned cp = 0;
                     for (int j = 0; j < 4 && p[1+j]; j++) {
                         char c = p[1+j];
                         cp = cp * 16 + (c >= 'a' ? c-'a'+10 : c >= 'A' ? c-'A'+10 : c-'0');
                     }
                     p += 4;
-                    // UTF-8 encode
                     if (cp < 0x80) {
                         out[i++] = (char)cp;
                     } else if (cp < 0x800) {
@@ -151,6 +149,7 @@ static int sample_token(const float *logits, int vocab_size,
 
     // Softmax with temperature
     float *probs = malloc(vocab_size * sizeof(float));
+    if (!probs) return 0;  // OOM fallback: greedy
     float max_logit = logits[0];
     for (int i = 1; i < vocab_size; i++)
         if (logits[i] > max_logit) max_logit = logits[i];
@@ -167,6 +166,7 @@ static int sample_token(const float *logits, int vocab_size,
         // Top-p (nucleus) sampling — sort descending, find cutoff
         typedef struct { float p; int id; } ProbId;
         ProbId *sorted = malloc(vocab_size * sizeof(ProbId));
+        if (!sorted) { free(probs); return 0; }  // OOM fallback: greedy
         for (int i = 0; i < vocab_size; i++) { sorted[i].p = probs[i]; sorted[i].id = i; }
 
         // Partial sort: only need tokens until cumulative >= top_p
@@ -1343,8 +1343,10 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
         // Decode and emit (with UTF-8 accumulation for multi-byte chars)
         {
             const char *text = tokenizer_decode(ctx->tokenizer, next_id);
-            static char utf8_buf[32];
-            static int utf8_len = 0;
+            // NOTE: these must NOT be static — stale state across generate
+            // calls corrupts multi-byte sequences for non-ASCII (accents, CJK)
+            char utf8_buf[32];
+            int utf8_len = 0;
 
             for (int ci = 0; text[ci]; ci++) {
                 utf8_buf[utf8_len++] = text[ci];
