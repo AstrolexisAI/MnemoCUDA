@@ -298,6 +298,20 @@ void ram_cache_free(RAMCache *rc) {
 
 // ── Implementation ──
 
+const char *mnemo_cuda_strerror(int err) {
+    switch (err) {
+        case MNEMO_OK:              return "success";
+        case MNEMO_ERR_BAD_CONFIG:  return "invalid configuration or missing model directory";
+        case MNEMO_ERR_TOKENIZER:   return "tokenizer load or encode failure";
+        case MNEMO_ERR_NO_GPU:      return "no CUDA GPUs detected or invalid GPU IDs";
+        case MNEMO_ERR_CONTEXT_FULL:return "position exceeds context length";
+        case MNEMO_ERR_CUDA:        return "CUDA runtime error";
+        case MNEMO_ERR_IO:          return "file I/O error";
+        case MNEMO_ERR_CANCELLED:   return "generation cancelled";
+        default:                    return "unknown error";
+    }
+}
+
 MnemoCudaConfig mnemo_cuda_config_default(void) {
     MnemoCudaConfig c = {0};
     c.context_length = 8192;  // 8K default — balances KV VRAM vs expert cache space
@@ -1113,8 +1127,8 @@ void mnemo_cuda_cancel(MnemoCudaCtx *ctx) {
 
 int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
                         float temperature, MnemoCudaTokenCB callback, void *userdata) {
-    if (!ctx || !ctx->loaded) return -1;
-    if (!ctx->tokenizer) { callback("Error: tokenizer not loaded", true, userdata); return -2; }
+    if (!ctx || !ctx->loaded) return MNEMO_ERR_BAD_CONFIG;
+    if (!ctx->tokenizer) { callback("Error: tokenizer not loaded", true, userdata); return MNEMO_ERR_TOKENIZER; }
 
     ctx->cancelled = false;
     rng_seed((uint64_t)time(NULL));
@@ -1252,7 +1266,7 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
     // ── 2. Prefill: process all prompt tokens ──
     ctx->kv_pos = 0;
     for (int i = 0; i < n_tokens; i++) {
-        if (ctx->cancelled) { free(tokens); free(h_logits); return -3; }
+        if (ctx->cancelled) { free(tokens); free(h_logits); return MNEMO_ERR_CANCELLED; }
         int rc = forward_pass(ctx, tokens[i], ctx->kv_pos, h_logits);
         if (rc != 0) { free(tokens); free(h_logits); return rc; }
         ctx->kv_pos++;
@@ -1325,8 +1339,14 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
     double total_secs = (t_end.tv_sec - t_start.tv_sec) +
                         (t_end.tv_nsec - t_start.tv_nsec) / 1e9;
 
+    double ttft_secs = (t_gen_start.tv_sec - t_start.tv_sec) +
+                       (t_gen_start.tv_nsec - t_start.tv_nsec) / 1e9;
+
     ctx->stats.tokens_generated = tokens_generated;
+    ctx->stats.prompt_tokens = n_tokens;
     ctx->stats.tokens_per_second = gen_secs > 0 ? tokens_generated / gen_secs : 0;
+    ctx->stats.ttft_seconds = ttft_secs;
+    ctx->stats.total_seconds = total_secs;
     ctx->stats.n_gpus_active = ctx->n_gpus;
     ctx->heat_total_tokens += (uint64_t)(n_tokens + tokens_generated);
 

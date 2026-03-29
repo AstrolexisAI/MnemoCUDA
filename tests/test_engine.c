@@ -202,6 +202,64 @@ static void test_tensor_classification(void) {
     PASS();
 }
 
+// ── Test 10: Error codes and strerror ──
+
+static void test_error_codes(void) {
+    TEST("error codes and strerror");
+
+    // Verify all error codes have non-empty messages
+    ASSERT_TRUE(strlen(mnemo_cuda_strerror(MNEMO_OK)) > 0, "MNEMO_OK has message");
+    ASSERT_TRUE(strlen(mnemo_cuda_strerror(MNEMO_ERR_BAD_CONFIG)) > 0, "BAD_CONFIG has message");
+    ASSERT_TRUE(strlen(mnemo_cuda_strerror(MNEMO_ERR_TOKENIZER)) > 0, "TOKENIZER has message");
+    ASSERT_TRUE(strlen(mnemo_cuda_strerror(MNEMO_ERR_NO_GPU)) > 0, "NO_GPU has message");
+    ASSERT_TRUE(strlen(mnemo_cuda_strerror(MNEMO_ERR_CONTEXT_FULL)) > 0, "CONTEXT_FULL has message");
+    ASSERT_TRUE(strlen(mnemo_cuda_strerror(MNEMO_ERR_CUDA)) > 0, "CUDA has message");
+    ASSERT_TRUE(strlen(mnemo_cuda_strerror(MNEMO_ERR_IO)) > 0, "IO has message");
+    ASSERT_TRUE(strlen(mnemo_cuda_strerror(MNEMO_ERR_CANCELLED)) > 0, "CANCELLED has message");
+    ASSERT_TRUE(strlen(mnemo_cuda_strerror(-99)) > 0, "unknown error has message");
+
+    // Verify enum values are negative (except OK)
+    ASSERT_EQ(MNEMO_OK, 0, "MNEMO_OK should be 0");
+    ASSERT_TRUE(MNEMO_ERR_BAD_CONFIG < 0, "errors should be negative");
+
+    // Verify strerror returns different strings for different codes
+    ASSERT_TRUE(strcmp(mnemo_cuda_strerror(MNEMO_OK),
+                       mnemo_cuda_strerror(MNEMO_ERR_CUDA)) != 0,
+                "OK and CUDA error should differ");
+
+    PASS();
+}
+
+// ── Test 11: Stats struct has expected defaults ──
+
+static void test_stats_defaults(void) {
+    TEST("stats have TTFT and prompt fields");
+    MnemoCudaCtx *ctx = mnemo_cuda_create();
+    MnemoCudaStats s = mnemo_cuda_get_stats(ctx);
+    ASSERT_EQ(s.tokens_generated, 0, "tokens_generated default");
+    ASSERT_EQ(s.prompt_tokens, 0, "prompt_tokens default");
+    ASSERT_TRUE(s.ttft_seconds == 0.0, "ttft_seconds default");
+    ASSERT_TRUE(s.total_seconds == 0.0, "total_seconds default");
+    mnemo_cuda_destroy(ctx);
+    PASS();
+}
+
+// ── Test 12: Config default values ──
+
+static void test_config_extended(void) {
+    TEST("config defaults extended validation");
+    MnemoCudaConfig cfg = mnemo_cuda_config_default();
+    // io_threads should be positive
+    ASSERT_TRUE(cfg.io_threads > 0 && cfg.io_threads <= 16,
+                "io_threads in valid range");
+    // expert_k default should be 0 (use model config)
+    ASSERT_EQ(cfg.expert_k, 0, "expert_k default is 0");
+    // All GPU IDs should be 0 by default
+    for (int i = 0; i < 8; i++)
+        ASSERT_EQ(cfg.gpu_ids[i], 0, "gpu_ids default is 0");
+    PASS();
+}
+
 // ── GPU Tests (require MODEL_DIR) ──
 
 typedef struct {
@@ -331,6 +389,9 @@ int main(void) {
     test_stats_unloaded();
     test_info_unloaded();
     test_tensor_classification();
+    test_error_codes();
+    test_stats_defaults();
+    test_config_extended();
 
     // GPU tests (require MODEL_DIR)
     const char *model_dir = getenv("MODEL_DIR");

@@ -31,6 +31,20 @@
 extern "C" {
 #endif
 
+// Error codes
+typedef enum {
+    MNEMO_OK              =  0,
+    MNEMO_ERR_BAD_CONFIG  = -1,  // Invalid config or missing model_dir
+    MNEMO_ERR_TOKENIZER   = -2,  // Tokenizer load/encode failure
+    MNEMO_ERR_NO_GPU      = -3,  // No CUDA GPUs detected or invalid gpu_ids
+    MNEMO_ERR_CONTEXT_FULL= -4,  // Position exceeds context length
+    MNEMO_ERR_CUDA        = -5,  // CUDA runtime error (OOM, invalid device, etc.)
+    MNEMO_ERR_IO          = -6,  // File I/O error (missing model files, pread failure)
+    MNEMO_ERR_CANCELLED   = -7,  // Generation cancelled via mnemo_cuda_cancel()
+} MnemoError;
+
+const char *mnemo_cuda_strerror(int err);
+
 // Opaque context
 typedef struct MnemoCudaCtx MnemoCudaCtx;
 
@@ -64,7 +78,10 @@ void mnemo_cuda_cancel(MnemoCudaCtx *ctx);
 // Info
 typedef struct {
     int tokens_generated;
+    int prompt_tokens;
     double tokens_per_second;
+    double ttft_seconds;         // Time to first token (prefill time)
+    double total_seconds;        // Total request time
     size_t vram_used_bytes;      // Total VRAM: resident + KV + expert cache + buffers
     size_t resident_size_bytes;  // Host-side resident weights file size
     int n_gpus_active;

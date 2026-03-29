@@ -24,6 +24,7 @@
 #include "log.h"
 
 static volatile int running = 1;
+static volatile int generating = 0;  // 1 when a request is being processed
 
 static void sigint_handler(int sig) {
     (void)sig;
@@ -535,17 +536,54 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
             continue;
         }
 
-        // GET /health — readiness check with basic stats
+        // GET /live — process is alive (always 200 if we got here)
+        if (strncmp(req, "GET /live", 9) == 0) {
+            http_respond_json(client_fd, "{\"status\":\"alive\"}", 18);
+            free(req); close(client_fd);
+            continue;
+        }
+
+        // GET /ready — model loaded and ready for inference
+        if (strncmp(req, "GET /ready", 10) == 0) {
+            const char *status = generating ? "busy" : "ready";
+            char json[64];
+            int off = snprintf(json, sizeof(json), "{\"status\":\"%s\"}", status);
+            http_respond_json(client_fd, json, off);
+            free(req); close(client_fd);
+            continue;
+        }
+
+        // GET /health — backward compat alias for /ready
         if (strncmp(req, "GET /health", 11) == 0) {
+            const char *status = generating ? "busy" : "ready";
+            char json[64];
+            int off = snprintf(json, sizeof(json), "{\"status\":\"%s\"}", status);
+            http_respond_json(client_fd, json, off);
+            free(req); close(client_fd);
+            continue;
+        }
+
+        // GET /status — detailed operational status
+        if (strncmp(req, "GET /status", 11) == 0) {
             MnemoCudaStats s = mnemo_cuda_get_stats(ctx);
-            char json[512];
+            MnemoCudaHeatStats hs = mnemo_cuda_get_heat_stats(ctx);
+            char json[1024];
             int off = snprintf(json, sizeof(json),
-                "{\"status\":\"ready\",\"model\":\"%s\","
-                "\"vram_mb\":%.0f,\"resident_mb\":%.0f,\"gpus\":%d}",
+                "{\"status\":\"%s\",\"model\":\"%s\","
+                "\"gpus\":%d,\"vram_mb\":%.0f,\"resident_mb\":%.0f,"
+                "\"heat_tokens\":%lu,\"pinning_active\":%s,"
+                "\"active_experts\":%d,\"cache_slots\":%d,\"cache_used\":%d,"
+                "\"last_ttft\":%.3f,\"last_tok_s\":%.1f}",
+                generating ? "busy" : "ready",
                 mnemo_cuda_get_info(ctx),
+                s.n_gpus_active,
                 (double)s.vram_used_bytes / (1024*1024),
                 (double)s.resident_size_bytes / (1024*1024),
-                s.n_gpus_active);
+                (unsigned long)hs.total_tokens,
+                hs.pinning_active ? "true" : "false",
+                hs.active_experts,
+                hs.cache_slots[0], hs.cache_used[0],
+                s.ttft_seconds, s.tokens_per_second);
             http_respond_json(client_fd, json, off);
             free(req); close(client_fd);
             continue;
@@ -563,6 +601,13 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
             free(req); close(client_fd);
             continue;
         }
+        // Reject if already processing a request
+        if (generating) {
+            http_respond_error(client_fd, 503, "Server busy - generation in progress");
+            free(req); close(client_fd);
+            continue;
+        }
+
         if (!body || body_len == 0) {
             http_respond_error(client_fd, 400, "Empty body");
             free(req); close(client_fd);
@@ -588,6 +633,8 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
         if (raw_prompt)
             fprintf(stderr, "[MnemoCUDA] raw_prompt=true, passing prompt as-is\n");
 
+        generating = 1;
+
         if (stream) {
             const char *hdr = "HTTP/1.1 200 OK\r\n"
                               "Content-Type: text/event-stream; charset=utf-8\r\n"
@@ -610,10 +657,12 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
             int rc = generate(ctx, prompt, temperature, max_tokens, &out);
 
             if (rc != 0) {
-                int http_code = (rc == -2) ? 503 : 500; // -2 = tokenizer, else internal
-                char msg[128];
-                snprintf(msg, sizeof(msg), "Generation failed (code %d)", rc);
+                int http_code = (rc == MNEMO_ERR_TOKENIZER) ? 503 : 500;
+                char msg[256];
+                snprintf(msg, sizeof(msg), "Generation failed: %s (code %d)",
+                         mnemo_cuda_strerror(rc), rc);
                 http_respond_error(client_fd, http_code, msg);
+                generating = 0;
                 free(prompt); free(req); close(client_fd);
                 continue;
             }
@@ -622,6 +671,7 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
             char *escaped = json_escape(out.buf, out.buf_len);
             if (!escaped) {
                 http_respond_error(client_fd, 500, "Internal Server Error");
+                generating = 0;
                 free(prompt); free(req); close(client_fd);
                 continue;
             }
@@ -637,6 +687,7 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
             free(response);
         }
 
+        generating = 0;
         free(prompt);
         free(req);
         close(client_fd);
@@ -671,7 +722,7 @@ int main(int argc, char **argv) {
     // Parse CLI options
     MnemoCudaConfig config = mnemo_cuda_config_default();
     const char *bind_addr = "127.0.0.1";
-    const char *auth_token = NULL;
+    const char *auth_token = getenv("MNEMO_AUTH_TOKEN");
     int warmup_mode = 2;  // 0=off, 1=light, 2=full
     for (int i = 2; i < argc - 1; i++) {
         if (strcmp(argv[i], "--context") == 0) {
