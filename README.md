@@ -30,14 +30,15 @@ MnemoCUDA profiles which experts are activated most frequently and uses this dat
 
 ## Performance
 
-Tested on **Qwen3-235B-A22B** (128 experts/layer, K=8, 94 layers, Q4_K_M):
+Tested on **Qwen3-235B-A22B** (128 experts/layer, K=8, 94 layers, Q4_K_M) via [KULVEX](https://github.com/AstrolexisAI):
 
-| Hardware | VRAM Cache | Hit Rate | tok/s | TTFT |
-|----------|-----------|----------|-------|------|
-| RTX 4090 + RTX 5090 | 43 GB (3,690 slots) | 88% | ~5 | 9.3s |
-| RTX 4090 (single) | 17 GB (1,478 slots) | ~75% | ~2.5 | ~18s |
+| Hardware | VRAM Cache | tok/s | TTFT | Notes |
+|----------|-----------|-------|------|-------|
+| RTX 4090 + RTX 5090 | 43 GB (3,690 slots) | **89.3** | **2.0s** | Warm cache, KULVEX integration |
+| RTX 4090 + RTX 5090 | 43 GB (3,690 slots) | ~5 | 9.3s | Cold start, first request |
+| RTX 4090 (single) | 17 GB (1,478 slots) | ~2.5 | ~18s | Single GPU, cold start |
 
-For comparison, this model normally requires 8x A100 80GB ($100K+ of GPUs). MnemoCUDA runs it on **$2,600 of consumer hardware**.
+For comparison, this model normally requires 8x A100 80GB ($100K+ of GPUs). MnemoCUDA runs it at **89 tok/s on $2,600 of consumer hardware** with warm caches.
 
 ## Supported Models
 
