@@ -8,6 +8,7 @@
 
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdint.h>
@@ -31,10 +32,28 @@ static void *io_pool_worker(void *arg) {
         sem_wait(&pool->task_ready[id]);
         if (pool->shutdown) break;
         IOTask *t = &pool->tasks[id];
+        t->bytes_read = 0;
+        t->error = 0;
         if (t->fd >= 0) {
-            pread(t->fd, t->dst, t->size, t->offset);
+            // pread_full: retry on EINTR, accumulate until size or EOF/error
+            size_t total = 0;
+            while (total < t->size) {
+                ssize_t n = pread(t->fd, (char *)t->dst + total,
+                                  t->size - total, t->offset + (off_t)total);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    t->error = errno;
+                    break;
+                }
+                if (n == 0) break;  // EOF
+                total += (size_t)n;
+            }
+            t->bytes_read = total;
+            if (total < t->size && t->error == 0)
+                t->error = EIO;  // short read
         } else if (t->src) {
             memcpy(t->dst, t->src, t->size);
+            t->bytes_read = t->size;
         }
         t->done = 1;
         sem_post(&pool->task_done[id]);

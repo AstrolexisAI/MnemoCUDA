@@ -629,6 +629,12 @@ int forward_pass(MnemoCudaCtx *ctx, int token_id, int pos, float *h_logits) {
     int H = cfg->hidden_size;
     int V = cfg->vocab_size;
 
+    if (pos >= cfg->max_position_embeddings) {
+        fprintf(stderr, "[MnemoCUDA] pos %d exceeds context length %d\n",
+                pos, cfg->max_position_embeddings);
+        return -4;
+    }
+
     // ── 1. Token embedding lookup ──
     TensorEntry *embd = tensor_get(ctx, "token_embd.weight");
     if (!embd) { fprintf(stderr, "[MnemoCUDA] Missing token_embd.weight\n"); return -1; }

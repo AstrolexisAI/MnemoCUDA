@@ -1110,6 +1110,16 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
         free(chatml);
     }
 
+    // Cap prompt tokens to fit within context window (leave room for generation)
+    int max_ctx = cfg->max_position_embeddings;
+    int max_prompt = max_ctx - max_tokens;
+    if (max_prompt < 1) max_prompt = 1;
+    if (n_tokens > max_prompt) {
+        fprintf(stderr, "[MnemoCUDA] Prompt too long (%d tokens), truncating to %d\n",
+                n_tokens, max_prompt);
+        n_tokens = max_prompt;
+    }
+
     fprintf(stderr, "[MnemoCUDA] Prompt: %d tokens, generating up to %d\n", n_tokens, max_tokens);
 
     // Allocate host logits buffer
@@ -1131,6 +1141,10 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
 
     for (int t = 0; t < max_tokens; t++) {
         if (ctx->cancelled) break;
+        if (ctx->kv_pos >= max_ctx) {
+            fprintf(stderr, "[MnemoCUDA] Context full at %d tokens\n", ctx->kv_pos);
+            break;
+        }
 
         // Sample next token
         int next_id = sample_token(h_logits, V, temperature, 0.9f);
@@ -1196,11 +1210,18 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
     if (!ctx->heat_pinning_active && ctx->heat_total_tokens >= 100)
         mnemo_cuda_heat_pin(ctx);
 
-    // Calculate VRAM used
+    // Calculate total VRAM used across all GPUs
     size_t vram = 0;
     for (int g = 0; g < ctx->n_gpus; g++) {
-        vram += ctx->gpus[g].resident_size;
-        vram += ctx->gpus[g].expert_buf_size;
+        GPUState *gpu = &ctx->gpus[g];
+        vram += gpu->resident_size;
+        vram += gpu->expert_buf_size;
+        vram += gpu->expert_cache_size;
+        vram += gpu->prefetch_buf_size;
+        // KV cache: 2 * n_layers * ctx_len * NKV * HD * sizeof(fp16)
+        int n_layers = gpu->layer_end - gpu->layer_start;
+        size_t kv_per_tok = (size_t)cfg->num_key_value_heads * cfg->head_dim * sizeof(uint16_t);
+        vram += (size_t)n_layers * cfg->max_position_embeddings * kv_per_tok * 2;
     }
     ctx->stats.vram_used_bytes = vram;
     ctx->stats.resident_size_bytes = ctx->resident_size;

@@ -9,8 +9,16 @@
 #include <string.h>
 #include <stdint.h>
 
+#define TOK_MAX_VOCAB   500000
+#define TOK_MAX_MERGES  500000
+#define TOK_MAX_SPECIAL 10000
+#define TOK_MAX_STRLEN  65535
+
+#define TOK_READ(ptr, sz, n, fp) do { \
+    if (fread(ptr, sz, n, fp) != (size_t)(n)) goto tok_fail; \
+} while(0)
+
 Tokenizer *tokenizer_load(const char *model_dir) {
-    // Try binary format first (prep_tokenizer.py output), fall back to JSON
     char path[1200];
     snprintf(path, sizeof(path), "%s/tokenizer.bin", model_dir);
     FILE *f = fopen(path, "rb");
@@ -19,21 +27,31 @@ Tokenizer *tokenizer_load(const char *model_dir) {
         return NULL;
     }
 
-    // Read header
+    Tokenizer *tok = NULL;
+
+    // Read and validate header
     uint32_t magic, vocab_size, n_merges, n_special, eos_id, im_start_id, im_end_id;
-    fread(&magic, 4, 1, f);
+    TOK_READ(&magic, 4, 1, f);
     if (magic != 0x4D544F4B) {
         fprintf(stderr, "[MnemoCUDA] Bad tokenizer magic: 0x%08X\n", magic);
         fclose(f); return NULL;
     }
-    fread(&vocab_size, 4, 1, f);
-    fread(&n_merges, 4, 1, f);
-    fread(&n_special, 4, 1, f);
-    fread(&eos_id, 4, 1, f);
-    fread(&im_start_id, 4, 1, f);
-    fread(&im_end_id, 4, 1, f);
+    TOK_READ(&vocab_size, 4, 1, f);
+    TOK_READ(&n_merges, 4, 1, f);
+    TOK_READ(&n_special, 4, 1, f);
+    TOK_READ(&eos_id, 4, 1, f);
+    TOK_READ(&im_start_id, 4, 1, f);
+    TOK_READ(&im_end_id, 4, 1, f);
 
-    Tokenizer *tok = calloc(1, sizeof(Tokenizer));
+    // Sanity checks on sizes
+    if (vocab_size > TOK_MAX_VOCAB || n_merges > TOK_MAX_MERGES || n_special > TOK_MAX_SPECIAL) {
+        fprintf(stderr, "[MnemoCUDA] Tokenizer sizes out of range: vocab=%u merges=%u special=%u\n",
+                vocab_size, n_merges, n_special);
+        fclose(f); return NULL;
+    }
+
+    tok = calloc(1, sizeof(Tokenizer));
+    if (!tok) { fclose(f); return NULL; }
     tok->vocab_size = (int)vocab_size;
     tok->eos_id = (int)eos_id;
     tok->im_start_id = (int)im_start_id;
@@ -42,12 +60,15 @@ Tokenizer *tokenizer_load(const char *model_dir) {
     // Read vocab
     tok->vocab = calloc(vocab_size, sizeof(char*));
     tok->vocab_len = calloc(vocab_size, sizeof(int));
+    if (!tok->vocab || !tok->vocab_len) goto tok_fail;
     for (uint32_t i = 0; i < vocab_size; i++) {
         uint16_t len;
-        fread(&len, 2, 1, f);
+        TOK_READ(&len, 2, 1, f);
         if (len > 0) {
+            if (len > TOK_MAX_STRLEN) goto tok_fail;
             tok->vocab[i] = malloc(len + 1);
-            fread(tok->vocab[i], 1, len, f);
+            if (!tok->vocab[i]) goto tok_fail;
+            TOK_READ(tok->vocab[i], 1, len, f);
             tok->vocab[i][len] = '\0';
             tok->vocab_len[i] = len;
         }
@@ -56,11 +77,14 @@ Tokenizer *tokenizer_load(const char *model_dir) {
     // Read merges
     tok->n_merges = (int)n_merges;
     tok->merges = calloc(n_merges, sizeof(char*));
+    if (!tok->merges) goto tok_fail;
     for (uint32_t i = 0; i < n_merges; i++) {
         uint16_t len;
-        fread(&len, 2, 1, f);
+        TOK_READ(&len, 2, 1, f);
+        if (len > TOK_MAX_STRLEN) goto tok_fail;
         tok->merges[i] = malloc(len + 1);
-        fread(tok->merges[i], 1, len, f);
+        if (!tok->merges[i]) goto tok_fail;
+        TOK_READ(tok->merges[i], 1, len, f);
         tok->merges[i][len] = '\0';
     }
 
@@ -68,14 +92,17 @@ Tokenizer *tokenizer_load(const char *model_dir) {
     tok->n_special = (int)n_special;
     tok->special_tokens = calloc(n_special, sizeof(char*));
     tok->special_ids = calloc(n_special, sizeof(int));
+    if (!tok->special_tokens || !tok->special_ids) goto tok_fail;
     for (uint32_t i = 0; i < n_special; i++) {
         uint32_t sid;
         uint16_t len;
-        fread(&sid, 4, 1, f);
-        fread(&len, 2, 1, f);
+        TOK_READ(&sid, 4, 1, f);
+        TOK_READ(&len, 2, 1, f);
+        if (len > TOK_MAX_STRLEN) goto tok_fail;
         tok->special_ids[i] = (int)sid;
         tok->special_tokens[i] = malloc(len + 1);
-        fread(tok->special_tokens[i], 1, len, f);
+        if (!tok->special_tokens[i]) goto tok_fail;
+        TOK_READ(tok->special_tokens[i], 1, len, f);
         tok->special_tokens[i][len] = '\0';
     }
 
@@ -83,6 +110,12 @@ Tokenizer *tokenizer_load(const char *model_dir) {
     fprintf(stderr, "[MnemoCUDA] Tokenizer: %d vocab, %d merges, %d special\n",
             tok->vocab_size, tok->n_merges, tok->n_special);
     return tok;
+
+tok_fail:
+    fprintf(stderr, "[MnemoCUDA] Tokenizer load failed: corrupt or truncated tokenizer.bin\n");
+    fclose(f);
+    tokenizer_free(tok);
+    return NULL;
 }
 
 void tokenizer_free(Tokenizer *tok) {

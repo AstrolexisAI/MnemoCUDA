@@ -17,6 +17,8 @@ typedef struct {
     size_t size;
     off_t offset;
     volatile int done;
+    size_t bytes_read;  // actual bytes transferred (may be < size on error)
+    int error;          // errno on failure, 0 on success
 } IOTask;
 
 void io_pool_init(int n_threads);  // n_threads clamped to [1, IO_POOL_MAX]

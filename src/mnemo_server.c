@@ -492,9 +492,14 @@ static void run_http(MnemoCudaCtx *ctx, int port) {
             continue;
         }
 
-        // Only POST to /v1/completions from here
+        // Only POST /v1/completions accepted
         if (strncmp(req, "POST ", 5) != 0) {
             http_respond_error(client_fd, 405, "Method Not Allowed");
+            free(req); close(client_fd);
+            continue;
+        }
+        if (strncmp(req + 5, "/v1/completions", 15) != 0) {
+            http_respond_error(client_fd, 404, "Not Found");
             free(req); close(client_fd);
             continue;
         }

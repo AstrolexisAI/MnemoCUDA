@@ -65,10 +65,8 @@ void mnemo_cuda_cancel(MnemoCudaCtx *ctx);
 typedef struct {
     int tokens_generated;
     double tokens_per_second;
-    double avg_expert_io_ms;
-    double avg_gpu_compute_ms;
-    size_t vram_used_bytes;
-    size_t resident_size_bytes;
+    size_t vram_used_bytes;      // Total VRAM: resident + KV + expert cache + buffers
+    size_t resident_size_bytes;  // Host-side resident weights file size
     int n_gpus_active;
 } MnemoCudaStats;
 
