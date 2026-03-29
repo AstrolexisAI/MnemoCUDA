@@ -35,12 +35,12 @@ typedef struct {
     float rms_norm_eps;
     int max_position_embeddings;
     int full_attention_interval;  // 0 = all layers have attention, N = every Nth layer (hybrid SSM+MoE)
-    // SSM/Mamba config (hybrid models)
-    int ssm_inner_size;           // Inner dimension for SSM (e.g., 8192)
-    int ssm_state_size;           // State dimension per feature (e.g., 128)
+    // Gated Delta Net / Linear Attention config (hybrid models)
+    int ssm_inner_size;           // value_dim = value_head_dim * num_v_heads (e.g., 8192)
+    int ssm_state_size;           // key_head_dim (e.g., 128)
     int ssm_conv_kernel;          // Causal conv kernel size (e.g., 4)
-    int ssm_group_count;          // Number of groups for B/C sharing (e.g., 16)
-    int ssm_dt_rank;              // Time-step projection rank (e.g., 64)
+    int ssm_group_count;          // num_key_heads (e.g., 16)
+    int ssm_dt_rank;              // num_value_heads (e.g., 64)
 } ModelConfig;
 
 // ── Expert layer file ──
@@ -116,14 +116,16 @@ typedef struct {
     int n_prefetched;
     volatile int prefetch_ready;
 
-    // SSM/Mamba state (hybrid models only, NULL if pure attention)
-    float *d_ssm_state;      // [n_ssm_layers, inner_size, state_size] persistent
-    float *d_conv_state;     // [n_ssm_layers, inner_size, conv_kernel-1] persistent
-    float *d_ssm_x;          // [inner_size] temp: input projection x
-    float *d_ssm_z;          // [inner_size] temp: gate z
-    float *d_ssm_y;          // [inner_size] temp: SSM output
-    int n_ssm_layers;        // number of SSM layers on this GPU
-    int *ssm_layer_map;      // [n_ssm_layers] maps SSM index -> global layer index
+    // Gated Delta Net state (hybrid models only, NULL if pure attention)
+    float *d_gdn_state;      // [n_gdn_layers, num_v_heads, key_head_dim, value_head_dim] persistent
+    float *d_conv_state;     // [n_gdn_layers, conv1d_dim, conv_kernel-1] persistent
+    float *d_gdn_qkv;       // [conv1d_dim] temp: QKV projection output
+    float *d_gdn_alpha;     // [num_v_heads] temp: alpha scalars
+    float *d_gdn_beta;      // [num_v_heads] temp: beta scalars
+    float *d_gdn_z;         // [value_dim] temp: gate Z
+    float *d_gdn_out;       // [value_dim] temp: output before projection
+    int n_gdn_layers;       // number of GDN layers on this GPU
+    int *gdn_layer_map;     // [n_gdn_layers] maps GDN index -> global layer index
 } GPUState;
 
 // ── Tensor hash table ──

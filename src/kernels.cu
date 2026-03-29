@@ -856,141 +856,170 @@ void cuda_attention_f16kv(const void *q, const void *kv_k, const void *kv_v,
         out, head_dim, n_kv_heads, seq_len, gqa_ratio, scale);
 }
 
-// ── SSM/Mamba Kernels ──
+// ── Gated Delta Net / Linear Attention Kernels ──
 
-// Conv1D causal forward: update sliding window, compute convolution
-// conv_state: [inner_size, conv_kernel-1] persistent sliding window
-// x_in: [inner_size] new input at current position
-// w_conv: [inner_size, conv_kernel] weights (depthwise)
-// b_conv: [inner_size] bias
-// x_out: [inner_size] convolved + bias + SiLU output
-__global__ void ssm_conv1d_kernel(
-    const float *__restrict__ x_in,
-    float *__restrict__ conv_state,    // RW persistent state
-    const float *__restrict__ w_conv,
-    const float *__restrict__ b_conv,
-    float *__restrict__ x_out,
-    int inner_size, int conv_kernel
+// Conv1D causal forward: depthwise over QKV concatenated
+// conv_state: [dim, conv_kernel-1] persistent sliding window
+// Applies SiLU activation after convolution
+__global__ void gdn_conv1d_kernel(
+    float *__restrict__ x,             // [dim] RW: input, overwritten with output
+    float *__restrict__ conv_state,    // [dim, conv_kernel-1] RW persistent
+    const float *__restrict__ w_conv,  // [dim, conv_kernel] depthwise weights
+    int dim, int conv_kernel
 ) {
     int d = blockIdx.x * blockDim.x + threadIdx.x;
-    if (d >= inner_size) return;
+    if (d >= dim) return;
 
     int km1 = conv_kernel - 1;
 
     // Shift conv state left: drop oldest, append new input
+    float new_val = x[d];
     for (int k = 0; k < km1 - 1; k++)
         conv_state[d * km1 + k] = conv_state[d * km1 + k + 1];
-    conv_state[d * km1 + km1 - 1] = x_in[d];
+    conv_state[d * km1 + km1 - 1] = new_val;
 
-    // Depthwise conv: sum over kernel window
-    float val = b_conv ? b_conv[d] : 0.0f;
-    // Window: [conv_state[0..km1-1], x_in[d]] = kernel positions 0..conv_kernel-1
+    // Depthwise conv: sum over kernel window [state..., current]
+    float val = 0.0f;
     for (int k = 0; k < km1; k++)
         val += conv_state[d * km1 + k] * w_conv[d * conv_kernel + k];
-    val += x_in[d] * w_conv[d * conv_kernel + km1];
+    val += new_val * w_conv[d * conv_kernel + km1];
 
     // SiLU activation
     float sigmoid = 1.0f / (1.0f + expf(-val));
-    x_out[d] = val * sigmoid;
+    x[d] = val * sigmoid;
 }
 
-void cuda_ssm_conv1d(const float *x_in, float *conv_state,
-                     const float *w_conv, const float *b_conv,
-                     float *x_out, int inner_size, int conv_kernel,
-                     cudaStream_t stream) {
+void cuda_gdn_conv1d(float *x, float *conv_state, const float *w_conv,
+                     int dim, int conv_kernel, cudaStream_t stream) {
     int threads = 256;
-    int blocks = (inner_size + threads - 1) / threads;
-    ssm_conv1d_kernel<<<blocks, threads, 0, stream>>>(
-        x_in, conv_state, w_conv, b_conv, x_out, inner_size, conv_kernel);
+    int blocks = (dim + threads - 1) / threads;
+    gdn_conv1d_kernel<<<blocks, threads, 0, stream>>>(
+        x, conv_state, w_conv, dim, conv_kernel);
 }
 
-// SSM discrete scan: selective state space recurrence
-// For each feature d in [0, inner_size):
-//   dt = softplus(dt_bias[d] + dt_proj[d,:] @ x_conv)  -- but dt_proj is optional
-//   For grouped SSM: B and C are shared across groups
-//   A_bar = exp(dt * A[d,s])  -- A stored in log domain
-//   B_bar = dt * B[group,s]
-//   h[d,s] = A_bar * h[d,s] + B_bar * x_conv[d]
-//   y[d] = sum_s(C[group,s] * h[d,s])
-__global__ void ssm_scan_kernel(
-    const float *__restrict__ x_conv,     // [inner_size] convolved input
-    const float *__restrict__ A,          // [inner_size, state_size] log-domain
-    const float *__restrict__ B,          // [group_count, state_size]
-    const float *__restrict__ C,          // [group_count, state_size]
-    const float *__restrict__ dt_bias,    // [inner_size]
-    float *__restrict__ ssm_state,        // [inner_size, state_size] RW persistent
-    float *__restrict__ y,                // [inner_size] output
-    int inner_size, int state_size, int group_count
+// Gated Delta Net recurrence: one head at a time
+// State S is [key_head_dim, value_head_dim] per head
+// Recurrence:
+//   g = exp(A[h] * softplus(alpha[h] + dt_bias[h]))  -- A is pre-negated from GGUF
+//   S *= g                                            -- decay
+//   kv_mem = S^T @ k                                  -- retrieve [value_head_dim]
+//   delta = (v - kv_mem) * sigmoid(beta[h])           -- error correction
+//   S += k ⊗ delta                                    -- outer product write
+//   output = S^T @ q                                  -- read [value_head_dim]
+__global__ void gdn_recurrence_kernel(
+    const float *__restrict__ q,          // [num_v_heads * key_head_dim]
+    const float *__restrict__ k,          // [num_k_heads * key_head_dim]
+    const float *__restrict__ v,          // [num_v_heads * value_head_dim]
+    const float *__restrict__ A,          // [num_v_heads] pre-negated: -exp(A_log)
+    const float *__restrict__ alpha,      // [num_v_heads] raw alpha
+    const float *__restrict__ beta,       // [num_v_heads] raw beta
+    const float *__restrict__ dt_bias,    // [num_v_heads]
+    float *__restrict__ state,            // [num_v_heads, key_head_dim, value_head_dim] RW
+    float *__restrict__ output,           // [num_v_heads * value_head_dim]
+    int num_v_heads, int num_k_heads, int key_head_dim, int value_head_dim
 ) {
-    int d = blockIdx.x * blockDim.x + threadIdx.x;
-    if (d >= inner_size) return;
+    int head = blockIdx.x;
+    if (head >= num_v_heads) return;
 
-    // Compute dt with softplus
-    float dt_raw = dt_bias ? dt_bias[d] : 1.0f;
-    // Add x_conv contribution for data-dependent dt
-    dt_raw += x_conv[d] * 0.01f;  // Small linear contribution
-    // Softplus: log(1 + exp(x))
-    float dt;
-    if (dt_raw > 20.0f) dt = dt_raw;  // Avoid exp overflow
-    else dt = logf(1.0f + expf(dt_raw));
-    // Clamp dt to stable range
-    dt = fminf(fmaxf(dt, 0.001f), 0.1f);
+    int tid = threadIdx.x;
 
-    // Which group does this feature belong to
-    int group = d / (inner_size / group_count);
-    if (group >= group_count) group = group_count - 1;
+    // Compute gate g for this head
+    float a_val = A[head];  // Already -exp(A_log) from GGUF
+    float alpha_val = alpha[head];
+    float dt_b = dt_bias ? dt_bias[head] : 0.0f;
+    float sp_input = alpha_val + dt_b;
+    float sp = (sp_input > 20.0f) ? sp_input : logf(1.0f + expf(sp_input));
+    float g = expf(a_val * sp);  // a_val is negative, so g < 1 (decay)
 
-    // SSM recurrence over state dimensions
-    float out = 0.0f;
-    for (int s = 0; s < state_size; s++) {
-        float log_a = A[d * state_size + s];        // Negative log-domain
-        float b_val = B[group * state_size + s];
-        float c_val = C[group * state_size + s];
+    // Beta gate
+    float beta_val = 1.0f / (1.0f + expf(-beta[head]));  // sigmoid
 
-        // Discretize: A_bar = exp(dt * log_a)
-        float a_bar = expf(dt * log_a);
-        float b_bar = dt * b_val;
+    // Key head index (grouped: multiple v_heads share one k_head)
+    int k_head = head / (num_v_heads / num_k_heads);
+    if (k_head >= num_k_heads) k_head = num_k_heads - 1;
 
-        // State update
-        float h_old = ssm_state[d * state_size + s];
-        float h_new = a_bar * h_old + b_bar * x_conv[d];
-        ssm_state[d * state_size + s] = h_new;
+    const float *q_h = q + (size_t)k_head * key_head_dim;  // Q uses key heads
+    const float *k_h = k + (size_t)k_head * key_head_dim;
+    const float *v_h = v + (size_t)head * value_head_dim;
+    float *S = state + (size_t)head * key_head_dim * value_head_dim;
+    float *out_h = output + (size_t)head * value_head_dim;
 
-        // Output accumulation
-        out += c_val * h_new;
+    // Process value dimensions in parallel (threads across value_head_dim)
+    for (int vd = tid; vd < value_head_dim; vd += blockDim.x) {
+        // Step 1: Decay state column
+        // Step 2: Retrieve: kv_mem[vd] = sum_kd(S[kd,vd] * k[kd])
+        float kv_mem = 0.0f;
+        for (int kd = 0; kd < key_head_dim; kd++) {
+            float s_val = S[kd * value_head_dim + vd] * g;  // decay
+            S[kd * value_head_dim + vd] = s_val;
+            kv_mem += s_val * k_h[kd];
+        }
+
+        // Step 3: Delta rule: error correction
+        float delta = (v_h[vd] - kv_mem) * beta_val;
+
+        // Step 4: Write: S += k ⊗ delta (outer product)
+        for (int kd = 0; kd < key_head_dim; kd++)
+            S[kd * value_head_dim + vd] += k_h[kd] * delta;
+
+        // Step 5: Read: output[vd] = sum_kd(S[kd,vd] * q[kd])
+        float out_val = 0.0f;
+        for (int kd = 0; kd < key_head_dim; kd++)
+            out_val += S[kd * value_head_dim + vd] * q_h[kd];
+
+        out_h[vd] = out_val;
     }
-
-    y[d] = out;
 }
 
-void cuda_ssm_scan(const float *x_conv, const float *A, const float *B,
-                   const float *C, const float *dt_bias,
-                   float *ssm_state, float *y,
-                   int inner_size, int state_size, int group_count,
-                   cudaStream_t stream) {
-    int threads = 256;
-    int blocks = (inner_size + threads - 1) / threads;
-    ssm_scan_kernel<<<blocks, threads, 0, stream>>>(
-        x_conv, A, B, C, dt_bias, ssm_state, y,
-        inner_size, state_size, group_count);
+void cuda_gdn_recurrence(const float *q, const float *k, const float *v,
+                         const float *A, const float *alpha, const float *beta,
+                         const float *dt_bias, float *state, float *output,
+                         int num_v_heads, int num_k_heads,
+                         int key_head_dim, int value_head_dim,
+                         cudaStream_t stream) {
+    // One block per head, 128 threads per block (across value_head_dim)
+    int threads = (value_head_dim < 128) ? value_head_dim : 128;
+    gdn_recurrence_kernel<<<num_v_heads, threads, 0, stream>>>(
+        q, k, v, A, alpha, beta, dt_bias, state, output,
+        num_v_heads, num_k_heads, key_head_dim, value_head_dim);
 }
 
-// SSM gate: y = y * silu(z)
-__global__ void ssm_gate_kernel(
-    float *__restrict__ y,
+// RMSNorm + Gated: output = rms_norm(x, w) * silu(z)
+__global__ void rms_norm_gated_kernel(
+    const float *__restrict__ x,
     const float *__restrict__ z,
-    int n
+    const float *__restrict__ w,
+    float *__restrict__ out,
+    int head_dim, int n_heads
 ) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float sigmoid = 1.0f / (1.0f + expf(-z[i]));
-    y[i] = y[i] * (z[i] * sigmoid);
+    int head = blockIdx.x;
+    if (head >= n_heads) return;
+
+    const float *x_h = x + head * head_dim;
+    const float *z_h = z + head * head_dim;
+    float *out_h = out + head * head_dim;
+
+    // RMS norm over head_dim
+    float sum_sq = 0.0f;
+    for (int d = 0; d < head_dim; d++)
+        sum_sq += x_h[d] * x_h[d];
+    float rms = rsqrtf(sum_sq / head_dim + 1e-6f);
+
+    // Norm * weight * silu(z)
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float normed = x_h[d] * rms * w[d];
+        float z_val = z_h[d];
+        float silu_z = z_val / (1.0f + expf(-z_val));
+        out_h[d] = normed * silu_z;
+    }
 }
 
-void cuda_ssm_gate(float *y, const float *z, int n, cudaStream_t stream) {
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    ssm_gate_kernel<<<blocks, threads, 0, stream>>>(y, z, n);
+void cuda_rms_norm_gated(const float *x, const float *z, const float *w,
+                         float *out, int head_dim, int n_heads,
+                         cudaStream_t stream) {
+    int threads = (head_dim < 128) ? head_dim : 128;
+    rms_norm_gated_kernel<<<n_heads, threads, 0, stream>>>(
+        x, z, w, out, head_dim, n_heads);
 }
 
 } // extern "C"

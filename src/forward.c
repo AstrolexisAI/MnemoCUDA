@@ -41,17 +41,18 @@ extern void cuda_f32_to_f16(const float *in, void *out, int n, cudaStream_t stre
 extern void cuda_attention_f16kv(const void *q, const void *kv_k, const void *kv_v,
                                  float *out, int n_heads_q, int head_dim, int n_kv_heads,
                                  int seq_len, int gqa_ratio, float scale, cudaStream_t stream);
-// SSM/Mamba kernels
-extern void cuda_ssm_conv1d(const float *x_in, float *conv_state,
-                            const float *w_conv, const float *b_conv,
-                            float *x_out, int inner_size, int conv_kernel,
-                            cudaStream_t stream);
-extern void cuda_ssm_scan(const float *x_conv, const float *A, const float *B,
-                          const float *C, const float *dt_bias,
-                          float *ssm_state, float *y,
-                          int inner_size, int state_size, int group_count,
-                          cudaStream_t stream);
-extern void cuda_ssm_gate(float *y, const float *z, int n, cudaStream_t stream);
+// Gated Delta Net kernels
+extern void cuda_gdn_conv1d(float *x, float *conv_state, const float *w_conv,
+                            int dim, int conv_kernel, cudaStream_t stream);
+extern void cuda_gdn_recurrence(const float *q, const float *k, const float *v,
+                                const float *A, const float *alpha, const float *beta,
+                                const float *dt_bias, float *state, float *output,
+                                int num_v_heads, int num_k_heads,
+                                int key_head_dim, int value_head_dim,
+                                cudaStream_t stream);
+extern void cuda_rms_norm_gated(const float *x, const float *z, const float *w,
+                                float *out, int head_dim, int n_heads,
+                                cudaStream_t stream);
 
 // ── Helper: get tensor data on specific GPU ──
 
@@ -314,39 +315,38 @@ void *expert_cache_insert(GPUState *gpu, int layer, int expert_id,
 
 // ── SSM/Mamba forward for hybrid layers ──
 
-static void forward_ssm_block(MnemoCudaCtx *ctx, int layer, int gpu_idx) {
+// Gated Delta Net forward for one layer (replaces attention in hybrid models)
+static void forward_gdn_block(MnemoCudaCtx *ctx, int layer, int gpu_idx) {
     GPUState *gpu = &ctx->gpus[gpu_idx];
     ModelConfig *cfg = &ctx->config;
     int H = cfg->hidden_size;
-    int INNER = cfg->ssm_inner_size;
-    int SS = cfg->ssm_state_size;
+    int V_DIM = cfg->ssm_inner_size;        // value_dim (8192)
+    int K_HD = cfg->ssm_state_size;          // key_head_dim (128)
+    int V_HD = K_HD;                         // value_head_dim = key_head_dim
+    int N_VH = cfg->ssm_dt_rank;             // num_value_heads (64)
+    int N_KH = cfg->ssm_group_count;         // num_key_heads (16)
+    int K_DIM = K_HD * N_KH;                 // key_dim (2048)
+    int CONV_DIM = K_DIM + K_DIM + V_DIM;    // conv1d dim (12288)
     int CK = cfg->ssm_conv_kernel;
-    int GC = cfg->ssm_group_count;
     float eps = cfg->rms_norm_eps;
     cudaStream_t cs = gpu->stream_compute;
     char tname[128];
 
-    if (!gpu->d_ssm_state || !gpu->d_ssm_x || INNER <= 0) return;
+    if (!gpu->d_gdn_state || !gpu->d_gdn_qkv) return;
 
-    // Find SSM layer index for this GPU's state buffers
-    int ssm_idx = -1;
-    for (int i = 0; i < gpu->n_ssm_layers; i++) {
-        if (gpu->ssm_layer_map[i] == layer) { ssm_idx = i; break; }
+    // Find GDN layer index
+    int gdn_idx = -1;
+    for (int i = 0; i < gpu->n_gdn_layers; i++) {
+        if (gpu->gdn_layer_map[i] == layer) { gdn_idx = i; break; }
     }
-    if (ssm_idx < 0) return;
+    if (gdn_idx < 0) return;
 
-    // Pointers into per-layer persistent state
-    float *layer_ssm_state = gpu->d_ssm_state + (size_t)ssm_idx * INNER * SS;
-    float *layer_conv_state = gpu->d_conv_state + (size_t)ssm_idx * INNER * (CK - 1);
+    float *layer_state = gpu->d_gdn_state + (size_t)gdn_idx * N_VH * K_HD * V_HD;
+    float *layer_conv = gpu->d_conv_state + (size_t)gdn_idx * CONV_DIM * (CK - 1);
 
-    // ── 1. Pre-SSM RMS norm ──
-    // Qwen3.5 has a dedicated ssm_norm; fall back to attn_norm if missing
-    snprintf(tname, sizeof(tname), "blk.%d.ssm_norm.weight", layer);
+    // ── 1. Pre-layer RMS norm ──
+    snprintf(tname, sizeof(tname), "blk.%d.attn_norm.weight", layer);
     void *norm_w = tensor_data_on_gpu(ctx, tname, gpu_idx);
-    if (!norm_w) {
-        snprintf(tname, sizeof(tname), "blk.%d.attn_norm.weight", layer);
-        norm_w = tensor_data_on_gpu(ctx, tname, gpu_idx);
-    }
     if (norm_w)
         cuda_rms_norm(gpu->d_hidden, (float *)norm_w, gpu->d_normed, H, eps, cs);
 
@@ -354,88 +354,83 @@ static void forward_ssm_block(MnemoCudaCtx *ctx, int layer, int gpu_idx) {
     cudaMemcpyAsync(gpu->d_residual, gpu->d_hidden, H * sizeof(float),
                     cudaMemcpyDeviceToDevice, cs);
 
-    // ── 2. Input projection via ssm_alpha: [H] → [INNER] ──
-    // Qwen3.5 uses ssm_alpha.weight as the input projection (not ssm_in)
+    // ── 2. QKV projection: [H] → [K_DIM + K_DIM + V_DIM] = [12288] ──
+    snprintf(tname, sizeof(tname), "blk.%d.attn_qkv.weight", layer);
+    TensorEntry *w_qkv = tensor_get(ctx, tname);
+    if (!w_qkv) return;
+    matvec(tensor_ptr_on_gpu(ctx, w_qkv, gpu_idx),
+           gpu->d_normed, gpu->d_gdn_qkv, CONV_DIM, H, w_qkv->type_id, cs);
+
+    // ── 3. Alpha/Beta projections: [H] → [N_VH] each ──
     snprintf(tname, sizeof(tname), "blk.%d.ssm_alpha.weight", layer);
     TensorEntry *w_alpha = tensor_get(ctx, tname);
-    if (!w_alpha) {
-        // Fallback: try ssm_in.weight for other architectures
-        snprintf(tname, sizeof(tname), "blk.%d.ssm_in.weight", layer);
-        w_alpha = tensor_get(ctx, tname);
-    }
-    if (!w_alpha) return;
-
-    void *alpha_ptr = tensor_ptr_on_gpu(ctx, w_alpha, gpu_idx);
-    if (!alpha_ptr) return;
-
-    // Determine output dimensions from the weight tensor
-    // ssm_alpha projects [H] → [INNER] (the x path)
-    // The gate (z) will be derived from the same normed input via a copy + SiLU
-    matvec(alpha_ptr, gpu->d_normed, gpu->d_ssm_x, INNER, H, w_alpha->type_id, cs);
-
-    // z = copy of normed hidden (gate path, truncated/projected to INNER)
-    // For now: z = first INNER elements of normed (simple gating)
-    if (INNER <= H) {
-        cudaMemcpyAsync(gpu->d_ssm_z, gpu->d_normed, INNER * sizeof(float),
-                        cudaMemcpyDeviceToDevice, cs);
-    }
-
-    // ── 3. Causal convolution ──
-    snprintf(tname, sizeof(tname), "blk.%d.ssm_conv1d.weight", layer);
-    TensorEntry *w_conv = tensor_get(ctx, tname);
-
-    float *conv_w_ptr = w_conv ? (float *)tensor_ptr_on_gpu(ctx, w_conv, gpu_idx) : NULL;
-
-    if (conv_w_ptr) {
-        cuda_ssm_conv1d(gpu->d_ssm_x, layer_conv_state,
-                        conv_w_ptr, NULL,  // Qwen3.5 conv has no separate bias tensor
-                        gpu->d_ssm_x, INNER, CK, cs);
-    }
-
-    // ── 4. SSM scan ──
-    // Qwen3.5 tensor names: ssm_a (no .weight), ssm_beta.weight (= B matrix)
-    // In this architecture, beta serves as both B and C (symmetric)
-    snprintf(tname, sizeof(tname), "blk.%d.ssm_a", layer);
-    TensorEntry *w_a = tensor_get(ctx, tname);
-    if (!w_a) {
-        // Try with .weight suffix for other architectures
-        snprintf(tname, sizeof(tname), "blk.%d.ssm_a.weight", layer);
-        w_a = tensor_get(ctx, tname);
-    }
+    if (w_alpha)
+        matvec(tensor_ptr_on_gpu(ctx, w_alpha, gpu_idx),
+               gpu->d_normed, gpu->d_gdn_alpha, N_VH, H, w_alpha->type_id, cs);
 
     snprintf(tname, sizeof(tname), "blk.%d.ssm_beta.weight", layer);
     TensorEntry *w_beta = tensor_get(ctx, tname);
-    if (!w_beta) {
-        snprintf(tname, sizeof(tname), "blk.%d.ssm_b.weight", layer);
-        w_beta = tensor_get(ctx, tname);
+    if (w_beta)
+        matvec(tensor_ptr_on_gpu(ctx, w_beta, gpu_idx),
+               gpu->d_normed, gpu->d_gdn_beta, N_VH, H, w_beta->type_id, cs);
+
+    // ── 4. Gate Z projection: [H] → [V_DIM] ──
+    snprintf(tname, sizeof(tname), "blk.%d.attn_gate.weight", layer);
+    TensorEntry *w_gate = tensor_get(ctx, tname);
+    if (w_gate)
+        matvec(tensor_ptr_on_gpu(ctx, w_gate, gpu_idx),
+               gpu->d_normed, gpu->d_gdn_z, V_DIM, H, w_gate->type_id, cs);
+
+    // ── 5. Causal conv1d over concatenated QKV ──
+    snprintf(tname, sizeof(tname), "blk.%d.ssm_conv1d.weight", layer);
+    TensorEntry *w_conv = tensor_get(ctx, tname);
+    if (w_conv) {
+        cuda_gdn_conv1d(gpu->d_gdn_qkv, layer_conv,
+                        (float *)tensor_ptr_on_gpu(ctx, w_conv, gpu_idx),
+                        CONV_DIM, CK, cs);
     }
 
+    // ── 6. Split QKV after conv ──
+    // Layout: [Q=K_DIM | K=K_DIM | V=V_DIM]
+    float *q_ptr = gpu->d_gdn_qkv;                  // [K_DIM]
+    float *k_ptr = gpu->d_gdn_qkv + K_DIM;          // [K_DIM]
+    float *v_ptr = gpu->d_gdn_qkv + K_DIM + K_DIM;  // [V_DIM]
+
+    // ── 7. A and dt_bias ──
+    snprintf(tname, sizeof(tname), "blk.%d.ssm_a", layer);
+    TensorEntry *w_a = tensor_get(ctx, tname);
     snprintf(tname, sizeof(tname), "blk.%d.ssm_dt.bias", layer);
-    TensorEntry *w_dt_bias = tensor_get(ctx, tname);
+    TensorEntry *w_dt = tensor_get(ctx, tname);
 
     float *a_ptr = w_a ? (float *)tensor_ptr_on_gpu(ctx, w_a, gpu_idx) : NULL;
-    float *beta_ptr = w_beta ? (float *)tensor_ptr_on_gpu(ctx, w_beta, gpu_idx) : NULL;
-    float *dt_bias_ptr = w_dt_bias ? (float *)tensor_ptr_on_gpu(ctx, w_dt_bias, gpu_idx) : NULL;
+    float *dt_ptr = w_dt ? (float *)tensor_ptr_on_gpu(ctx, w_dt, gpu_idx) : NULL;
 
-    if (a_ptr && beta_ptr) {
-        // Use beta as both B and C (symmetric SSM in Qwen3.5)
-        cuda_ssm_scan(gpu->d_ssm_x, a_ptr, beta_ptr, beta_ptr, dt_bias_ptr,
-                      layer_ssm_state, gpu->d_ssm_y,
-                      INNER, SS, GC, cs);
+    // ── 8. Gated Delta Net recurrence ──
+    if (a_ptr) {
+        cuda_gdn_recurrence(q_ptr, k_ptr, v_ptr,
+                            a_ptr, gpu->d_gdn_alpha, gpu->d_gdn_beta, dt_ptr,
+                            layer_state, gpu->d_gdn_out,
+                            N_VH, N_KH, K_HD, V_HD, cs);
     }
 
-    // ── 5. Gate: y = y * silu(z) ──
-    cuda_ssm_gate(gpu->d_ssm_y, gpu->d_ssm_z, INNER, cs);
+    // ── 9. RMSNormGated: output = rms_norm(output, ssm_norm) * silu(z) ──
+    snprintf(tname, sizeof(tname), "blk.%d.ssm_norm.weight", layer);
+    TensorEntry *w_norm = tensor_get(ctx, tname);
+    if (w_norm) {
+        cuda_rms_norm_gated(gpu->d_gdn_out, gpu->d_gdn_z,
+                            (float *)tensor_ptr_on_gpu(ctx, w_norm, gpu_idx),
+                            gpu->d_gdn_out, V_HD, N_VH, cs);
+    }
 
-    // ── 6. Output projection: [INNER] → [H] ──
+    // ── 10. Output projection: [V_DIM] → [H] ──
     snprintf(tname, sizeof(tname), "blk.%d.ssm_out.weight", layer);
     TensorEntry *w_out = tensor_get(ctx, tname);
     if (w_out) {
         matvec(tensor_ptr_on_gpu(ctx, w_out, gpu_idx),
-               gpu->d_ssm_y, gpu->d_hidden, H, INNER, w_out->type_id, cs);
+               gpu->d_gdn_out, gpu->d_hidden, H, V_DIM, w_out->type_id, cs);
     }
 
-    // ── 7. Residual connection ──
+    // ── 11. Residual connection ──
     cuda_residual_add(gpu->d_hidden, gpu->d_residual, gpu->d_hidden, H, cs);
 }
 
@@ -540,8 +535,8 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
 
         cuda_residual_add(gpu->d_hidden, gpu->d_residual, gpu->d_hidden, H, cs);
     } else {
-        // SSM/Mamba layer: run SSM recurrence instead of attention
-        forward_ssm_block(ctx, layer, gpu_idx);
+        // Gated Delta Net layer: linear attention with delta rule
+        forward_gdn_block(ctx, layer, gpu_idx);
     }
 
     // ── 8. Pre-FFN RMS norm ──
