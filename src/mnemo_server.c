@@ -469,17 +469,30 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
         }
 
         // Bearer token authentication (if configured)
+        // Search headers only (before body), require exact token match
         if (auth_token) {
-            char expected[512];
-            snprintf(expected, sizeof(expected), "Bearer %s", auth_token);
-            char *auth_hdr = strcasestr(req, "Authorization:");
             int authorized = 0;
+            // Temporarily NUL-terminate at body start to limit search to headers
+            char saved = 0;
+            if (body && body > req) { saved = *body; *body = '\0'; }
+
+            char *auth_hdr = strcasestr(req, "\nAuthorization:");
             if (auth_hdr) {
-                auth_hdr += 14;
+                auth_hdr += 15;  // skip "\nAuthorization:"
                 while (*auth_hdr == ' ') auth_hdr++;
-                if (strncmp(auth_hdr, expected, strlen(expected)) == 0)
-                    authorized = 1;
+                // Expect exactly "Bearer <token>" followed by \r or \n
+                if (strncmp(auth_hdr, "Bearer ", 7) == 0) {
+                    auth_hdr += 7;
+                    int tlen = strlen(auth_token);
+                    if (strncmp(auth_hdr, auth_token, tlen) == 0 &&
+                        (auth_hdr[tlen] == '\r' || auth_hdr[tlen] == '\n' ||
+                         auth_hdr[tlen] == '\0'))
+                        authorized = 1;
+                }
             }
+
+            if (body && body > req) *body = saved;  // restore
+
             if (!authorized) {
                 http_respond_error(client_fd, 401, "Unauthorized");
                 free(req); close(client_fd);
@@ -662,9 +675,10 @@ int main(int argc, char **argv) {
     int warmup_mode = 2;  // 0=off, 1=light, 2=full
     for (int i = 2; i < argc - 1; i++) {
         if (strcmp(argv[i], "--context") == 0) {
-            long val = strtol(argv[i+1], NULL, 10);
-            if (val < 128 || val > 131072) {
-                fprintf(stderr, "Invalid --context %s (range: 128-131072)\n", argv[i+1]);
+            char *end;
+            long val = strtol(argv[i+1], &end, 10);
+            if (*end != '\0' || val < 128 || val > 131072) {
+                fprintf(stderr, "Invalid --context '%s' (integer 128-131072 required)\n", argv[i+1]);
                 return 1;
             }
             config.context_length = (int)val;
@@ -737,9 +751,10 @@ int main(int argc, char **argv) {
     if (argc >= 3 && strcmp(argv[2], "--repl") == 0) {
         run_repl(ctx);
     } else if (argc >= 4 && strcmp(argv[2], "--http") == 0) {
-        long port = strtol(argv[3], NULL, 10);
-        if (port < 1 || port > 65535) {
-            fprintf(stderr, "Invalid port %s\n", argv[3]);
+        char *port_end;
+        long port = strtol(argv[3], &port_end, 10);
+        if (*port_end != '\0' || port < 1 || port > 65535) {
+            fprintf(stderr, "Invalid port '%s' (integer 1-65535 required)\n", argv[3]);
             mnemo_cuda_destroy(ctx);
             return 1;
         }

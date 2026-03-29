@@ -439,12 +439,14 @@ static int load_config_json(MnemoCudaCtx *ctx, const char *path) {
     return 0;
 }
 
-// Fail-fast macro for CUDA calls during load. On error, unload cleans up.
+// Fail-fast macro for CUDA calls during load.
+// Cleans up partial state via mnemo_cuda_unload (idempotent) before returning.
 #define CUDA_LOAD_CHECK(call) do { \
     cudaError_t _err = (call); \
     if (_err != cudaSuccess) { \
-        fprintf(stderr, "[MnemoCUDA] CUDA error in load at %s:%d: %s\n", \
-                __FILE__, __LINE__, cudaGetErrorString(_err)); \
+        LOG_ERROR("CUDA error in load at %s:%d: %s", \
+                  __FILE__, __LINE__, cudaGetErrorString(_err)); \
+        mnemo_cuda_unload(ctx); \
         return -5; \
     } \
 } while(0)
@@ -458,7 +460,8 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
     char path[1200];
     snprintf(path, sizeof(path), "%s/config.json", config.model_dir);
     if (load_config_json(ctx, path) != 0) {
-        fprintf(stderr, "[MnemoCUDA] Failed to load model config\n");
+        LOG_ERROR("Failed to load model config");
+        mnemo_cuda_unload(ctx);
         return -1;
     }
 
@@ -592,6 +595,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
     cudaGetDeviceCount(&device_count);
     if (device_count <= 0) {
         LOG_ERROR("No CUDA GPUs detected");
+        mnemo_cuda_unload(ctx);
         return -3;
     }
 
@@ -603,6 +607,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
     } else {
         if (config.n_gpus < 0 || config.n_gpus > 8) {
             fprintf(stderr, "[MnemoCUDA] n_gpus=%d out of range [1,8]\n", config.n_gpus);
+            mnemo_cuda_unload(ctx);
             return -3;
         }
         ctx->n_gpus = config.n_gpus;
@@ -611,12 +616,14 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
             if (gid < 0 || gid >= device_count) {
                 fprintf(stderr, "[MnemoCUDA] gpu_ids[%d]=%d invalid (have %d devices)\n",
                         i, gid, device_count);
+                mnemo_cuda_unload(ctx);
                 return -3;
             }
             // Check for duplicate GPU IDs
             for (int j = 0; j < i; j++) {
                 if (ctx->gpus[j].gpu_id == gid) {
                     fprintf(stderr, "[MnemoCUDA] Duplicate gpu_id %d\n", gid);
+                    mnemo_cuda_unload(ctx);
                     return -3;
                 }
             }
@@ -703,14 +710,14 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
     // Load resident weights: mmap file on host
     snprintf(path, sizeof(path), "%s/resident_weights.bin", config.model_dir);
     int fd = open(path, O_RDONLY);
-    if (fd < 0) { fprintf(stderr, "[MnemoCUDA] Cannot open %s\n", path); return -2; }
+    if (fd < 0) { fprintf(stderr, "[MnemoCUDA] Cannot open %s\n", path); mnemo_cuda_unload(ctx); return -2; }
 
     struct stat st;
     fstat(fd, &st);
     ctx->resident_size = st.st_size;
 
     ctx->h_resident_mmap = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-    if (ctx->h_resident_mmap == MAP_FAILED) { close(fd); return -2; }
+    if (ctx->h_resident_mmap == MAP_FAILED) { close(fd); mnemo_cuda_unload(ctx); return -2; }
     close(fd);
 
     // Sanitize NaN/Inf in F32 resident tensors (some GGUFs have corrupt weights)
@@ -865,7 +872,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
             CUDA_LOAD_CHECK(cudaMallocHost(&gpu->h_expert_buf, gpu->expert_buf_size));
         } else {
             gpu->h_expert_buf = malloc(gpu->expert_buf_size);
-            if (!gpu->h_expert_buf) { fprintf(stderr, "[MnemoCUDA] OOM: expert buf\n"); return -5; }
+            if (!gpu->h_expert_buf) { fprintf(stderr, "[MnemoCUDA] OOM: expert buf\n"); mnemo_cuda_unload(ctx); return -5; }
         }
         CUDA_LOAD_CHECK(cudaMalloc(&gpu->d_expert_buf, gpu->expert_buf_size));
 
@@ -900,7 +907,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
             CUDA_LOAD_CHECK(cudaMallocHost(&gpu->h_prefetch_buf, gpu->prefetch_buf_size));
         } else {
             gpu->h_prefetch_buf = malloc(gpu->prefetch_buf_size);
-            if (!gpu->h_prefetch_buf) { fprintf(stderr, "[MnemoCUDA] OOM: prefetch buf\n"); return -5; }
+            if (!gpu->h_prefetch_buf) { fprintf(stderr, "[MnemoCUDA] OOM: prefetch buf\n"); mnemo_cuda_unload(ctx); return -5; }
         }
         gpu->prefetch_layer = -1;
         gpu->n_prefetched = 0;
