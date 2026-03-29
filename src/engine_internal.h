@@ -34,6 +34,7 @@ typedef struct {
     float rope_theta;
     float rms_norm_eps;
     int max_position_embeddings;
+    int full_attention_interval;  // 0 = all layers have attention, N = every Nth layer (hybrid SSM+MoE)
 } ModelConfig;
 
 // ── Expert layer file ──

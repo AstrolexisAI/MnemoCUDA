@@ -426,6 +426,7 @@ static int load_config_json(MnemoCudaCtx *ctx, const char *path) {
     CFG_FLOAT(rope_theta, "rope.freq_base", 1000000.0f);
     CFG_FLOAT(rms_norm_eps, "attention.layer_norm_rms_epsilon", 1e-6f);
     CFG_INT(max_position_embeddings, "context_length", 40960);
+    CFG_INT(full_attention_interval, "full_attention_interval", 0);
 
     // Read vocab_size from metadata (try multiple common keys)
     int vs = json_get_int(json, "tokenizer.ggml.tokens_count", 0);
@@ -650,6 +651,14 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
     LOG_INFO("Loading: hidden=%d, layers=%d, experts=%d (K=%d), GPUs=%d",
             cfg->hidden_size, cfg->num_hidden_layers,
             cfg->num_experts, cfg->num_experts_per_tok, ctx->n_gpus);
+
+    if (cfg->full_attention_interval > 0) {
+        int attn_layers = cfg->num_hidden_layers / cfg->full_attention_interval;
+        int ssm_layers = cfg->num_hidden_layers - attn_layers;
+        LOG_WARN("Hybrid MoE+SSM model: %d attention layers, %d SSM layers (interval=%d). "
+                 "SSM layers will be skipped (not yet implemented)",
+                 attn_layers, ssm_layers, cfg->full_attention_interval);
+    }
 
     // Open expert files BEFORE CUDA allocations (CUDA may invalidate fds)
     ctx->expert_layers = calloc(cfg->num_hidden_layers, sizeof(ExpertLayerFile));

@@ -317,84 +317,99 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
 
     char tname[128];
 
-    // ── 1. Pre-attention RMS norm ──
-    snprintf(tname, sizeof(tname), "blk.%d.attn_norm.weight", layer);
-    void *norm_w = tensor_data_on_gpu(ctx, tname, gpu_idx);
-    cuda_rms_norm(gpu->d_hidden, (float *)norm_w, gpu->d_normed, H, eps, cs);
-
-    // Save residual
-    cudaMemcpyAsync(gpu->d_residual, gpu->d_hidden, H * sizeof(float),
-                    cudaMemcpyDeviceToDevice, cs);
-
-    // ── 2. Q/K/V projections (GPU dequant matvec) ──
-    snprintf(tname, sizeof(tname), "blk.%d.attn_q.weight", layer);
-    TensorEntry *wq = tensor_get(ctx, tname);
-    if (wq) matvec(tensor_ptr_on_gpu(ctx, wq, gpu_idx),
-                    gpu->d_normed, gpu->d_q, NH * HD, H, wq->type_id, cs);
-
-    snprintf(tname, sizeof(tname), "blk.%d.attn_k.weight", layer);
-    TensorEntry *wk = tensor_get(ctx, tname);
-    if (wk) matvec(tensor_ptr_on_gpu(ctx, wk, gpu_idx),
-                    gpu->d_normed, gpu->d_k, NKV * HD, H, wk->type_id, cs);
-
-    snprintf(tname, sizeof(tname), "blk.%d.attn_v.weight", layer);
-    TensorEntry *wv = tensor_get(ctx, tname);
-    if (wv) matvec(tensor_ptr_on_gpu(ctx, wv, gpu_idx),
-                    gpu->d_normed, gpu->d_v, NKV * HD, H, wv->type_id, cs);
-
-    // ── 3. QK norms (optional, Qwen3 uses them) ──
-    snprintf(tname, sizeof(tname), "blk.%d.attn_q_norm.weight", layer);
-    TensorEntry *qn = tensor_get(ctx, tname);
-    if (qn) {
-        for (int h = 0; h < NH; h++)
-            cuda_rms_norm(gpu->d_q + h * HD,
-                         (float *)tensor_ptr_on_gpu(ctx, qn, gpu_idx),
-                         gpu->d_q + h * HD, HD, eps, cs);
+    // Detect if this is an attention layer or SSM layer (hybrid MoE+SSM models)
+    // full_attention_interval=4 means layers 0,4,8,... have attention, rest are SSM
+    int is_attention_layer = 1;
+    if (cfg->full_attention_interval > 0) {
+        is_attention_layer = (layer % cfg->full_attention_interval == 0);
     }
 
-    snprintf(tname, sizeof(tname), "blk.%d.attn_k_norm.weight", layer);
-    TensorEntry *kn = tensor_get(ctx, tname);
-    if (kn) {
-        for (int h = 0; h < NKV; h++)
-            cuda_rms_norm(gpu->d_k + h * HD,
-                         (float *)tensor_ptr_on_gpu(ctx, kn, gpu_idx),
-                         gpu->d_k + h * HD, HD, eps, cs);
+    if (is_attention_layer) {
+        // ── 1. Pre-attention RMS norm ──
+        snprintf(tname, sizeof(tname), "blk.%d.attn_norm.weight", layer);
+        void *norm_w = tensor_data_on_gpu(ctx, tname, gpu_idx);
+        if (norm_w) {
+            cuda_rms_norm(gpu->d_hidden, (float *)norm_w, gpu->d_normed, H, eps, cs);
+        }
+
+        // Save residual
+        cudaMemcpyAsync(gpu->d_residual, gpu->d_hidden, H * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cs);
+
+        // ── 2. Q/K/V projections (GPU dequant matvec) ──
+        snprintf(tname, sizeof(tname), "blk.%d.attn_q.weight", layer);
+        TensorEntry *wq = tensor_get(ctx, tname);
+        if (wq) matvec(tensor_ptr_on_gpu(ctx, wq, gpu_idx),
+                        gpu->d_normed, gpu->d_q, NH * HD, H, wq->type_id, cs);
+
+        snprintf(tname, sizeof(tname), "blk.%d.attn_k.weight", layer);
+        TensorEntry *wk = tensor_get(ctx, tname);
+        if (wk) matvec(tensor_ptr_on_gpu(ctx, wk, gpu_idx),
+                        gpu->d_normed, gpu->d_k, NKV * HD, H, wk->type_id, cs);
+
+        snprintf(tname, sizeof(tname), "blk.%d.attn_v.weight", layer);
+        TensorEntry *wv = tensor_get(ctx, tname);
+        if (wv) matvec(tensor_ptr_on_gpu(ctx, wv, gpu_idx),
+                        gpu->d_normed, gpu->d_v, NKV * HD, H, wv->type_id, cs);
+
+        // ── 3. QK norms (optional, Qwen3 uses them) ──
+        snprintf(tname, sizeof(tname), "blk.%d.attn_q_norm.weight", layer);
+        TensorEntry *qn = tensor_get(ctx, tname);
+        if (qn) {
+            for (int h = 0; h < NH; h++)
+                cuda_rms_norm(gpu->d_q + h * HD,
+                             (float *)tensor_ptr_on_gpu(ctx, qn, gpu_idx),
+                             gpu->d_q + h * HD, HD, eps, cs);
+        }
+
+        snprintf(tname, sizeof(tname), "blk.%d.attn_k_norm.weight", layer);
+        TensorEntry *kn = tensor_get(ctx, tname);
+        if (kn) {
+            for (int h = 0; h < NKV; h++)
+                cuda_rms_norm(gpu->d_k + h * HD,
+                             (float *)tensor_ptr_on_gpu(ctx, kn, gpu_idx),
+                             gpu->d_k + h * HD, HD, eps, cs);
+        }
+
+        // ── 4. RoPE (GPU kernel) ──
+        cuda_rope(gpu->d_q, gpu->d_k, HD, pos, cfg->rope_theta, NH, NKV, cs);
+
+        // ── 5. KV cache store (FP32 → FP16 on GPU) ──
+        int local_layer = layer - gpu->layer_start;
+        int ctx_len = cfg->max_position_embeddings;
+        size_t kv_layer_stride = (size_t)ctx_len * NKV * HD;
+
+        void *kv_k_dst = (char *)gpu->d_kv_k + (local_layer * kv_layer_stride + (size_t)pos * NKV * HD) * sizeof(uint16_t);
+        void *kv_v_dst = (char *)gpu->d_kv_v + (local_layer * kv_layer_stride + (size_t)pos * NKV * HD) * sizeof(uint16_t);
+        cuda_f32_to_f16(gpu->d_k, kv_k_dst, NKV * HD, cs);
+        cuda_f32_to_f16(gpu->d_v, kv_v_dst, NKV * HD, cs);
+
+        // ── 6. Attention: Q@K^T → softmax → @V (FP16 KV — half bandwidth) ──
+        void *kv_k_layer = (char *)gpu->d_kv_k + local_layer * kv_layer_stride * sizeof(uint16_t);
+        void *kv_v_layer = (char *)gpu->d_kv_v + local_layer * kv_layer_stride * sizeof(uint16_t);
+        int gqa_ratio = NH / NKV;
+        float attn_scale = 1.0f / sqrtf((float)HD);
+        int seq_len = pos + 1;
+
+        cuda_attention_f16kv(gpu->d_q, kv_k_layer, kv_v_layer, gpu->d_attn_out,
+                             NH, HD, NKV, seq_len, gqa_ratio, attn_scale, cs);
+
+        // ── 7. Output projection + residual (GPU) ──
+        snprintf(tname, sizeof(tname), "blk.%d.attn_output.weight", layer);
+        TensorEntry *wo = tensor_get(ctx, tname);
+        if (wo) matvec(tensor_ptr_on_gpu(ctx, wo, gpu_idx),
+                        gpu->d_attn_out, gpu->d_hidden, H, NH * HD, wo->type_id, cs);
+
+        cuda_residual_add(gpu->d_hidden, gpu->d_residual, gpu->d_hidden, H, cs);
     }
-
-    // ── 4. RoPE (GPU kernel) ──
-    cuda_rope(gpu->d_q, gpu->d_k, HD, pos, cfg->rope_theta, NH, NKV, cs);
-
-    // ── 5. KV cache store (FP32 → FP16 on GPU) ──
-    int local_layer = layer - gpu->layer_start;
-    int ctx_len = cfg->max_position_embeddings;
-    size_t kv_layer_stride = (size_t)ctx_len * NKV * HD;
-
-    void *kv_k_dst = (char *)gpu->d_kv_k + (local_layer * kv_layer_stride + (size_t)pos * NKV * HD) * sizeof(uint16_t);
-    void *kv_v_dst = (char *)gpu->d_kv_v + (local_layer * kv_layer_stride + (size_t)pos * NKV * HD) * sizeof(uint16_t);
-    cuda_f32_to_f16(gpu->d_k, kv_k_dst, NKV * HD, cs);
-    cuda_f32_to_f16(gpu->d_v, kv_v_dst, NKV * HD, cs);
-
-    // ── 6. Attention: Q@K^T → softmax → @V (FP16 KV — half bandwidth) ──
-    void *kv_k_layer = (char *)gpu->d_kv_k + local_layer * kv_layer_stride * sizeof(uint16_t);
-    void *kv_v_layer = (char *)gpu->d_kv_v + local_layer * kv_layer_stride * sizeof(uint16_t);
-    int gqa_ratio = NH / NKV;
-    float attn_scale = 1.0f / sqrtf((float)HD);
-    int seq_len = pos + 1;
-
-    cuda_attention_f16kv(gpu->d_q, kv_k_layer, kv_v_layer, gpu->d_attn_out,
-                         NH, HD, NKV, seq_len, gqa_ratio, attn_scale, cs);
-
-    // ── 7. Output projection + residual (GPU) ──
-    snprintf(tname, sizeof(tname), "blk.%d.attn_output.weight", layer);
-    TensorEntry *wo = tensor_get(ctx, tname);
-    if (wo) matvec(tensor_ptr_on_gpu(ctx, wo, gpu_idx),
-                    gpu->d_attn_out, gpu->d_hidden, H, NH * HD, wo->type_id, cs);
-
-    cuda_residual_add(gpu->d_hidden, gpu->d_residual, gpu->d_hidden, H, cs);
+    // SSM layers: attention block skipped (SSM/Mamba not yet implemented).
+    // Hidden state passes through to the MoE/FFN block unchanged.
+    // This produces degraded output but prevents crashes on hybrid models.
 
     // ── 8. Pre-FFN RMS norm ──
     snprintf(tname, sizeof(tname), "blk.%d.ffn_norm.weight", layer);
     void *ffn_norm_w = tensor_data_on_gpu(ctx, tname, gpu_idx);
+    if (!ffn_norm_w) return;  // no FFN on this layer (pure SSM without MoE)
     cuda_rms_norm(gpu->d_hidden, (float *)ffn_norm_w, gpu->d_normed, H, eps, cs);
 
     // Save residual for MoE skip connection
