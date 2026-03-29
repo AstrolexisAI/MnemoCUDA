@@ -374,6 +374,16 @@ static int load_config_json(MnemoCudaCtx *ctx, const char *path) {
     return 0;
 }
 
+// Fail-fast macro for CUDA calls during load. On error, unload cleans up.
+#define CUDA_LOAD_CHECK(call) do { \
+    cudaError_t _err = (call); \
+    if (_err != cudaSuccess) { \
+        fprintf(stderr, "[MnemoCUDA] CUDA error in load at %s:%d: %s\n", \
+                __FILE__, __LINE__, cudaGetErrorString(_err)); \
+        return -5; \
+    } \
+} while(0)
+
 int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
     if (!ctx || !config.model_dir) return -1;
 
@@ -393,6 +403,16 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         ctx->config.num_experts_per_tok = MNEMO_MAX_EXPERT_K;
     }
 
+    if (config.context_length < 128) {
+        fprintf(stderr, "[MnemoCUDA] context_length=%d too small, using 128\n",
+                config.context_length);
+        config.context_length = 128;
+    }
+    if (config.context_length > 131072) {
+        fprintf(stderr, "[MnemoCUDA] context_length=%d too large, capping at 131072\n",
+                config.context_length);
+        config.context_length = 131072;
+    }
     ctx->config.max_position_embeddings = config.context_length;
 
     ModelConfig *cfg = &ctx->config;
@@ -495,20 +515,41 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         fprintf(stderr, "[MnemoCUDA] Warning: no resident_manifest.json\n");
     }
 
-    // Auto-detect GPUs if n_gpus == 0
+    // Validate and set up GPUs
+    int device_count = 0;
+    cudaGetDeviceCount(&device_count);
+    if (device_count <= 0) {
+        fprintf(stderr, "[MnemoCUDA] No CUDA GPUs detected\n");
+        return -3;
+    }
+
     if (config.n_gpus == 0) {
-        cudaGetDeviceCount(&ctx->n_gpus);
-        if (ctx->n_gpus > 8) ctx->n_gpus = 8;
+        // Auto-detect
+        ctx->n_gpus = device_count > 8 ? 8 : device_count;
         for (int i = 0; i < ctx->n_gpus; i++)
             ctx->gpus[i].gpu_id = i;
     } else {
+        if (config.n_gpus < 0 || config.n_gpus > 8) {
+            fprintf(stderr, "[MnemoCUDA] n_gpus=%d out of range [1,8]\n", config.n_gpus);
+            return -3;
+        }
         ctx->n_gpus = config.n_gpus;
-        for (int i = 0; i < ctx->n_gpus; i++)
-            ctx->gpus[i].gpu_id = config.gpu_ids[i];
-    }
-    if (ctx->n_gpus <= 0) {
-        fprintf(stderr, "[MnemoCUDA] No CUDA GPUs detected\n");
-        return -3;
+        for (int i = 0; i < ctx->n_gpus; i++) {
+            int gid = config.gpu_ids[i];
+            if (gid < 0 || gid >= device_count) {
+                fprintf(stderr, "[MnemoCUDA] gpu_ids[%d]=%d invalid (have %d devices)\n",
+                        i, gid, device_count);
+                return -3;
+            }
+            // Check for duplicate GPU IDs
+            for (int j = 0; j < i; j++) {
+                if (ctx->gpus[j].gpu_id == gid) {
+                    fprintf(stderr, "[MnemoCUDA] Duplicate gpu_id %d\n", gid);
+                    return -3;
+                }
+            }
+            ctx->gpus[i].gpu_id = gid;
+        }
     }
 
     fprintf(stderr, "[MnemoCUDA] Loading: hidden=%d, layers=%d, experts=%d (K=%d), GPUs=%d\n",
@@ -628,8 +669,8 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         GPUState *gpu = &ctx->gpus[g];
         cudaSetDevice(gpu->gpu_id);
 
-        cudaStreamCreate(&gpu->stream_compute);
-        cudaStreamCreate(&gpu->stream_io);
+        CUDA_LOAD_CHECK(cudaStreamCreate(&gpu->stream_compute));
+        CUDA_LOAD_CHECK(cudaStreamCreate(&gpu->stream_io));
 
         // Classify which tensors this GPU needs
         gpu->tensor_offsets = (size_t *)malloc(n_tensors * sizeof(size_t));
@@ -673,7 +714,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
 
         // Allocate and copy only needed tensors
         if (gpu_resident_size == 0) gpu_resident_size = 256;  // avoid zero alloc
-        cudaMalloc(&gpu->d_resident, gpu_resident_size);
+        CUDA_LOAD_CHECK(cudaMalloc(&gpu->d_resident, gpu_resident_size));
         gpu->resident_size = gpu_resident_size;
 
         for (int i = 0; i < n_tensors; i++) {
@@ -699,7 +740,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
     }
 
     // Allocate pinned host buffer for inter-GPU hidden state transfer
-    cudaMallocHost((void**)&ctx->h_hidden_transfer, cfg->hidden_size * sizeof(float));
+    CUDA_LOAD_CHECK(cudaMallocHost((void**)&ctx->h_hidden_transfer, cfg->hidden_size * sizeof(float)));
 
     // Allocate per-GPU compute buffers
     int H = cfg->hidden_size;
@@ -724,44 +765,46 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         GPUState *gpu = &ctx->gpus[g];
         cudaSetDevice(gpu->gpu_id);
 
-        cudaMalloc((void**)&gpu->d_hidden,   H * sizeof(float));
-        cudaMalloc((void**)&gpu->d_residual, H * sizeof(float));
-        cudaMalloc((void**)&gpu->d_q,        NH * HD * sizeof(float));
-        cudaMalloc((void**)&gpu->d_k,        NKV * HD * sizeof(float));
-        cudaMalloc((void**)&gpu->d_v,        NKV * HD * sizeof(float));
-        cudaMalloc((void**)&gpu->d_attn_out, NH * HD * sizeof(float));
-        cudaMalloc((void**)&gpu->d_normed,   H * sizeof(float));
-        cudaMalloc((void**)&gpu->d_router_logits, cfg->num_experts * sizeof(float));
-        cudaMalloc((void**)&gpu->d_router_out, cfg->num_experts * sizeof(float));
-        cudaMalloc((void**)&gpu->d_expert_indices, K * sizeof(int));
-        cudaMalloc((void**)&gpu->d_expert_weights, K * sizeof(float));
-        cudaMalloc((void**)&gpu->d_expert_gate, EFF * sizeof(float));
-        cudaMalloc((void**)&gpu->d_expert_up,   EFF * sizeof(float));
-        cudaMalloc((void**)&gpu->d_expert_act,  EFF * sizeof(float));
-        cudaMalloc((void**)&gpu->d_expert_out,  H * sizeof(float));
-        cudaMalloc((void**)&gpu->d_moe_out,     (size_t)H * K * sizeof(float));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_hidden,   H * sizeof(float)));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_residual, H * sizeof(float)));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_q,        NH * HD * sizeof(float)));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_k,        NKV * HD * sizeof(float)));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_v,        NKV * HD * sizeof(float)));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_attn_out, NH * HD * sizeof(float)));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_normed,   H * sizeof(float)));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_router_logits, cfg->num_experts * sizeof(float)));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_router_out, cfg->num_experts * sizeof(float)));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_expert_indices, K * sizeof(int)));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_expert_weights, K * sizeof(float)));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_expert_gate, EFF * sizeof(float)));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_expert_up,   EFF * sizeof(float)));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_expert_act,  EFF * sizeof(float)));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_expert_out,  H * sizeof(float)));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_moe_out,     (size_t)H * K * sizeof(float)));
 
         // Logits only on last GPU
         if (g == ctx->n_gpus - 1)
-            cudaMalloc((void**)&gpu->d_logits, V * sizeof(float));
+            CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_logits, V * sizeof(float)));
 
         // Expert I/O buffer (pinned host, K experts for parallel pread)
         gpu->expert_buf_size = max_expert_sz * K;
         gpu->expert_buf_pinned = config.use_pinned_memory;
-        if (config.use_pinned_memory)
-            cudaMallocHost(&gpu->h_expert_buf, gpu->expert_buf_size);
-        else
+        if (config.use_pinned_memory) {
+            CUDA_LOAD_CHECK(cudaMallocHost(&gpu->h_expert_buf, gpu->expert_buf_size));
+        } else {
             gpu->h_expert_buf = malloc(gpu->expert_buf_size);
-        cudaMalloc(&gpu->d_expert_buf, gpu->expert_buf_size);
+            if (!gpu->h_expert_buf) { fprintf(stderr, "[MnemoCUDA] OOM: expert buf\n"); return -5; }
+        }
+        CUDA_LOAD_CHECK(cudaMalloc(&gpu->d_expert_buf, gpu->expert_buf_size));
 
         // KV cache — FP16 (half the VRAM of FP32)
         int n_layers = gpu->layer_end - gpu->layer_start;
         size_t kv_per_tok = (size_t)NKV * HD * sizeof(uint16_t);
         size_t kv_size = (size_t)n_layers * config.context_length * kv_per_tok;
-        cudaMalloc((void**)&gpu->d_kv_k, kv_size);
-        cudaMalloc((void**)&gpu->d_kv_v, kv_size);
-        cudaMemset(gpu->d_kv_k, 0, kv_size);
-        cudaMemset(gpu->d_kv_v, 0, kv_size);
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_kv_k, kv_size));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_kv_v, kv_size));
+        CUDA_LOAD_CHECK(cudaMemset(gpu->d_kv_k, 0, kv_size));
+        CUDA_LOAD_CHECK(cudaMemset(gpu->d_kv_v, 0, kv_size));
 
         fprintf(stderr, "[MnemoCUDA] GPU %d: KV cache %.1f MB FP16 (%d ctx), expert buf %.1f MB\n",
                 gpu->gpu_id, (double)kv_size*2 / (1024*1024), config.context_length,
@@ -781,10 +824,12 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         // Prefetch buffer — holds up to K experts for speculative next-layer reads
         gpu->prefetch_buf_size = max_expert_sz * K;
         gpu->prefetch_buf_pinned = config.use_pinned_memory;
-        if (config.use_pinned_memory)
-            cudaMallocHost(&gpu->h_prefetch_buf, gpu->prefetch_buf_size);
-        else
+        if (config.use_pinned_memory) {
+            CUDA_LOAD_CHECK(cudaMallocHost(&gpu->h_prefetch_buf, gpu->prefetch_buf_size));
+        } else {
             gpu->h_prefetch_buf = malloc(gpu->prefetch_buf_size);
+            if (!gpu->h_prefetch_buf) { fprintf(stderr, "[MnemoCUDA] OOM: prefetch buf\n"); return -5; }
+        }
         gpu->prefetch_layer = -1;
         gpu->n_prefetched = 0;
         gpu->prefetch_ready = 0;

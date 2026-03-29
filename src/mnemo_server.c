@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <time.h>
 #include "engine.h"
 
@@ -90,23 +91,28 @@ static void on_token(const char *text, bool is_done, void *userdata) {
 
 // ── Generate with stats ──
 
-static void generate(MnemoCudaCtx *ctx, const char *prompt, float temp, int max_tokens, OutputCtx *out) {
+static int generate(MnemoCudaCtx *ctx, const char *prompt, float temp, int max_tokens, OutputCtx *out) {
     out->buf_len = 0;
     out->buf[0] = '\0';
 
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    mnemo_cuda_generate(ctx, prompt, max_tokens, temp, on_token, out);
+    int rc = mnemo_cuda_generate(ctx, prompt, max_tokens, temp, on_token, out);
 
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 
     MnemoCudaStats stats = mnemo_cuda_get_stats(ctx);
-    fprintf(stderr, "[MnemoCUDA] %d tokens in %.1fs (%.1f tok/s, prefill %.1fs)\n",
-            stats.tokens_generated, elapsed, stats.tokens_per_second,
-            elapsed - (stats.tokens_generated > 0 ? stats.tokens_generated / stats.tokens_per_second : 0));
+    if (rc == 0) {
+        fprintf(stderr, "[MnemoCUDA] %d tokens in %.1fs (%.1f tok/s, prefill %.1fs)\n",
+                stats.tokens_generated, elapsed, stats.tokens_per_second,
+                elapsed - (stats.tokens_generated > 0 ? stats.tokens_generated / stats.tokens_per_second : 0));
+    } else {
+        fprintf(stderr, "[MnemoCUDA] Generation failed: error %d\n", rc);
+    }
+    return rc;
 }
 
 // ── REPL mode ──
@@ -407,7 +413,7 @@ static char *json_escape(const char *src, int len) {
 
 // ── HTTP server mode ──
 
-static void run_http(MnemoCudaCtx *ctx, int port) {
+static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) { perror("socket"); return; }
 
@@ -416,16 +422,19 @@ static void run_http(MnemoCudaCtx *ctx, int port) {
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
-        .sin_addr.s_addr = INADDR_ANY,
         .sin_port = htons(port),
     };
+    if (inet_pton(AF_INET, bind_addr, &addr.sin_addr) != 1) {
+        fprintf(stderr, "[MnemoCUDA] Invalid bind address: %s\n", bind_addr);
+        close(server_fd); return;
+    }
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind"); close(server_fd); return;
     }
     listen(server_fd, 5);
 
-    fprintf(stderr, "[MnemoCUDA] HTTP server on port %d\n", port);
+    fprintf(stderr, "[MnemoCUDA] HTTP server on %s:%d\n", bind_addr, port);
     fprintf(stderr, "[MnemoCUDA] POST /v1/completions {\"prompt\":\"...\", \"max_tokens\":256, \"temperature\":0.7}\n");
 
     OutputCtx out = { .fd = -1, .buf = malloc(65536), .buf_len = 0, .buf_cap = 65536 };
@@ -537,11 +546,27 @@ static void run_http(MnemoCudaCtx *ctx, int port) {
                               "Connection: close\r\n\r\n";
             write(client_fd, hdr, strlen(hdr));
             out.fd = client_fd;
-            generate(ctx, prompt, temperature, max_tokens, &out);
+            int rc = generate(ctx, prompt, temperature, max_tokens, &out);
             out.fd = -1;
+            if (rc != 0) {
+                // Emit SSE error event before closing
+                char err_evt[256];
+                int n = snprintf(err_evt, sizeof(err_evt),
+                    "data: {\"error\":\"generation failed (code %d)\",\"done\":true}\n\n", rc);
+                write(client_fd, err_evt, n);
+            }
         } else {
             out.fd = -1;
-            generate(ctx, prompt, temperature, max_tokens, &out);
+            int rc = generate(ctx, prompt, temperature, max_tokens, &out);
+
+            if (rc != 0) {
+                int http_code = (rc == -2) ? 503 : 500; // -2 = tokenizer, else internal
+                char msg[128];
+                snprintf(msg, sizeof(msg), "Generation failed (code %d)", rc);
+                http_respond_error(client_fd, http_code, msg);
+                free(prompt); free(req); close(client_fd);
+                continue;
+            }
 
             MnemoCudaStats stats = mnemo_cuda_get_stats(ctx);
             char *escaped = json_escape(out.buf, out.buf_len);
@@ -580,6 +605,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  %s <model_dir> --repl              Interactive REPL\n", argv[0]);
         fprintf(stderr, "  %s <model_dir> --http <port>       HTTP API server\n", argv[0]);
         fprintf(stderr, "  %s <model_dir> \"prompt\"            Single generation\n", argv[0]);
+        fprintf(stderr, "\nOptions:\n");
+        fprintf(stderr, "  --context N     Context length (default 8192, range 128-131072)\n");
+        fprintf(stderr, "  --bind ADDR     Bind address for HTTP (default 127.0.0.1)\n");
         return 1;
     }
 
@@ -588,10 +616,19 @@ int main(int argc, char **argv) {
 
     const char *model_dir = argv[1];
 
-    // Context length from config_default(), override with --context N
+    // Parse CLI options
     MnemoCudaConfig config = mnemo_cuda_config_default();
+    const char *bind_addr = "127.0.0.1";  // safe default: localhost only
     for (int i = 2; i < argc - 1; i++) {
-        if (strcmp(argv[i], "--context") == 0) config.context_length = atoi(argv[i+1]);
+        if (strcmp(argv[i], "--context") == 0) {
+            long val = strtol(argv[i+1], NULL, 10);
+            if (val < 128 || val > 131072) {
+                fprintf(stderr, "Invalid --context %s (range: 128-131072)\n", argv[i+1]);
+                return 1;
+            }
+            config.context_length = (int)val;
+        }
+        if (strcmp(argv[i], "--bind") == 0) bind_addr = argv[i+1];
     }
 
     fprintf(stderr, "[MnemoCUDA] Loading model from %s...\n", model_dir);
@@ -651,7 +688,13 @@ int main(int argc, char **argv) {
     if (argc >= 3 && strcmp(argv[2], "--repl") == 0) {
         run_repl(ctx);
     } else if (argc >= 4 && strcmp(argv[2], "--http") == 0) {
-        run_http(ctx, atoi(argv[3]));
+        long port = strtol(argv[3], NULL, 10);
+        if (port < 1 || port > 65535) {
+            fprintf(stderr, "Invalid port %s\n", argv[3]);
+            mnemo_cuda_destroy(ctx);
+            return 1;
+        }
+        run_http(ctx, (int)port, bind_addr);
     } else if (argc >= 3) {
         // Single prompt
         OutputCtx out = { .fd = -1, .buf = malloc(65536), .buf_len = 0, .buf_cap = 65536 };
