@@ -69,18 +69,25 @@ __global__ void matvec_q4k(
     float          *__restrict__ y,
     int n_rows, int n_cols
 ) {
-    // Vectorized Q4K matvec: 32 lanes load qs[128] as 32×uint32_t in 1 coalesced
-    // transaction (128 bytes). Each lane unpacks 4 bytes = 8 Q4K values (lo+hi nibbles).
-    // No branches in inner loop, fully unrolled per group.
+    // Double-buffered Q4K matvec: prefetch next block's qs into registers
+    // while computing current block. Overlaps DRAM latency with FMA compute.
     __shared__ float s_tile[256];
 
     int warps_per_block = blockDim.x / 32;
     int row = blockIdx.x * warps_per_block + (threadIdx.x / 32);
     int lane = threadIdx.x % 32;
-
     int blocks_per_row = (n_cols + 255) / 256;
-
     float sum = 0.0f;
+
+    // Prefetch first block's qs into registers
+    uint32_t next_qs = 0;
+    uint16_t next_d_bits = 0, next_dmin_bits = 0;
+    if (row < n_rows && blocks_per_row > 0) {
+        const BlockQ4K *blk0 = &weights[(size_t)row * blocks_per_row];
+        next_qs = ((const uint32_t *)blk0->qs)[lane];
+        next_d_bits = blk0->d;
+        next_dmin_bits = blk0->dmin;
+    }
 
     for (int b = 0; b < blocks_per_row; b++) {
         int base = b * 256;
@@ -89,18 +96,21 @@ __global__ void matvec_q4k(
         __syncthreads();
 
         if (row < n_rows) {
+            // Use prefetched data
+            uint32_t my_qs = next_qs;
+            float d   = f16_to_f32(next_d_bits);
+            float dmin = f16_to_f32(next_dmin_bits);
             const BlockQ4K *blk_ptr = &weights[(size_t)row * blocks_per_row + b];
-            float d   = f16_to_f32(blk_ptr->d);
-            float dmin = f16_to_f32(blk_ptr->dmin);
 
-            // Vectorized load: 32 lanes × 4 bytes = 128 bytes in 1 transaction
-            uint32_t my_qs = ((const uint32_t *)blk_ptr->qs)[lane];
-            uint8_t q0 = my_qs & 0xFF;
-            uint8_t q1 = (my_qs >> 8) & 0xFF;
-            uint8_t q2 = (my_qs >> 16) & 0xFF;
-            uint8_t q3 = (my_qs >> 24) & 0xFF;
+            // Start prefetching NEXT block (overlaps with compute below)
+            if (b + 1 < blocks_per_row) {
+                const BlockQ4K *next_blk = &weights[(size_t)row * blocks_per_row + b + 1];
+                next_qs = ((const uint32_t *)next_blk->qs)[lane];
+                next_d_bits = next_blk->d;
+                next_dmin_bits = next_blk->dmin;
+            }
 
-            // Lane k owns qs[4k..4k+3]. Group = lane/8, pos_in_group = (lane%8)*4
+            // Compute with current block (while prefetch is in flight)
             int grp = lane / 8;
             int pos = (lane % 8) * 4;
 
@@ -110,22 +120,19 @@ __global__ void matvec_q4k(
             float d_lo = d * sc_lo, mf_lo = dmin * m_lo;
             float d_hi = d * sc_hi, mf_hi = dmin * m_hi;
 
-            // Low nibbles: values at grp*64 + pos + {0,1,2,3}
             int lo_base = grp * 64 + pos;
             if (lo_base + 3 < n_cols - base) {
-                sum += (d_lo * (q0 & 0xF) - mf_lo) * s_tile[lo_base];
-                sum += (d_lo * (q1 & 0xF) - mf_lo) * s_tile[lo_base + 1];
-                sum += (d_lo * (q2 & 0xF) - mf_lo) * s_tile[lo_base + 2];
-                sum += (d_lo * (q3 & 0xF) - mf_lo) * s_tile[lo_base + 3];
+                sum += (d_lo * ((my_qs)       & 0xF) - mf_lo) * s_tile[lo_base];
+                sum += (d_lo * ((my_qs >> 8)  & 0xF) - mf_lo) * s_tile[lo_base + 1];
+                sum += (d_lo * ((my_qs >> 16) & 0xF) - mf_lo) * s_tile[lo_base + 2];
+                sum += (d_lo * ((my_qs >> 24) & 0xF) - mf_lo) * s_tile[lo_base + 3];
             }
-
-            // High nibbles: values at grp*64 + 32 + pos + {0,1,2,3}
             int hi_base = grp * 64 + 32 + pos;
             if (hi_base + 3 < n_cols - base) {
-                sum += (d_hi * (q0 >> 4) - mf_hi) * s_tile[hi_base];
-                sum += (d_hi * (q1 >> 4) - mf_hi) * s_tile[hi_base + 1];
-                sum += (d_hi * (q2 >> 4) - mf_hi) * s_tile[hi_base + 2];
-                sum += (d_hi * (q3 >> 4) - mf_hi) * s_tile[hi_base + 3];
+                sum += (d_hi * ((my_qs >> 4)  & 0xF) - mf_hi) * s_tile[hi_base];
+                sum += (d_hi * ((my_qs >> 12) & 0xF) - mf_hi) * s_tile[hi_base + 1];
+                sum += (d_hi * ((my_qs >> 20) & 0xF) - mf_hi) * s_tile[hi_base + 2];
+                sum += (d_hi * ((my_qs >> 28) & 0xF) - mf_hi) * s_tile[hi_base + 3];
             }
         }
         __syncthreads();
