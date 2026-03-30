@@ -27,4 +27,11 @@ int forward_pass_no_logits(MnemoCudaCtx *ctx, int token_id, int pos);
 // to host between tokens. Reduces function call overhead and keeps GPU busy.
 int forward_prefill_batch(MnemoCudaCtx *ctx, const int *token_ids, int n_tokens, int start_pos);
 
+// Batched forward pass: process N requests through one decode step,
+// interleaved by layer for L2 cache locality of weight tensors.
+// token_ids[i], positions[i] are per-request. Returns sampled tokens in out_tokens[i].
+int forward_pass_batch(MnemoCudaCtx *ctx, const int *token_ids, const int *positions,
+                       int batch_size, float temperature, float top_p,
+                       uint64_t rng_state, int *out_tokens);
+
 #endif

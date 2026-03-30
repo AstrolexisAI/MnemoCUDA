@@ -1401,6 +1401,111 @@ void build_attention_graphs(MnemoCudaCtx *ctx) {
         LOG_INFO("Built %d attention CUDA graphs", graphs_built);
 }
 
+// ── Swap GPU compute/KV buffers to/from a batch slot ──
+static void gpu_swap_slot(GPUState *gpu, int slot) {
+    if (slot == 0) return;
+    BatchSlot *s = &gpu->extra_slots[slot - 1];
+    if (!s->allocated) return;
+    #define SWP(t, a, b) do { t _t = a; a = b; b = _t; } while(0)
+    SWP(float*, gpu->d_hidden,   s->d_hidden);
+    SWP(float*, gpu->d_residual, s->d_residual);
+    SWP(float*, gpu->d_q,        s->d_q);
+    SWP(float*, gpu->d_k,        s->d_k);
+    SWP(float*, gpu->d_v,        s->d_v);
+    SWP(float*, gpu->d_attn_out, s->d_attn_out);
+    SWP(float*, gpu->d_normed,   s->d_normed);
+    SWP(float*, gpu->d_moe_out,  s->d_moe_out);
+    SWP(float*, gpu->d_logits,   s->d_logits);
+    SWP(void*,  gpu->d_kv_k,     s->d_kv_k);
+    SWP(void*,  gpu->d_kv_v,     s->d_kv_v);
+    #undef SWP
+}
+
+// ── Batched forward pass: N requests interleaved by layer ──
+int forward_pass_batch(MnemoCudaCtx *ctx, const int *token_ids, const int *positions,
+                       int batch_size, float temperature, float top_p,
+                       uint64_t rng_state, int *out_tokens) {
+    ModelConfig *cfg = &ctx->config;
+    int H = cfg->hidden_size, V = cfg->vocab_size;
+    if (batch_size < 1 || batch_size > MAX_BATCH) return -1;
+
+    // Embedding for all requests
+    for (int r = 0; r < batch_size; r++) {
+        for (int g = 0; g < ctx->n_gpus; g++) gpu_swap_slot(&ctx->gpus[g], r);
+        int rc = embed_token(ctx, token_ids[r]);
+        for (int g = 0; g < ctx->n_gpus; g++) gpu_swap_slot(&ctx->gpus[g], r);
+        if (rc != 0) return rc;
+    }
+
+    // Layer loop: all requests at each layer (L2 cache reuse of weights)
+    for (int g = 0; g < ctx->n_gpus; g++) {
+        GPUState *gpu = &ctx->gpus[g];
+        cudaSetDevice(gpu->gpu_id);
+
+        for (int layer = gpu->layer_start; layer < gpu->layer_end; layer++) {
+            for (int r = 0; r < batch_size; r++) {
+                gpu_swap_slot(gpu, r);
+
+                // Inter-GPU handoff at GPU boundary
+                if (g > 0 && layer == gpu->layer_start) {
+                    GPUState *prev = &ctx->gpus[g - 1];
+                    gpu_swap_slot(prev, r);
+                    if (ctx->p2p_enabled[g - 1][g]) {
+                        cudaMemcpyPeerAsync(gpu->d_hidden, gpu->gpu_id,
+                                            prev->d_hidden, prev->gpu_id,
+                                            H * sizeof(float), gpu->stream_compute);
+                    } else {
+                        cudaSetDevice(prev->gpu_id);
+                        cudaMemcpy(ctx->h_hidden_transfer, prev->d_hidden,
+                                   H * sizeof(float), cudaMemcpyDeviceToHost);
+                        cudaSetDevice(gpu->gpu_id);
+                        cudaMemcpyAsync(gpu->d_hidden, ctx->h_hidden_transfer,
+                                        H * sizeof(float), cudaMemcpyHostToDevice,
+                                        gpu->stream_compute);
+                    }
+                    gpu_swap_slot(prev, r);
+                    cudaSetDevice(gpu->gpu_id);
+                }
+
+                forward_layer(ctx, layer, g, positions[r]);
+                gpu_swap_slot(gpu, r);
+            }
+        }
+    }
+
+    // LM head + sampling per request
+    int last_g = ctx->n_gpus - 1;
+    GPUState *last_gpu = &ctx->gpus[last_g];
+    cudaSetDevice(last_gpu->gpu_id);
+    cudaStream_t cs = last_gpu->stream_compute;
+
+    for (int r = 0; r < batch_size; r++) {
+        gpu_swap_slot(last_gpu, r);
+
+        TensorEntry *out_norm = tensor_get(ctx, "output_norm.weight");
+        if (out_norm) {
+            void *nw = tensor_ptr_on_gpu(ctx, out_norm, last_g);
+            cuda_rms_norm(last_gpu->d_hidden, (float *)nw, last_gpu->d_normed,
+                          H, cfg->rms_norm_eps, cs);
+        }
+        TensorEntry *lm = tensor_get(ctx, "output.weight");
+        if (lm && last_gpu->d_logits)
+            matvec(tensor_ptr_on_gpu(ctx, lm, last_g), last_gpu->d_normed,
+                   last_gpu->d_logits, V, H, lm->type_id, cs);
+
+        cuda_sample_token(last_gpu->d_logits, V, temperature, top_p,
+                          rng_state + r, last_gpu->d_sampled_token, cs);
+        cudaMemcpyAsync(last_gpu->h_sampled_token, last_gpu->d_sampled_token,
+                        sizeof(int), cudaMemcpyDeviceToHost, cs);
+        cudaStreamSynchronize(cs);
+        out_tokens[r] = *last_gpu->h_sampled_token;
+
+        gpu_swap_slot(last_gpu, r);
+    }
+
+    return 0;
+}
+
 // ── Full forward pass: embedding → layers → lm_head ──
 
 int forward_pass(MnemoCudaCtx *ctx, int token_id, int pos, float *h_logits) {
