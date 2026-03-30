@@ -151,6 +151,22 @@ typedef struct {
     cudaEvent_t ev_router;        // router D2H completion
     cudaEvent_t ev_upload;        // expert upload completion (reused per expert)
 
+    // CUDA Graphs for attention path (per-layer, FP16 KV only)
+    cudaGraphExec_t *attn_graph_exec;  // [n_layers on this GPU]
+    cudaGraphNode_t *attn_rope_node;   // RoPE node handle per layer
+    cudaGraphNode_t *attn_kvst_node;   // KV store (f16_dual) node per layer
+    cudaGraphNode_t *attn_attn_node;   // attention kernel node per layer
+    // Saved kernel params from capture (used as template for Set)
+    struct cudaKernelNodeParams *attn_rope_params;
+    struct cudaKernelNodeParams *attn_kvst_params;
+    struct cudaKernelNodeParams *attn_attn_params;
+    // Persistent param storage for per-token updates (must outlive graph launch)
+    int    *attn_pos_buf;              // [n_layers] current pos values
+    int    *attn_seqlen_buf;           // [n_layers] current seq_len values
+    void  **attn_kvk_dst_buf;          // [n_layers] KV K destination pointers
+    void  **attn_kvv_dst_buf;          // [n_layers] KV V destination pointers
+    bool attn_graphs_ready;
+
     // Gated Delta Net state (hybrid models only, NULL if pure attention)
     float *d_gdn_state;      // [n_gdn_layers, num_v_heads, key_head_dim, value_head_dim] persistent
     float *d_conv_state;     // [n_gdn_layers, conv1d_dim, conv_kernel-1] persistent

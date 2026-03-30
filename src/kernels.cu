@@ -2129,4 +2129,9 @@ void cuda_kernels_init(void) {
         cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024);
 }
 
+// Kernel function pointer getters for CUDA graph node identification
+void *cuda_get_rope_kernel_ptr(void) { return (void *)rope_kernel; }
+void *cuda_get_f16dual_kernel_ptr(void) { return (void *)f32_to_f16_dual_kernel; }
+void *cuda_get_attn_f16kv_kernel_ptr(void) { return (void *)attention_kernel_f16kv; }
+
 } // extern "C"

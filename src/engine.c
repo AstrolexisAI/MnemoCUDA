@@ -1254,6 +1254,13 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
             LOG_INFO("P2P enabled for %d GPU pairs", p2p_count);
     }
 
+    // Build CUDA graphs for attention path (done in forward.c where kernels are visible)
+    {
+        extern void build_attention_graphs(MnemoCudaCtx *ctx);
+        if (!cfg->kv_int8 && cfg->full_attention_interval == 0)
+            build_attention_graphs(ctx);
+    }
+
     ctx->loaded = true;
     LOG_INFO("Ready: %s", ctx->info);
     return 0;
@@ -1298,6 +1305,21 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
         cudaFree(gpu->d_class_hit_slots);
         cudaFree(gpu->d_class_miss_mask);
         if (gpu->h_class_miss_mask) cudaFreeHost(gpu->h_class_miss_mask);
+
+        // Free CUDA graphs
+        if (gpu->attn_graph_exec) {
+            int nl = gpu->layer_end - gpu->layer_start;
+            for (int li = 0; li < nl; li++)
+                if (gpu->attn_graph_exec[li]) cudaGraphExecDestroy(gpu->attn_graph_exec[li]);
+            free(gpu->attn_graph_exec);
+            free(gpu->attn_rope_node);
+            free(gpu->attn_kvst_node);
+            free(gpu->attn_attn_node);
+            free(gpu->attn_pos_buf);
+            free(gpu->attn_seqlen_buf);
+            free(gpu->attn_kvk_dst_buf);
+            free(gpu->attn_kvv_dst_buf);
+        }
 
         if (gpu->h_expert_buf) {
             if (gpu->expert_buf_pinned) cudaFreeHost(gpu->h_expert_buf);

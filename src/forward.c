@@ -623,6 +623,44 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
     #define LT ctx->layer_tensors[layer]
 
     t0 = now_ms();
+    // Try CUDA graph path for attention (FP16, non-hybrid)
+    if (is_attention_layer && gpu->attn_graphs_ready && !cfg->kv_int8) {
+        int li = layer - gpu->layer_start;
+        if (gpu->attn_graph_exec[li]) {
+            // Update RoPE pos (arg[3])
+            gpu->attn_pos_buf[li] = pos;
+            gpu->attn_rope_params[li].kernelParams[3] = &gpu->attn_pos_buf[li];
+            cudaGraphExecKernelNodeSetParams(gpu->attn_graph_exec[li],
+                                             gpu->attn_rope_node[li],
+                                             &gpu->attn_rope_params[li]);
+
+            // Update KV store destinations (arg[2]=kv_k_dst, arg[3]=kv_v_dst)
+            int local_layer = layer - gpu->layer_start;
+            int ctx_len = cfg->max_position_embeddings;
+            size_t kv_stride = (size_t)ctx_len * NKV * HD;
+            gpu->attn_kvk_dst_buf[li] = (char *)gpu->d_kv_k +
+                (local_layer * kv_stride + (size_t)pos * NKV * HD) * sizeof(uint16_t);
+            gpu->attn_kvv_dst_buf[li] = (char *)gpu->d_kv_v +
+                (local_layer * kv_stride + (size_t)pos * NKV * HD) * sizeof(uint16_t);
+            gpu->attn_kvst_params[li].kernelParams[2] = &gpu->attn_kvk_dst_buf[li];
+            gpu->attn_kvst_params[li].kernelParams[3] = &gpu->attn_kvv_dst_buf[li];
+            cudaGraphExecKernelNodeSetParams(gpu->attn_graph_exec[li],
+                                             gpu->attn_kvst_node[li],
+                                             &gpu->attn_kvst_params[li]);
+
+            // Update attention seq_len (arg[6])
+            gpu->attn_seqlen_buf[li] = pos + 1;
+            gpu->attn_attn_params[li].kernelParams[6] = &gpu->attn_seqlen_buf[li];
+            cudaGraphExecKernelNodeSetParams(gpu->attn_graph_exec[li],
+                                             gpu->attn_attn_node[li],
+                                             &gpu->attn_attn_params[li]);
+
+            // Launch the graph (replaces 8 kernel launches)
+            cudaGraphLaunch(gpu->attn_graph_exec[li], cs);
+            goto attn_done;
+        }
+    }
+
     if (is_attention_layer) {
         // ── 1. Pre-attention RMS norm + residual save (fused: 1 launch instead of 2) ──
         TensorEntry *an = LT.attn_norm;
@@ -726,6 +764,7 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
         forward_gdn_block(ctx, layer, gpu_idx);
     }
 
+attn_done:
     // Profile: attention block done
     if (ctx->profiling_enabled) {
         cudaStreamSynchronize(cs);
@@ -1207,6 +1246,141 @@ static int embed_token(MnemoCudaCtx *ctx, int token_id) {
                     cudaMemcpyHostToDevice, gpu0->stream_compute);
     free(h_hidden);
     return 0;
+}
+
+// ── Build CUDA graphs for attention (called from engine.c at load time) ──
+
+void build_attention_graphs(MnemoCudaCtx *ctx) {
+    extern void *cuda_get_rope_kernel_ptr(void);
+    extern void *cuda_get_f16dual_kernel_ptr(void);
+    extern void *cuda_get_attn_f16kv_kernel_ptr(void);
+
+    void *rope_fn = cuda_get_rope_kernel_ptr();
+    void *f16d_fn = cuda_get_f16dual_kernel_ptr();
+    void *attn_fn = cuda_get_attn_f16kv_kernel_ptr();
+
+    ModelConfig *cfg = &ctx->config;
+    int NH = cfg->num_attention_heads, NKV = cfg->num_key_value_heads;
+    int HD = cfg->head_dim, H = cfg->hidden_size;
+    float eps = cfg->rms_norm_eps;
+    int graphs_built = 0;
+
+    for (int g = 0; g < ctx->n_gpus; g++) {
+        GPUState *gpu = &ctx->gpus[g];
+        cudaSetDevice(gpu->gpu_id);
+        int nl = gpu->layer_end - gpu->layer_start;
+
+        gpu->attn_graph_exec  = calloc(nl, sizeof(cudaGraphExec_t));
+        gpu->attn_rope_node   = calloc(nl, sizeof(cudaGraphNode_t));
+        gpu->attn_kvst_node   = calloc(nl, sizeof(cudaGraphNode_t));
+        gpu->attn_attn_node   = calloc(nl, sizeof(cudaGraphNode_t));
+        gpu->attn_rope_params = calloc(nl, sizeof(struct cudaKernelNodeParams));
+        gpu->attn_kvst_params = calloc(nl, sizeof(struct cudaKernelNodeParams));
+        gpu->attn_attn_params = calloc(nl, sizeof(struct cudaKernelNodeParams));
+        gpu->attn_pos_buf     = calloc(nl, sizeof(int));
+        gpu->attn_seqlen_buf  = calloc(nl, sizeof(int));
+        gpu->attn_kvk_dst_buf = calloc(nl, sizeof(void *));
+        gpu->attn_kvv_dst_buf = calloc(nl, sizeof(void *));
+
+        for (int li = 0; li < nl; li++) {
+            int layer = gpu->layer_start + li;
+            if (!ctx->layer_tensors[layer].attn_norm) continue;
+            if (!ctx->layer_tensors[layer].attn_q) continue;
+            if (!ctx->layer_tensors[layer].attn_output) continue;
+            if (ctx->layer_tensors[layer].attn_output->type_id != 12) continue;
+
+            cudaStream_t cs = gpu->stream_compute;
+            int ctx_len = cfg->max_position_embeddings;
+            size_t kv_stride = (size_t)ctx_len * NKV * HD;
+
+            cudaStreamBeginCapture(cs, cudaStreamCaptureModeGlobal);
+
+            #define LTG ctx->layer_tensors[layer]
+
+            void *nw = tensor_ptr_on_gpu(ctx, LTG.attn_norm, g);
+            cuda_rms_norm_residual(gpu->d_hidden, (float *)nw,
+                                   gpu->d_normed, gpu->d_residual, H, eps, cs);
+
+            TensorEntry *wq = LTG.attn_q;
+            matvec(tensor_ptr_on_gpu(ctx, wq, g),
+                   gpu->d_normed, gpu->d_q, NH*HD, H, wq->type_id, cs);
+
+            TensorEntry *wk = LTG.attn_k, *wv = LTG.attn_v;
+            cuda_matvec_q4k_dual(tensor_ptr_on_gpu(ctx, wk, g),
+                                 tensor_ptr_on_gpu(ctx, wv, g),
+                                 gpu->d_normed, gpu->d_k, gpu->d_v, NKV*HD, H, cs);
+
+            TensorEntry *qn = LTG.attn_q_norm, *kn = LTG.attn_k_norm;
+            if (qn && kn)
+                cuda_rms_norm_qk(gpu->d_q, gpu->d_k,
+                                 (float *)tensor_ptr_on_gpu(ctx, qn, g),
+                                 (float *)tensor_ptr_on_gpu(ctx, kn, g),
+                                 HD, NH, NKV, eps, cs);
+
+            gpu->attn_pos_buf[li] = 0;
+            cuda_rope(gpu->d_q, gpu->d_k, HD, gpu->attn_pos_buf[li],
+                      cfg->rope_theta, NH, NKV, cs);
+
+            void *kv_k0 = (char *)gpu->d_kv_k + (size_t)li * kv_stride * sizeof(uint16_t);
+            void *kv_v0 = (char *)gpu->d_kv_v + (size_t)li * kv_stride * sizeof(uint16_t);
+            gpu->attn_kvk_dst_buf[li] = kv_k0;
+            gpu->attn_kvv_dst_buf[li] = kv_v0;
+            cuda_f32_to_f16_dual(gpu->d_k, gpu->d_v,
+                                 gpu->attn_kvk_dst_buf[li],
+                                 gpu->attn_kvv_dst_buf[li], NKV*HD, cs);
+
+            gpu->attn_seqlen_buf[li] = 1;
+            int gqa = NH / NKV;
+            float attn_sc = 1.0f / sqrtf((float)HD);
+            cuda_attention_f16kv(gpu->d_q, kv_k0, kv_v0, gpu->d_attn_out,
+                                 NH, HD, NKV, gpu->attn_seqlen_buf[li],
+                                 gqa, attn_sc, cs);
+
+            TensorEntry *wo = LTG.attn_output;
+            cuda_matvec_q4k_add(tensor_ptr_on_gpu(ctx, wo, g),
+                                gpu->d_attn_out, gpu->d_residual, gpu->d_hidden,
+                                H, NH*HD, cs);
+
+            #undef LTG
+
+            cudaGraph_t graph;
+            cudaStreamEndCapture(cs, &graph);
+            if (!graph) continue;
+
+            // Find updatable nodes by kernel function pointer
+            size_t n_nodes;
+            cudaGraphGetNodes(graph, NULL, &n_nodes);
+            cudaGraphNode_t *nodes = malloc(n_nodes * sizeof(cudaGraphNode_t));
+            cudaGraphGetNodes(graph, nodes, &n_nodes);
+
+            for (size_t ni = 0; ni < n_nodes; ni++) {
+                enum cudaGraphNodeType type;
+                cudaGraphNodeGetType(nodes[ni], &type);
+                if (type != cudaGraphNodeTypeKernel) continue;
+                struct cudaKernelNodeParams kp;
+                memset(&kp, 0, sizeof(kp));
+                cudaGraphKernelNodeGetParams(nodes[ni], &kp);
+                if (kp.func == rope_fn) {
+                    gpu->attn_rope_node[li] = nodes[ni];
+                    gpu->attn_rope_params[li] = kp;
+                } else if (kp.func == f16d_fn) {
+                    gpu->attn_kvst_node[li] = nodes[ni];
+                    gpu->attn_kvst_params[li] = kp;
+                } else if (kp.func == attn_fn) {
+                    gpu->attn_attn_node[li] = nodes[ni];
+                    gpu->attn_attn_params[li] = kp;
+                }
+            }
+            free(nodes);
+
+            cudaGraphInstantiate(&gpu->attn_graph_exec[li], graph, 0);
+            cudaGraphDestroy(graph);
+            graphs_built++;
+        }
+        gpu->attn_graphs_ready = (graphs_built > 0);
+    }
+    if (graphs_built > 0)
+        LOG_INFO("Built %d attention CUDA graphs", graphs_built);
 }
 
 // ── Full forward pass: embedding → layers → lm_head ──
