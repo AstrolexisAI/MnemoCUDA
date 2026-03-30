@@ -1287,67 +1287,71 @@ __global__ void sample_token_kernel(
     float total = s_sum[0];
 
     // ── Step 3: top-p nucleus sampling ──
-    // Strategy: find probability threshold, then thread 0 samples.
-    // Each thread computes (prob, id) pairs for its strided chunk.
-    // We use iterative threshold refinement to find the top-p cutoff.
+    // Each thread finds its local top-1 candidate, then we collect the top-256
+    // candidates in shared memory. Thread 0 sorts them by descending probability,
+    // accumulates until cumulative >= top_p, then samples from the nucleus.
 
-    // RNG: xoroshiro128+ (2 iterations to decorrelate)
-    unsigned long long rs0 = rng_seed;
-    unsigned long long rs1 = rng_seed ^ 0xDEADBEEFCAFEBABEULL;
-    for (int warm = 0; warm < 3; warm++) {
-        unsigned long long t = rs0 ^ (rs0 << 23);
-        rs0 = rs1;
-        rs1 = t ^ rs1 ^ (t >> 17) ^ (rs1 >> 26);
-    }
-    float rand_val;
-    if (tid == 0) {
-        unsigned long long t = rs0 ^ (rs0 << 23);
-        rs0 = rs1;
-        rs1 = t ^ rs1 ^ (t >> 17) ^ (rs1 >> 26);
-        rand_val = (float)((rs0 + rs1) >> 11) * (1.0f / 9007199254740992.0f);
+    // Each thread finds its best candidate (highest unnormalized prob)
+    float my_best_prob = -1.0f;
+    int my_best_id = 0;
+    for (int i = tid; i < vocab_size; i += BLOCK) {
+        float p = expf((logits[i] - global_max) / temperature);
+        if (p > my_best_prob) { my_best_prob = p; my_best_id = i; }
     }
 
-    // Broadcast random value from thread 0
-    __shared__ float s_rand;
-    if (tid == 0) s_rand = rand_val;
+    // Collect 256 candidates in shared memory
+    __shared__ float s_cand_prob[256];
+    __shared__ int   s_cand_id[256];
+    s_cand_prob[tid] = my_best_prob;
+    s_cand_id[tid] = my_best_id;
     __syncthreads();
-    float r = s_rand;
 
-    // Target cumulative probability
-    float target = r * fminf(top_p, 1.0f);
-
-    // Each thread does a local prefix-sum scan of sorted-ish probabilities.
-    // Simplified approach: thread 0 scans all vocab with the threshold.
-    // For vocab < 200K and 1 block this is fast enough (~1 cycle/element).
+    // Thread 0: sort candidates descending by prob, accumulate nucleus, sample
     if (tid == 0) {
-        // Selection sort into top candidates until we pass the threshold.
-        // We need probabilities: p[i] = exp((logits[i] - max) / temp) / total
+        // RNG: xoroshiro128+
+        unsigned long long rs0 = rng_seed;
+        unsigned long long rs1 = rng_seed ^ 0xDEADBEEFCAFEBABEULL;
+        for (int warm = 0; warm < 3; warm++) {
+            unsigned long long t = rs0 ^ (rs0 << 23);
+            rs0 = rs1;
+            rs1 = t ^ rs1 ^ (t >> 17) ^ (rs1 >> 26);
+        }
+        unsigned long long t = rs0 ^ (rs0 << 23);
+        rs0 = rs1;
+        rs1 = t ^ rs1 ^ (t >> 17) ^ (rs1 >> 26);
+        float r = (float)((rs0 + rs1) >> 11) * (1.0f / 9007199254740992.0f);
+
+        // Selection sort descending + early stop at top_p
         float cumul = 0.0f;
-        int selected = 0;
+        float top_p_mass = top_p * total;
+        int nucleus_size = 0;
 
-        // Quick approach: iterate vocab finding largest remaining prob each time
-        // until cumulative >= top_p, then sample from those.
-        // For efficiency, first pass: find all probs > threshold (top_p / 256).
-        // This avoids full sort for most tokens.
+        for (int pick = 0; pick < 256; pick++) {
+            // Find largest remaining candidate
+            int best = pick;
+            for (int j = pick + 1; j < 256; j++)
+                if (s_cand_prob[j] > s_cand_prob[best]) best = j;
 
-        float target_r = r * total;  // work in unnormalized space
-        float top_p_unnorm = top_p * total;
+            // Swap to front
+            float tp = s_cand_prob[pick]; int ti = s_cand_id[pick];
+            s_cand_prob[pick] = s_cand_prob[best]; s_cand_id[pick] = s_cand_id[best];
+            s_cand_prob[best] = tp; s_cand_id[best] = ti;
 
-        // Use a single linear scan: accumulate probabilities in descending order
-        // by repeatedly finding the max. For typical top_p=0.9, this converges
-        // in 10-50 iterations even for 150K vocab.
-
-        // But even better: just do a single scan accumulating all probs,
-        // sampling proportionally. This is O(V) but branch-free and fast on GPU.
-        float acc = 0.0f;
-        int sampled_id = 0;
-        for (int i = 0; i < vocab_size; i++) {
-            float p = expf((logits[i] - global_max) / temperature);
-            acc += p;
-            if (acc >= target_r) { sampled_id = i; break; }
+            cumul += s_cand_prob[pick];
+            nucleus_size = pick + 1;
+            if (cumul >= top_p_mass) break;
         }
 
-        // If we didn't break (rounding), pick last token
+        // Renormalize nucleus and sample
+        float nsum = 0.0f;
+        for (int i = 0; i < nucleus_size; i++) nsum += s_cand_prob[i];
+        float target = r * nsum;
+        float acc = 0.0f;
+        int sampled_id = s_cand_id[0];
+        for (int i = 0; i < nucleus_size; i++) {
+            acc += s_cand_prob[i];
+            if (acc >= target) { sampled_id = s_cand_id[i]; break; }
+        }
         *result_token = sampled_id;
     }
 }

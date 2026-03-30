@@ -131,6 +131,8 @@ int io_pool_wait_any(int n) {
     // Find which task completed (scan for done=1 that hasn't been consumed yet)
     for (int i = 0; i < n; i++) {
         if (g_io_pool.tasks[i].done) {
+            // Mark consumed so subsequent calls skip this task
+            g_io_pool.tasks[i].done = 0;
             // Also consume the per-task semaphore so io_pool_wait still works
             sem_trywait(&g_io_pool.task_done[i]);
             return i;

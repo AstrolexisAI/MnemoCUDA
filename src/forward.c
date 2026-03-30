@@ -699,16 +699,18 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
                     K * sizeof(int), cudaMemcpyDeviceToHost, cs);
     cudaMemcpyAsync(gpu->h_expert_weights, gpu->d_expert_weights,
                     K * sizeof(float), cudaMemcpyDeviceToHost, cs);
-    cudaStreamSynchronize(cs);  // need results on host for classification
-    int *expert_indices = gpu->h_expert_indices;
-    float *expert_weights_h = gpu->h_expert_weights;
-    t1 = now_ms();
-    ctx->prof_router_ms += t1 - t0;
+    // Record event after D2H copies — sync deferred until we need the data
+    cudaEvent_t router_done;
+    cudaEventCreateWithFlags(&router_done, cudaEventDisableTiming);
+    cudaEventRecord(router_done, cs);
 
     // ── 11 + 12. Expert load (cache-first) + forward on GPU ──
     t0 = now_ms();
     ExpertLayerFile *elf = &ctx->expert_layers[layer];
-    if (elf->fd <= 0 && !elf->mmap_data) return;
+    if (elf->fd <= 0 && !elf->mmap_data) {
+        cudaEventDestroy(router_done);
+        return;
+    }
 
     size_t expert_size = elf->expert_size;
     size_t gate_sz = elf->gate_size > 0 ? elf->gate_size : expert_size / 3;
@@ -718,12 +720,20 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
     size_t expected_q4k_down = (size_t)((H * EFF + 255) / 256) * 144;
     int down_type_id = (down_sz > expected_q4k_down * 1.2) ? 14 : 12;
 
-    // Zero MoE accumulator on GPU
+    // Zero MoE accumulator on GPU (doesn't need router results)
     cudaMemsetAsync(gpu->d_moe_out, 0, H * sizeof(float), cs);
 
-    // ── Wait for any pending prefetch from previous layer ──
+    // Wait for any pending prefetch from previous layer (host-side, no GPU dep)
     if (gpu->prefetch_layer == layer && !gpu->prefetch_ready)
         prefetch_wait(gpu, gpu->n_prefetched);
+
+    // Now sync: we need expert_indices/weights on host for classification
+    cudaEventSynchronize(router_done);
+    cudaEventDestroy(router_done);
+    int *expert_indices = gpu->h_expert_indices;
+    float *expert_weights_h = gpu->h_expert_weights;
+    t1 = now_ms();
+    ctx->prof_router_ms += t1 - t0;
 
     // ── Classify experts: VRAM hit → prefetch hit → RAM hit → NVMe miss ──
     static int total_lookups = 0, total_hits = 0;
@@ -1163,7 +1173,6 @@ int forward_pass(MnemoCudaCtx *ctx, int token_id, int pos, float *h_logits) {
                 cudaMemcpyPeerAsync(gpu->d_hidden, gpu->gpu_id,
                                     prev->d_hidden, prev->gpu_id,
                                     H * sizeof(float), gpu->stream_compute);
-                cudaStreamSynchronize(gpu->stream_compute);
             } else {
                 // Fallback: D2H → pinned host → H2D
                 cudaSetDevice(prev->gpu_id);
@@ -1261,7 +1270,6 @@ int forward_pass_sample(MnemoCudaCtx *ctx, int token_id, int pos,
                 cudaMemcpyPeerAsync(gpu->d_hidden, gpu->gpu_id,
                                     prev->d_hidden, prev->gpu_id,
                                     H * sizeof(float), gpu->stream_compute);
-                cudaStreamSynchronize(gpu->stream_compute);
             } else {
                 cudaSetDevice(prev->gpu_id);
                 cudaMemcpy(ctx->h_hidden_transfer, prev->d_hidden,
@@ -1357,7 +1365,6 @@ int forward_pass_no_logits(MnemoCudaCtx *ctx, int token_id, int pos) {
                 cudaMemcpyPeerAsync(gpu->d_hidden, gpu->gpu_id,
                                     prev->d_hidden, prev->gpu_id,
                                     H * sizeof(float), gpu->stream_compute);
-                cudaStreamSynchronize(gpu->stream_compute);
             } else {
                 cudaSetDevice(prev->gpu_id);
                 cudaMemcpy(ctx->h_hidden_transfer, prev->d_hidden,
