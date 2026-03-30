@@ -1287,26 +1287,39 @@ __global__ void sample_token_kernel(
     float total = s_sum[0];
 
     // ── Step 3: top-p nucleus sampling ──
-    // Each thread finds its local top-1 candidate, then we collect the top-256
-    // candidates in shared memory. Thread 0 sorts them by descending probability,
-    // accumulates until cumulative >= top_p, then samples from the nucleus.
+    // Each thread maintains a local top-8 min-heap from its strided partition,
+    // then all 256×8 = 2048 candidates are collected in shared memory.
+    // Thread 0 does selection sort (with early stop at top_p) and samples.
+    // For typical LLM distributions, top-2048 holds >99.9% of probability mass.
 
-    // Each thread finds its best candidate (highest unnormalized prob)
-    float my_best_prob = -1.0f;
-    int my_best_id = 0;
+    #define TOPP_LOCAL_K 8
+    #define TOPP_TOTAL_CANDS (256 * TOPP_LOCAL_K)  // 2048
+
+    // Thread-local top-8 (registers): min-heap by probability
+    float my_vals[TOPP_LOCAL_K];
+    int   my_ids[TOPP_LOCAL_K];
+    for (int i = 0; i < TOPP_LOCAL_K; i++) { my_vals[i] = -1.0f; my_ids[i] = -1; }
+
     for (int i = tid; i < vocab_size; i += BLOCK) {
         float p = expf((logits[i] - global_max) / temperature);
-        if (p > my_best_prob) { my_best_prob = p; my_best_id = i; }
+        // Find min in local heap
+        int mi = 0;
+        for (int k = 1; k < TOPP_LOCAL_K; k++)
+            if (my_vals[k] < my_vals[mi]) mi = k;
+        if (p > my_vals[mi]) { my_vals[mi] = p; my_ids[mi] = i; }
     }
 
-    // Collect 256 candidates in shared memory
-    __shared__ float s_cand_prob[256];
-    __shared__ int   s_cand_id[256];
-    s_cand_prob[tid] = my_best_prob;
-    s_cand_id[tid] = my_best_id;
+    // Write 8 candidates per thread to shared memory (2048 total)
+    // 2048 * (4+4) = 16KB shared memory — within limits
+    __shared__ float s_cand_prob[TOPP_TOTAL_CANDS];
+    __shared__ int   s_cand_id[TOPP_TOTAL_CANDS];
+    for (int k = 0; k < TOPP_LOCAL_K; k++) {
+        s_cand_prob[tid * TOPP_LOCAL_K + k] = my_vals[k];
+        s_cand_id[tid * TOPP_LOCAL_K + k] = my_ids[k];
+    }
     __syncthreads();
 
-    // Thread 0: sort candidates descending by prob, accumulate nucleus, sample
+    // Thread 0: selection sort descending + early stop at top_p, then sample
     if (tid == 0) {
         // RNG: xoroshiro128+
         unsigned long long rs0 = rng_seed;
@@ -1321,16 +1334,20 @@ __global__ void sample_token_kernel(
         rs1 = t ^ rs1 ^ (t >> 17) ^ (rs1 >> 26);
         float r = (float)((rs0 + rs1) >> 11) * (1.0f / 9007199254740992.0f);
 
-        // Selection sort descending + early stop at top_p
-        float cumul = 0.0f;
         float top_p_mass = top_p * total;
+        float cumul = 0.0f;
         int nucleus_size = 0;
 
-        for (int pick = 0; pick < 256; pick++) {
-            // Find largest remaining candidate
+        // Selection sort: pick largest, swap to front, accumulate, stop at top_p.
+        // Worst case scans 2048 candidates per pick, but early stop at nucleus.
+        // For top_p=0.9, nucleus is typically 10-100 tokens → 10-100 passes.
+        for (int pick = 0; pick < TOPP_TOTAL_CANDS; pick++) {
+            // Find largest remaining
             int best = pick;
-            for (int j = pick + 1; j < 256; j++)
+            for (int j = pick + 1; j < TOPP_TOTAL_CANDS; j++)
                 if (s_cand_prob[j] > s_cand_prob[best]) best = j;
+
+            if (s_cand_prob[best] <= 0.0f) break;  // no more valid candidates
 
             // Swap to front
             float tp = s_cand_prob[pick]; int ti = s_cand_id[pick];
@@ -1354,6 +1371,9 @@ __global__ void sample_token_kernel(
         }
         *result_token = sampled_id;
     }
+
+    #undef TOPP_LOCAL_K
+    #undef TOPP_TOTAL_CANDS
 }
 
 void cuda_embedding_lookup_q4k(const void *embd_table, float *output,

@@ -32,7 +32,12 @@ void io_pool_submit_wait(IOTask *tasks, int n);
 void io_pool_submit(IOTask *tasks, int n);
 void io_pool_wait(int n);
 int  io_pool_task_error(int idx);     // error code for completed task idx (0 = ok)
-int  io_pool_wait_any(int n);        // wait for any one of n submitted tasks; returns task index
+
+// Wait for any one of n submitted tasks; returns task index.
+// Clears the task's done flag so it won't be returned again.
+// Consumes the per-task semaphore — do NOT mix wait_any() and wait()
+// on the same batch; use one or the other exclusively.
+int  io_pool_wait_any(int n);
 
 #ifdef __cplusplus
 }
