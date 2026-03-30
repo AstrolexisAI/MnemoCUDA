@@ -1193,6 +1193,12 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
              ctx->n_gpus,
              ctx->resident_size / (1024*1024));
 
+    // Init kernel attributes (100KB shared memory for bandwidth-bound matvec)
+    {
+        extern void cuda_kernels_init(void);
+        cuda_kernels_init();
+    }
+
     io_pool_init(config.io_threads);
     ctx->extra_prefetch = config.extra_prefetch;
     // Auto-enable deep prefetch for large MoE models with sufficient I/O threads

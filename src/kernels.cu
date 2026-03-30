@@ -1860,4 +1860,29 @@ void cuda_sample_token(const float *logits, int vocab_size,
     KERNEL_LAUNCH_CHECK();
 }
 
+void cuda_kernels_init(void) {
+    // Allow up to 100KB dynamic shared memory for bandwidth-bound matvec kernels.
+    // Default is 48KB which limits occupancy to 25% with H=4096 x-vector (16KB).
+    cudaFuncSetAttribute(matvec_q4k,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024);
+    cudaFuncSetAttribute(matvec_q4k_scaled_add,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024);
+    cudaFuncSetAttribute(matvec_q4k_dual,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024);
+    cudaFuncSetAttribute(matvec_q6k,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024);
+    cudaFuncSetAttribute(matvec_q3k,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024);
+    cudaFuncSetAttribute(matvec_q5k,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024);
+    cudaFuncSetAttribute(matvec_q8_0,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024);
+    cudaFuncSetAttribute(attention_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024);
+    cudaFuncSetAttribute(attention_kernel_f16kv,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024);
+    cudaFuncSetAttribute(attention_kernel_int8kv,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024);
+}
+
 } // extern "C"

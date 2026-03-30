@@ -67,6 +67,7 @@ extern void cuda_sample_token(const float *logits, int vocab_size,
                               int *d_result, cudaStream_t stream);
 extern void cuda_rms_norm_batched(const float *input, const float *weight, float *output,
                                   int head_dim, int n_heads, float eps, cudaStream_t stream);
+extern void cuda_kernels_init(void);
 extern void cuda_f32_to_int8_kv(const float *in, void *out, float *scales,
                                 int head_dim, int n_kv_heads, cudaStream_t stream);
 extern void cuda_attention_int8kv(const float *q, const void *kv_k, const void *kv_v,
@@ -625,13 +626,20 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
         if (wq) matvec(tensor_ptr_on_gpu(ctx, wq, gpu_idx),
                         gpu->d_normed, gpu->d_q, NH * HD, H, wq->type_id, cs);
 
+        // K+V fused: same dimensions [NKV*HD × H], same input (d_normed)
         TensorEntry *wk = LT.attn_k;
-        if (wk) matvec(tensor_ptr_on_gpu(ctx, wk, gpu_idx),
-                        gpu->d_normed, gpu->d_k, NKV * HD, H, wk->type_id, cs);
-
         TensorEntry *wv = LT.attn_v;
-        if (wv) matvec(tensor_ptr_on_gpu(ctx, wv, gpu_idx),
-                        gpu->d_normed, gpu->d_v, NKV * HD, H, wv->type_id, cs);
+        if (wk && wv && wk->type_id == 12 && wv->type_id == 12) {
+            cuda_matvec_q4k_dual(tensor_ptr_on_gpu(ctx, wk, gpu_idx),
+                                 tensor_ptr_on_gpu(ctx, wv, gpu_idx),
+                                 gpu->d_normed, gpu->d_k, gpu->d_v,
+                                 NKV * HD, H, cs);
+        } else {
+            if (wk) matvec(tensor_ptr_on_gpu(ctx, wk, gpu_idx),
+                            gpu->d_normed, gpu->d_k, NKV * HD, H, wk->type_id, cs);
+            if (wv) matvec(tensor_ptr_on_gpu(ctx, wv, gpu_idx),
+                            gpu->d_normed, gpu->d_v, NKV * HD, H, wv->type_id, cs);
+        }
 
         // ── 3. QK norms (optional, Qwen3 uses them) — batched: 1 launch per Q, 1 per K ──
         TensorEntry *qn = LT.attn_q_norm;
