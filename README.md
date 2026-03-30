@@ -30,15 +30,39 @@ MnemoCUDA profiles which experts are activated most frequently and uses this dat
 
 ## Performance
 
-Tested on **Qwen3-235B-A22B** (128 experts/layer, K=8, 94 layers, Q4_K_M) via [KULVEX](https://github.com/AstrolexisAI):
+Tested on **Qwen3-235B-A22B** (128 experts/layer, K=8, 94 layers, Q4_K_M):
 
 | Hardware | VRAM Cache | tok/s | TTFT | Notes |
 |----------|-----------|-------|------|-------|
-| RTX 4090 + RTX 5090 | 43 GB (3,690 slots) | **89.3** | **2.0s** | Warm cache, KULVEX integration |
-| RTX 4090 + RTX 5090 | 43 GB (3,690 slots) | ~5 | 9.3s | Cold start, first request |
-| RTX 4090 (single) | 17 GB (1,478 slots) | ~2.5 | ~18s | Single GPU, cold start |
+| RTX 4090 + RTX 5090 | 46 GB (3,959 slots) | **14.0** | **1.6s** | Warm cache, optimized engine |
+| RTX 4090 + RTX 5090 | 46 GB (3,959 slots) | ~12 | 2.5s | Sustained decode, warm cache |
+| RTX 4090 + RTX 5090 | 46 GB (3,959 slots) | ~5 | 9.3s | Cold start, first request |
 
-For comparison, this model normally requires 8x A100 80GB ($100K+ of GPUs). MnemoCUDA runs it at **89 tok/s on $2,600 of consumer hardware** with warm caches.
+### Per-token breakdown (ncu-verified, warm cache)
+
+| Component | Time | % | Notes |
+|-----------|------|---|-------|
+| Attention (Q/K/V/O proj + norms + RoPE + attn) | 52ms | 80% | Q4K matvec at 427 GB/s (44% peak BW) |
+| MoE experts (gate+up+swiglu+down × 8) | 7ms | 11% | Fused dual+scaled_add kernels |
+| Router (matvec + topk + classify + sync) | 3ms | 5% | GPU classification + event sync |
+| Cache management | 3ms | 5% | Prefetch, deferred insert |
+| Multi-GPU handoff | <1ms | <1% | P2P when available |
+
+### Optimization history (5 → 14 tok/s)
+
+The engine went through extensive optimization across ~20 commits:
+
+- **Sync elimination**: Removed per-layer `cudaStreamSynchronize` barriers, replaced with events
+- **GPU-side sampling**: `sample_token_kernel` (top-p nucleus, 2048 candidates) — copies 4 bytes instead of full vocab logits
+- **Kernel fusions**: 7,500+ launches eliminated per token — batched QK norms, dual K+V projection, fused O_proj+residual, fused norm+residual-save, fused FP16 KV store, fused expert gate+up matvec
+- **CUDA Graphs**: Attention path captured as graphs (8 kernels → 1 graph launch × 94 layers)
+- **Vectorized Q4K**: `uint32_t` coalesced loads, branch-free inner loop, `#pragma unroll`
+- **GPU embedding dequant**: Q4K/Q3K embedding lookup kernels eliminate per-token malloc/CPU-dequant
+- **Warp-parallel kernels**: Router matvec_f32 (32 threads/row), attention Q@K^T (warp-cooperative shuffle)
+- **Cache improvements**: GPU-side expert classification, process-as-ready I/O, auto extra-prefetch
+- **Infrastructure**: Request queue with worker thread, hash-table tokenizer, RoPE constant memory, pre-created event pool, per-layer cached tensor pointers
+
+**Theoretical floor**: ~25ms/token (12ms compute + 13ms overhead). The Q4K matvec kernel achieves 44% of peak DRAM bandwidth (427 of 1008 GB/s). Reaching 70%+ requires tensor-core dequant or fundamentally different memory access patterns.
 
 ## Supported Models
 
@@ -220,11 +244,30 @@ GPU 0 (RTX 4090, 24 GB): Layers 0-46   -- resident + embeddings
 GPU 1 (RTX 5090, 32 GB): Layers 47-93  -- resident + output head
 ```
 
-Hidden state transfers between GPUs use pinned host memory.
+Hidden state transfers between GPUs use **P2P** (NVLink/PCIe peer access) when available, falling back to pinned host memory.
 
-### Tiled Attention
+### Attention Pipeline
 
-Attention uses **tiled online softmax** (Flash Attention style) with fixed shared memory (~8 KB), enabling arbitrarily long contexts without SM shared memory overflow.
+Each layer's attention is captured as a **CUDA Graph** at load time (8 fused kernels per graph):
+
+1. `rms_norm_residual` — norm + residual save in one pass
+2. `matvec_q4k` — Q projection (vectorized uint32 loads)
+3. `matvec_q4k_dual` — K+V projection fused (single x-vector read)
+4. `rms_norm_qk` — Q+K head norms in one launch
+5. `rope_kernel` — RoPE with constant-memory frequencies + `__sincosf`
+6. `f32_to_f16_dual` — K+V → FP16 KV cache in one launch
+7. `attention_kernel_f16kv` — tiled online softmax with shared-memory Q cache
+8. `matvec_q4k_add` — output projection + residual add fused
+
+Per-token graph param updates (RoPE pos, KV destinations, seq_len) via `cudaGraphExecKernelNodeSetParams`.
+
+### Expert Pipeline
+
+Each expert runs 3 fused kernels (was 5):
+
+1. `matvec_q4k_dual` — gate + up projections (shared x-vector)
+2. `cuda_swiglu` — SiLU activation
+3. `matvec_q4k_scaled_add` — down projection + weighted accumulation fused
 
 ## REPL Commands
 
@@ -243,10 +286,12 @@ Attention uses **tiled online softmax** (Flash Attention style) with fixed share
 |----------|---------|-------------|
 | `--http <port>` | -- | Run as HTTP server |
 | `--repl` | -- | Interactive mode |
-| `--context <n>` | 8192 | Max context length (128-131072) |
+| `--context <n>` | 2048 | Max context length (128-131072) |
 | `--bind <addr>` | 127.0.0.1 | Bind address for HTTP server |
 | `--warmup <mode>` | full | Warmup mode: `off`, `light` (1 prompt), `full` (6 prompts) |
 | `--auth <token>` | -- | Require Bearer token (also via `MNEMO_AUTH_TOKEN` env var) |
+| `--kv-int8` | off | INT8 KV cache (halves KV bandwidth vs FP16) |
+| `--extra-prefetch` | auto | 2-layer-ahead prefetch (auto-enabled for large MoE models) |
 
 Lower context = more VRAM for expert cache = higher hit rate = faster generation.
 
@@ -255,26 +300,28 @@ Lower context = more VRAM for expert cache = higher hit rate = faster generation
 ```
 MnemoCUDA/
 |-- src/
-|   |-- engine.c              # Lifecycle, config loading, sampling, generate (~1,500 lines)
+|   |-- engine.c              # Lifecycle, config, sampling, generate, CUDA graph build (~1,750 lines)
 |   |-- engine.h              # Public C API (error codes, stats, config)
-|   |-- engine_internal.h     # Shared internal types (ModelConfig, GPUState, etc.)
-|   |-- forward.c/h           # Forward pass, expert cache, prefetch, matvec dispatch (~900 lines)
-|   |-- tokenizer.c/h         # BPE tokenizer with ByteLevel decode (~330 lines)
-|   |-- io_pool.c/h           # Persistent I/O thread pool with error reporting (~130 lines)
-|   |-- heat.c/h              # Expert heat profiling, pinning, persistence (~230 lines)
+|   |-- engine_internal.h     # Shared internal types (ModelConfig, GPUState, cache, graphs)
+|   |-- forward.c/h           # Forward pass, expert cache, prefetch, attention graphs (~1,700 lines)
+|   |-- tokenizer.c/h         # BPE tokenizer with hash-table vocab lookup (~380 lines)
+|   |-- io_pool.c/h           # I/O thread pool with wait_any completion (~150 lines)
+|   |-- heat.c/h              # Expert heat profiling, pinning, persistence (~240 lines)
+|   |-- json_helpers.c/h      # Minimal JSON parser with injection resistance
 |   |-- log.h                 # Leveled logging macros (LOG_INFO/WARN/ERROR/DEBUG)
-|   |-- kernels.cu            # CUDA kernels: Q3-6_K/Q8_0/F32 matvec, tiled attention, RoPE, SwiGLU (~860 lines)
-|   |-- mnemo_server.c        # HTTP/REPL server: auth, health, SSE, 503 busy guard (~840 lines)
+|   |-- kernels.cu            # CUDA kernels: vectorized Q4K, fused attention, sampling, INT8 KV (~2,150 lines)
+|   |-- mnemo_server.c        # HTTP/REPL server with request queue + worker thread (~800 lines)
 |   |-- async_client.py       # Python async HTTP/SSE client
 |-- tests/
 |   |-- test_heat.c           # Heat profiling unit tests (12 tests)
-|   |-- test_engine.c         # Engine structural + GPU smoke tests (12 + 3 tests)
-|   |-- test_server.c         # Server JSON parsing and escape tests (11 tests)
+|   |-- test_engine.c         # Engine structural + GPU inference tests (12 + 4 tests)
+|   |-- test_server.c         # JSON parsing, escaping, injection resistance (17 tests)
 |-- tools/
 |   |-- prep_tokenizer.py     # Convert HuggingFace tokenizer to binary
 |   |-- tokenize.py           # Python tokenizer bridge (subprocess protocol)
 |   |-- validate_dequant.py   # Dequantization validation
 |   |-- validate_rope_norm.py # RoPE and RMS norm validation
+|   |-- benchmark.sh          # Benchmark suite (tok/s, TTFT, hit rates, profiling)
 |-- docs/
 |   |-- deployment.md         # Production deployment guide (Nginx, systemd, security)
 |   |-- troubleshooting.md    # Error codes, performance diagnosis, compatibility
@@ -287,15 +334,18 @@ MnemoCUDA/
 ## Test Suite
 
 ```bash
-make test   # Runs 35 tests (no GPU required for structural tests)
+make test   # Runs 41 tests (no GPU required for structural tests)
+
+# With real model for GPU inference tests:
+MODEL_DIR=/path/to/split_model make test
 ```
 
 | Suite | Tests | GPU Required |
 |-------|-------|:---:|
 | `test_heat` | 12 | No |
 | `test_engine` (structural) | 12 | No |
-| `test_engine` (GPU smoke) | 3 | Yes (`MODEL_DIR` env var) |
-| `test_server` | 11 | No |
+| `test_engine` (GPU inference) | 4 | Yes (`MODEL_DIR` env var) |
+| `test_server` (JSON + injection) | 17 | No |
 
 GPU smoke tests require `MODEL_DIR=/path/to/split_model` to run load/generate/cancel/heat cycles.
 
