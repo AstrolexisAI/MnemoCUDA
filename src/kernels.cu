@@ -107,6 +107,47 @@ __global__ void matvec_q4k(
     if (lane == 0) y[row] = sum;
 }
 
+// ── Q4_K Matvec + Scaled Accumulate (fused down-projection + weighted add) ──
+// y[row] += scale * dot(weights[row], x) — avoids separate scaled_add kernel.
+__global__ void matvec_q4k_scaled_add(
+    const BlockQ4K *__restrict__ weights,
+    const float    *__restrict__ x,
+    float          *__restrict__ y,
+    int n_rows, int n_cols, float scale
+) {
+    int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    int lane = threadIdx.x % 32;
+    if (row >= n_rows) return;
+
+    int blocks_per_row = (n_cols + 255) / 256;
+    const BlockQ4K *row_blocks = weights + row * blocks_per_row;
+
+    float sum = 0.0f;
+    for (int b = lane; b < blocks_per_row; b += 32) {
+        const BlockQ4K &blk = row_blocks[b];
+        float d   = f16_to_f32(blk.d);
+        float dmin = f16_to_f32(blk.dmin);
+        const uint8_t *q = blk.qs;
+        int base = b * 256;
+        int is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4(is, blk.scales, sc1, m1);
+            float d1 = d * sc1, m1f = dmin * m1;
+            get_scale_min_k4(is + 1, blk.scales, sc2, m2);
+            float d2 = d * sc2, m2f = dmin * m2;
+            for (int l = 0; l < 32 && (base + j + l) < n_cols; l++)
+                sum += (d1 * (q[l] & 0xF) - m1f) * x[base + j + l];
+            for (int l = 0; l < 32 && (base + j + 32 + l) < n_cols; l++)
+                sum += (d2 * (q[l] >> 4) - m2f) * x[base + j + 32 + l];
+            q += 32;
+            is += 2;
+        }
+    }
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) y[row] += scale * sum;
+}
+
 // ── Q6_K Dequantized Matrix-Vector Multiply ──
 // Block: [ql:128][qh:64][scales:16][d:2] = 210 bytes, 256 values
 // ql layout per half (64 bytes → 128 values):
@@ -718,6 +759,17 @@ void cuda_matvec_q4k(const void *weights, const float *x, float *y,
     KERNEL_LAUNCH_CHECK();
 }
 
+void cuda_matvec_q4k_scaled_add(const void *weights, const float *x, float *y,
+                                int n_rows, int n_cols, float scale,
+                                cudaStream_t stream) {
+    int warps_per_block = 4;
+    int threads = warps_per_block * 32;
+    int blocks = (n_rows + warps_per_block - 1) / warps_per_block;
+    matvec_q4k_scaled_add<<<blocks, threads, 0, stream>>>(
+        (const BlockQ4K *)weights, x, y, n_rows, n_cols, scale);
+    KERNEL_LAUNCH_CHECK();
+}
+
 void cuda_matvec_q6k(const void *weights, const float *x, float *y,
                      int n_rows, int n_cols, cudaStream_t stream) {
     int warps_per_block = 4;
@@ -1143,6 +1195,40 @@ void cuda_rms_norm_gated(const float *x, const float *z, const float *w,
     KERNEL_LAUNCH_CHECK();
 }
 
+// ── GPU-side expert cache classification ──
+// One thread per expert index (K threads, K <= 16).
+// Checks each expert against the VRAM cache slot table.
+// Outputs: hit_slots[e] = slot index if hit (-1 if miss),
+//          miss_mask[e] = 1 if miss, 0 if hit.
+__global__ void classify_experts_kernel(
+    const int *__restrict__ expert_indices,  // K expert IDs from router
+    const int *__restrict__ cache_layer,     // [n_slots] — layer per slot
+    const int *__restrict__ cache_expert,    // [n_slots] — expert per slot
+    int        *__restrict__ hit_slots,      // [K] output: slot index or -1
+    int        *__restrict__ miss_mask,      // [K] output: 1=miss, 0=hit
+    int layer, int n_slots, int K, int n_experts
+) {
+    int e = threadIdx.x;
+    if (e >= K) return;
+    int eid = expert_indices[e];
+    if (eid < 0 || eid >= n_experts) {
+        hit_slots[e] = -1;
+        miss_mask[e] = 0;  // invalid expert, skip
+        return;
+    }
+
+    // Linear scan of cache slots (n_slots typically 1000-4000)
+    for (int s = 0; s < n_slots; s++) {
+        if (cache_layer[s] == layer && cache_expert[s] == eid) {
+            hit_slots[e] = s;
+            miss_mask[e] = 0;
+            return;
+        }
+    }
+    hit_slots[e] = -1;
+    miss_mask[e] = 1;
+}
+
 // ── GPU-side embedding lookup + dequantization ──
 // Avoids per-token malloc + CPU dequant + H2D. The quantized embedding table
 // is already on GPU as part of d_resident.
@@ -1422,6 +1508,17 @@ __global__ void sample_token_kernel(
 
     #undef TOPP_LOCAL_K
     #undef TOPP_TOTAL_CANDS
+}
+
+void cuda_classify_experts(const int *expert_indices,
+                           const int *cache_layer, const int *cache_expert,
+                           int *hit_slots, int *miss_mask,
+                           int layer, int n_slots, int K, int n_experts,
+                           cudaStream_t stream) {
+    classify_experts_kernel<<<1, K, 0, stream>>>(
+        expert_indices, cache_layer, cache_expert,
+        hit_slots, miss_mask, layer, n_slots, K, n_experts);
+    KERNEL_LAUNCH_CHECK();
 }
 
 void cuda_embedding_lookup_q4k(const void *embd_table, float *output,

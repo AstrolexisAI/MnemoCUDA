@@ -118,6 +118,15 @@ typedef struct {
     int *cache_pending_expert;     // expert being uploaded (LOADING only)
     cudaEvent_t *cache_ready_event; // signaled when H2D completes per slot
 
+    // Device-side cache state mirror (for GPU classification kernel)
+    int *d_cache_layer;           // device copy of cache_layer[expert_cache_slots]
+    int *d_cache_expert;          // device copy of cache_expert[expert_cache_slots]
+
+    // GPU classification output buffers
+    int *d_class_hit_slots;       // slot indices for VRAM hits (max K=16)
+    int *d_class_miss_mask;       // 1 = miss, 0 = VRAM hit (per expert index)
+    int *h_class_miss_mask;       // pinned host copy of miss_mask
+
     bool expert_buf_pinned;
     bool prefetch_buf_pinned;
 

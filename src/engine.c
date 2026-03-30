@@ -1118,6 +1118,16 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
                 LOG_INFO("GPU %d: VRAM cache %.1f MB (%d slots × %.1f MB)",
                         gpu->gpu_id, (double)gpu->expert_cache_size / (1024*1024),
                         gpu->expert_cache_slots, (double)max_expert_sz / (1024*1024));
+
+                // Device-side cache state for GPU classification kernel
+                cudaMalloc((void**)&gpu->d_cache_layer, ns * sizeof(int));
+                cudaMalloc((void**)&gpu->d_cache_expert, ns * sizeof(int));
+                cudaMalloc((void**)&gpu->d_class_hit_slots, 16 * sizeof(int));
+                cudaMalloc((void**)&gpu->d_class_miss_mask, 16 * sizeof(int));
+                cudaMallocHost((void**)&gpu->h_class_miss_mask, 16 * sizeof(int));
+                // Initialize device cache state to -1 (empty)
+                cudaMemset(gpu->d_cache_layer, 0xFF, ns * sizeof(int));
+                cudaMemset(gpu->d_cache_expert, 0xFF, ns * sizeof(int));
             }
         }
     }
@@ -1243,6 +1253,11 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
         cudaFree(gpu->d_kv_k); cudaFree(gpu->d_kv_v);
         cudaFree(gpu->d_expert_buf);
         cudaFree(gpu->d_expert_cache);
+        cudaFree(gpu->d_cache_layer);
+        cudaFree(gpu->d_cache_expert);
+        cudaFree(gpu->d_class_hit_slots);
+        cudaFree(gpu->d_class_miss_mask);
+        if (gpu->h_class_miss_mask) cudaFreeHost(gpu->h_class_miss_mask);
 
         if (gpu->h_expert_buf) {
             if (gpu->expert_buf_pinned) cudaFreeHost(gpu->h_expert_buf);

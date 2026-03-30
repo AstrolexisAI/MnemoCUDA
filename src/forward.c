@@ -67,6 +67,11 @@ extern void cuda_sample_token(const float *logits, int vocab_size,
                               int *d_result, cudaStream_t stream);
 extern void cuda_rms_norm_batched(const float *input, const float *weight, float *output,
                                   int head_dim, int n_heads, float eps, cudaStream_t stream);
+extern void cuda_classify_experts(const int *expert_indices,
+                                  const int *cache_layer, const int *cache_expert,
+                                  int *hit_slots, int *miss_mask,
+                                  int layer, int n_slots, int K, int n_experts,
+                                  cudaStream_t stream);
 extern void cuda_embedding_lookup_q4k(const void *embd_table, float *output,
                                       int token_id, int hidden_size, int row_bytes,
                                       cudaStream_t stream);
@@ -111,6 +116,16 @@ static void *tensor_ptr_on_gpu(MnemoCudaCtx *ctx, TensorEntry *e, int gpu_idx) {
 }
 
 // ── Matvec dispatch by quantization type ──
+
+extern void cuda_matvec_q4k_scaled_add(const void *weights, const float *x, float *y,
+                                       int n_rows, int n_cols, float scale,
+                                       cudaStream_t stream);
+
+// Forward declaration
+static void expert_fwd(GPUState *gpu, const void *expert_data,
+                       size_t gate_sz, size_t up_sz,
+                       int H, int EFF, int down_type_id,
+                       float weight, cudaStream_t cs);
 
 static void matvec(const void *w, const float *x, float *y,
                    int rows, int cols, int type_id, cudaStream_t stream) {
@@ -685,14 +700,36 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
     matvec(tensor_ptr_on_gpu(ctx, wr, gpu_idx),
            gpu->d_normed, gpu->d_router_out, NE, H, wr->type_id, cs);
 
-    // ── 10. Top-K expert selection (GPU → async D2H via pinned memory) ──
+    // ── 10. Top-K expert selection + GPU cache classification ──
     cuda_topk_softmax(gpu->d_router_out, gpu->d_expert_indices,
                       gpu->d_expert_weights, NE, K, cs);
+
+    // Sync cache state to device (small: n_slots * 4 bytes * 2)
+    if (gpu->d_cache_layer && gpu->expert_cache_slots > 0) {
+        cudaMemcpyAsync(gpu->d_cache_layer, gpu->cache_layer,
+                        gpu->expert_cache_slots * sizeof(int),
+                        cudaMemcpyHostToDevice, cs);
+        cudaMemcpyAsync(gpu->d_cache_expert, gpu->cache_expert,
+                        gpu->expert_cache_slots * sizeof(int),
+                        cudaMemcpyHostToDevice, cs);
+    }
+
+    // GPU-side L1 classification: runs on cs after topk, no host stall
+    if (gpu->d_cache_layer && gpu->expert_cache_slots > 0) {
+        cuda_classify_experts(gpu->d_expert_indices,
+                              gpu->d_cache_layer, gpu->d_cache_expert,
+                              gpu->d_class_hit_slots, gpu->d_class_miss_mask,
+                              layer, gpu->expert_cache_slots, K, NE, cs);
+    }
+
+    // Copy classification results + expert IDs/weights to host (all on cs)
     cudaMemcpyAsync(gpu->h_expert_indices, gpu->d_expert_indices,
                     K * sizeof(int), cudaMemcpyDeviceToHost, cs);
     cudaMemcpyAsync(gpu->h_expert_weights, gpu->d_expert_weights,
                     K * sizeof(float), cudaMemcpyDeviceToHost, cs);
-    // Record event after D2H copies — sync deferred until we need the data
+    if (gpu->h_class_miss_mask)
+        cudaMemcpyAsync(gpu->h_class_miss_mask, gpu->d_class_miss_mask,
+                        K * sizeof(int), cudaMemcpyDeviceToHost, cs);
     cudaEventRecord(gpu->ev_router, cs);
 
     // ── 11 + 12. Expert load (cache-first) + forward on GPU ──
@@ -715,40 +752,42 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
     if (gpu->prefetch_layer == layer && !gpu->prefetch_ready)
         prefetch_wait(gpu, gpu->n_prefetched);
 
-    // Now sync: we need expert_indices/weights on host for classification
+    // Sync: need classification results on host
     cudaEventSynchronize(gpu->ev_router);
     int *expert_indices = gpu->h_expert_indices;
     float *expert_weights_h = gpu->h_expert_weights;
     t1 = now_ms();
     ctx->prof_router_ms += t1 - t0;
 
-    // ── Classify experts: VRAM hit → prefetch hit → RAM hit → NVMe miss ──
+    // ── Classify experts using GPU results: VRAM hit → prefetch → RAM → NVMe ──
     static int total_lookups = 0, total_hits = 0;
     static int total_prefetch_hits = 0, total_ram_hits = 0;
 
     void *hit_ptrs[16]; float hit_weights[16]; int n_hits = 0;
     int miss_eids[16]; float miss_weights[16]; int n_misses = 0;
-    // RAM-hit experts: already in pinned host, just need GPU upload
     void *ram_hit_ptrs[16]; float ram_hit_weights[16]; int ram_hit_eids[16]; int n_ram_hits = 0;
 
     for (int e = 0; e < K && e < 16; e++) {
         int eid = expert_indices[e];
         if (eid < 0 || eid >= NE) continue;
 
-        // Heat profiling: count this activation
         if (ctx->heat_map)
             ctx->heat_map[layer * NE + eid]++;
 
         total_lookups++;
 
-        // Level 1: VRAM cache (instant, on-GPU)
-        void *cached = expert_cache_lookup(gpu, layer, eid);
-        if (cached) {
-            total_hits++;
-            if (ctx->layer_hits) ctx->layer_hits[layer]++;
-            hit_ptrs[n_hits] = cached;
-            hit_weights[n_hits++] = expert_weights_h[e];
-            continue;
+        // GPU already classified L1 hits — use miss_mask
+        if (gpu->h_class_miss_mask && gpu->h_class_miss_mask[e] == 0) {
+            // L1 VRAM cache hit (confirmed by GPU kernel)
+            void *cached = expert_cache_lookup(gpu, layer, eid);
+            if (cached) {
+                total_hits++;
+                if (ctx->layer_hits) ctx->layer_hits[layer]++;
+                hit_ptrs[n_hits] = cached;
+                hit_weights[n_hits++] = expert_weights_h[e];
+                continue;
+            }
+            // GPU said hit but host disagrees (race with eviction) — fall through
         }
 
         // Level 2: Prefetch buffer (pinned host, predicted)
@@ -861,11 +900,7 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
             if (!hits_computed) {
                 for (int h = 0; h < n_hits; h++) {
                     void *d = hit_ptrs[h];
-                    matvec(d, gpu->d_normed, gpu->d_expert_gate, EFF, H, 12, cs);
-                    matvec((char *)d + gate_sz, gpu->d_normed, gpu->d_expert_up, EFF, H, 12, cs);
-                    cuda_swiglu(gpu->d_expert_gate, gpu->d_expert_up, gpu->d_expert_act, EFF, cs);
-                    matvec((char *)d + gate_sz + up_sz, gpu->d_expert_act, gpu->d_expert_out, H, EFF, down_type_id, cs);
-                    cuda_scaled_add(gpu->d_moe_out, gpu->d_expert_out, hit_weights[h], H, cs);
+                    expert_fwd(gpu, d, gate_sz, up_sz, H, EFF, down_type_id, hit_weights[h], cs);
                 }
                 hits_computed = 1;
             }
@@ -900,11 +935,7 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
                 cudaEventRecord(gpu->ev_upload, gpu->stream_io);
                 cudaStreamWaitEvent(cs, gpu->ev_upload, 0);
 
-                matvec(d, gpu->d_normed, gpu->d_expert_gate, EFF, H, 12, cs);
-                matvec((char *)d + gate_sz, gpu->d_normed, gpu->d_expert_up, EFF, H, 12, cs);
-                cuda_swiglu(gpu->d_expert_gate, gpu->d_expert_up, gpu->d_expert_act, EFF, cs);
-                matvec((char *)d + gate_sz + up_sz, gpu->d_expert_act, gpu->d_expert_out, H, EFF, down_type_id, cs);
-                cuda_scaled_add(gpu->d_moe_out, gpu->d_expert_out, miss_weights[i], H, cs);
+                expert_fwd(gpu, d, gate_sz, up_sz, H, EFF, down_type_id, miss_weights[i], cs);
             }
         }
 
@@ -968,6 +999,29 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
     // ── 13. MoE output + residual (GPU) ──
     cuda_residual_add(gpu->d_moe_out, gpu->d_residual, gpu->d_hidden, H, cs);
 
+}
+
+// ── Expert forward helper: gate + up + swiglu + down + scaled_add ──
+// Encapsulates the 5-kernel MoE expert computation, deduplicating 3 call sites.
+// For Q4K down-projection, uses fused matvec_scaled_add (4 launches instead of 5).
+static void expert_fwd(GPUState *gpu, const void *expert_data,
+                       size_t gate_sz, size_t up_sz,
+                       int H, int EFF, int down_type_id,
+                       float weight, cudaStream_t cs) {
+    matvec(expert_data, gpu->d_normed, gpu->d_expert_gate, EFF, H, 12, cs);
+    matvec((const char *)expert_data + gate_sz, gpu->d_normed, gpu->d_expert_up, EFF, H, 12, cs);
+    cuda_swiglu(gpu->d_expert_gate, gpu->d_expert_up, gpu->d_expert_act, EFF, cs);
+
+    if (down_type_id == 12) {
+        // Fused: down-projection + scaled accumulation into moe_out
+        cuda_matvec_q4k_scaled_add(
+            (const char *)expert_data + gate_sz + up_sz,
+            gpu->d_expert_act, gpu->d_moe_out, H, EFF, weight, cs);
+    } else {
+        matvec((const char *)expert_data + gate_sz + up_sz,
+               gpu->d_expert_act, gpu->d_expert_out, H, EFF, down_type_id, cs);
+        cuda_scaled_add(gpu->d_moe_out, gpu->d_expert_out, weight, H, cs);
+    }
 }
 
 // ── Embedding lookup helper: GPU dequant if tensor is on GPU, else CPU fallback ──
