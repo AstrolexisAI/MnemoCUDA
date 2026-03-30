@@ -1468,6 +1468,55 @@ void mnemo_cuda_cancel(MnemoCudaCtx *ctx) {
 
 // ── Generate: tokenize → prefill → autoregressive decode ──
 
+void mnemo_cuda_batch_bench(MnemoCudaCtx *ctx, int n_steps) {
+    if (!ctx || !ctx->loaded) return;
+    ModelConfig *cfg = &ctx->config;
+
+    // Use a dummy token for decode steps
+    int dummy_token = 1;  // typically a common token
+    struct timespec t0, t1;
+
+    // Batch=1: N decode steps
+    LOG_INFO("Batch=1: %d decode steps...", n_steps);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int t = 0; t < n_steps; t++) {
+        int out;
+        int token_ids[1] = { dummy_token };
+        int positions[1] = { t };
+        forward_pass_batch(ctx, token_ids, positions, 1, 0.0f, 0.9f, 42 + t, &out);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double b1 = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    LOG_INFO("Batch=1: %d tokens in %.2fs = %.1f tok/s", n_steps, b1, n_steps / b1);
+
+    // Check if batch=2 is available
+    bool batch_ok = true;
+    for (int g = 0; g < ctx->n_gpus; g++)
+        if (!ctx->gpus[g].extra_slots[0].allocated) batch_ok = false;
+
+    if (!batch_ok) {
+        LOG_INFO("Batch=2 not available (slot 1 not allocated)");
+        return;
+    }
+
+    // Batch=2: N decode steps × 2 requests
+    LOG_INFO("Batch=2: %d decode steps × 2 requests...", n_steps);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int t = 0; t < n_steps; t++) {
+        int out[2];
+        int token_ids[2] = { dummy_token, dummy_token };
+        int positions[2] = { t, t };
+        forward_pass_batch(ctx, token_ids, positions, 2, 0.0f, 0.9f, 42 + t, out);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double b2 = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    LOG_INFO("Batch=2: %d tokens (2×%d) in %.2fs = %.1f tok/s total, %.1f per request",
+             n_steps * 2, n_steps, b2, n_steps * 2 / b2, n_steps / b2);
+
+    LOG_INFO("Batch throughput: %.1f tok/s (batch=1) vs %.1f tok/s (batch=2) = %.2fx",
+             n_steps / b1, n_steps * 2 / b2, (n_steps * 2 / b2) / (n_steps / b1));
+}
+
 int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
                         float temperature, bool raw_prompt,
                         MnemoCudaTokenCB callback, void *userdata) {

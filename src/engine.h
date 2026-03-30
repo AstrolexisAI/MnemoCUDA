@@ -91,6 +91,10 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
                         MnemoCudaTokenCB callback, void *userdata);
 void mnemo_cuda_cancel(MnemoCudaCtx *ctx);
 
+// Batch benchmark: compares batch=1 vs batch=2 decode throughput.
+// Runs N decode steps for each mode and logs results.
+void mnemo_cuda_batch_bench(MnemoCudaCtx *ctx, int n_steps);
+
 // Info
 typedef struct {
     int tokens_generated;

@@ -791,6 +791,10 @@ int main(int argc, char **argv) {
             return 1;
         }
         run_http(ctx, (int)port, bind_addr, auth_token);
+    } else if (argc >= 3 && strcmp(argv[2], "--batch-bench") == 0) {
+        // Batch benchmark mode
+        LOG_INFO("=== Batch benchmark: batch=1 vs batch=2 decode throughput ===");
+        mnemo_cuda_batch_bench(ctx, 20);
     } else if (argc >= 3) {
         // Single prompt
         OutputCtx out = { .fd = -1, .buf = malloc(65536), .buf_len = 0, .buf_cap = 65536 };

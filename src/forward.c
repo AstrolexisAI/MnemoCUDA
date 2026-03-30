@@ -1402,7 +1402,7 @@ void build_attention_graphs(MnemoCudaCtx *ctx) {
 }
 
 // ── Swap GPU compute/KV buffers to/from a batch slot ──
-static void gpu_swap_slot(GPUState *gpu, int slot) {
+void gpu_swap_slot(GPUState *gpu, int slot) {
     if (slot == 0) return;
     BatchSlot *s = &gpu->extra_slots[slot - 1];
     if (!s->allocated) return;
