@@ -138,6 +138,9 @@ static void *tensor_ptr_on_gpu(MnemoCudaCtx *ctx, TensorEntry *e, int gpu_idx) {
 
 // ── Matvec dispatch by quantization type ──
 
+extern void cuda_matvec_q4k_qkv(const void *w_q, const void *w_k, const void *w_v,
+                                const float *x, float *out_q, float *out_k, float *out_v,
+                                int q_rows, int kv_rows, int n_cols, cudaStream_t stream);
 extern void cuda_matvec_q4k_dual(const void *wa, const void *wb, const float *x,
                                  float *ya, float *yb,
                                  int n_rows, int n_cols, cudaStream_t stream);
@@ -670,24 +673,32 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
                                    gpu->d_normed, gpu->d_residual, H, eps, cs);
         }
 
-        // ── 2. Q/K/V projections (GPU dequant matvec) ──
+        // ── 2. Q/K/V projections ──
         TensorEntry *wq = LT.attn_q;
-        if (wq) matvec(tensor_ptr_on_gpu(ctx, wq, gpu_idx),
-                        gpu->d_normed, gpu->d_q, NH * HD, H, wq->type_id, cs);
-
-        // K+V fused: same dimensions [NKV*HD × H], same input (d_normed)
         TensorEntry *wk = LT.attn_k;
         TensorEntry *wv = LT.attn_v;
-        if (wk && wv && wk->type_id == 12 && wv->type_id == 12) {
-            cuda_matvec_q4k_dual(tensor_ptr_on_gpu(ctx, wk, gpu_idx),
-                                 tensor_ptr_on_gpu(ctx, wv, gpu_idx),
-                                 gpu->d_normed, gpu->d_k, gpu->d_v,
-                                 NKV * HD, H, cs);
+        // QKV mega-kernel: all 3 projections in 1 launch when all are Q4K
+        if (wq && wk && wv &&
+            wq->type_id == 12 && wk->type_id == 12 && wv->type_id == 12) {
+            cuda_matvec_q4k_qkv(tensor_ptr_on_gpu(ctx, wq, gpu_idx),
+                                tensor_ptr_on_gpu(ctx, wk, gpu_idx),
+                                tensor_ptr_on_gpu(ctx, wv, gpu_idx),
+                                gpu->d_normed, gpu->d_q, gpu->d_k, gpu->d_v,
+                                NH * HD, NKV * HD, H, cs);
         } else {
-            if (wk) matvec(tensor_ptr_on_gpu(ctx, wk, gpu_idx),
-                            gpu->d_normed, gpu->d_k, NKV * HD, H, wk->type_id, cs);
-            if (wv) matvec(tensor_ptr_on_gpu(ctx, wv, gpu_idx),
-                            gpu->d_normed, gpu->d_v, NKV * HD, H, wv->type_id, cs);
+            if (wq) matvec(tensor_ptr_on_gpu(ctx, wq, gpu_idx),
+                            gpu->d_normed, gpu->d_q, NH * HD, H, wq->type_id, cs);
+            if (wk && wv && wk->type_id == 12 && wv->type_id == 12) {
+                cuda_matvec_q4k_dual(tensor_ptr_on_gpu(ctx, wk, gpu_idx),
+                                     tensor_ptr_on_gpu(ctx, wv, gpu_idx),
+                                     gpu->d_normed, gpu->d_k, gpu->d_v,
+                                     NKV * HD, H, cs);
+            } else {
+                if (wk) matvec(tensor_ptr_on_gpu(ctx, wk, gpu_idx),
+                                gpu->d_normed, gpu->d_k, NKV * HD, H, wk->type_id, cs);
+                if (wv) matvec(tensor_ptr_on_gpu(ctx, wv, gpu_idx),
+                                gpu->d_normed, gpu->d_v, NKV * HD, H, wv->type_id, cs);
+            }
         }
 
         // ── 3. QK norms (fused: Q+K in 1 launch) ──
@@ -1310,13 +1321,12 @@ void build_attention_graphs(MnemoCudaCtx *ctx) {
                                    gpu->d_normed, gpu->d_residual, H, eps, cs);
 
             TensorEntry *wq = LTG.attn_q;
-            matvec(tensor_ptr_on_gpu(ctx, wq, g),
-                   gpu->d_normed, gpu->d_q, NH*HD, H, wq->type_id, cs);
-
             TensorEntry *wk = LTG.attn_k, *wv = LTG.attn_v;
-            cuda_matvec_q4k_dual(tensor_ptr_on_gpu(ctx, wk, g),
-                                 tensor_ptr_on_gpu(ctx, wv, g),
-                                 gpu->d_normed, gpu->d_k, gpu->d_v, NKV*HD, H, cs);
+            cuda_matvec_q4k_qkv(tensor_ptr_on_gpu(ctx, wq, g),
+                                tensor_ptr_on_gpu(ctx, wk, g),
+                                tensor_ptr_on_gpu(ctx, wv, g),
+                                gpu->d_normed, gpu->d_q, gpu->d_k, gpu->d_v,
+                                NH*HD, NKV*HD, H, cs);
 
             TensorEntry *qn = LTG.attn_q_norm, *kn = LTG.attn_k_norm;
             if (qn && kn)

@@ -191,6 +191,81 @@ __global__ void matvec_q4k_add(
     }
 }
 
+// ── Q4_K QKV Mega-kernel: Q + K + V projections in one launch ──
+// Grid covers q_rows + kv_rows + kv_rows = total rows.
+// Each warp determines which projection it belongs to by its global row index.
+// All warps share the same input x via tiled shared memory.
+__global__ void matvec_q4k_qkv(
+    const BlockQ4K *__restrict__ w_q,    // [q_rows × n_cols]
+    const BlockQ4K *__restrict__ w_k,    // [kv_rows × n_cols]
+    const BlockQ4K *__restrict__ w_v,    // [kv_rows × n_cols]
+    const float    *__restrict__ x,
+    float          *__restrict__ out_q,
+    float          *__restrict__ out_k,
+    float          *__restrict__ out_v,
+    int q_rows, int kv_rows, int n_cols
+) {
+    __shared__ float s_tile[256];
+    int warps_per_block = blockDim.x / 32;
+    int global_row = blockIdx.x * warps_per_block + (threadIdx.x / 32);
+    int lane = threadIdx.x % 32;
+    int total_rows = q_rows + kv_rows + kv_rows;
+    if (global_row >= total_rows) return;
+
+    // Determine which projection and local row
+    const BlockQ4K *weights;
+    float *output;
+    int local_row;
+    if (global_row < q_rows) {
+        weights = w_q; output = out_q; local_row = global_row;
+    } else if (global_row < q_rows + kv_rows) {
+        weights = w_k; output = out_k; local_row = global_row - q_rows;
+    } else {
+        weights = w_v; output = out_v; local_row = global_row - q_rows - kv_rows;
+    }
+
+    int blocks_per_row = (n_cols + 255) / 256;
+    const BlockQ4K *row_blocks = weights + (size_t)local_row * blocks_per_row;
+    float sum = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; b++) {
+        int base = b * 256;
+        for (int i = threadIdx.x; i < 256 && (base + i) < n_cols; i += blockDim.x)
+            s_tile[i] = x[base + i];
+        __syncthreads();
+
+        const BlockQ4K *blk_ptr = &row_blocks[b];
+        float d   = f16_to_f32(blk_ptr->d);
+        float dmin = f16_to_f32(blk_ptr->dmin);
+        uint32_t my_qs = ((const uint32_t *)blk_ptr->qs)[lane];
+        int grp = lane / 8, pos = (lane % 8) * 4;
+        uint8_t sc_lo, m_lo, sc_hi, m_hi;
+        get_scale_min_k4(grp * 2,     blk_ptr->scales, sc_lo, m_lo);
+        get_scale_min_k4(grp * 2 + 1, blk_ptr->scales, sc_hi, m_hi);
+        float d_lo = d * sc_lo, mf_lo = dmin * m_lo;
+        float d_hi = d * sc_hi, mf_hi = dmin * m_hi;
+
+        int lo_base = grp * 64 + pos;
+        if (lo_base + 3 < n_cols - base) {
+            sum += (d_lo * ((my_qs)       & 0xF) - mf_lo) * s_tile[lo_base];
+            sum += (d_lo * ((my_qs >> 8)  & 0xF) - mf_lo) * s_tile[lo_base + 1];
+            sum += (d_lo * ((my_qs >> 16) & 0xF) - mf_lo) * s_tile[lo_base + 2];
+            sum += (d_lo * ((my_qs >> 24) & 0xF) - mf_lo) * s_tile[lo_base + 3];
+        }
+        int hi_base = grp * 64 + 32 + pos;
+        if (hi_base + 3 < n_cols - base) {
+            sum += (d_hi * ((my_qs >> 4)  & 0xF) - mf_hi) * s_tile[hi_base];
+            sum += (d_hi * ((my_qs >> 12) & 0xF) - mf_hi) * s_tile[hi_base + 1];
+            sum += (d_hi * ((my_qs >> 20) & 0xF) - mf_hi) * s_tile[hi_base + 2];
+            sum += (d_hi * ((my_qs >> 28) & 0xF) - mf_hi) * s_tile[hi_base + 3];
+        }
+        __syncthreads();
+    }
+
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) output[local_row] = sum;
+}
+
 // ── Q4_K Dual Matvec (gate + up projections in one kernel) ──
 // Vectorized uint32_t loads, same pattern as matvec_q4k.
 __global__ void matvec_q4k_dual(
@@ -993,6 +1068,19 @@ void cuda_matvec_q4k(const void *weights, const float *x, float *y,
     int blocks = (n_rows + warps_per_block - 1) / warps_per_block;
     matvec_q4k<<<blocks, threads, 0, stream>>>(
         (const BlockQ4K *)weights, x, y, n_rows, n_cols);
+    KERNEL_LAUNCH_CHECK();
+}
+
+void cuda_matvec_q4k_qkv(const void *w_q, const void *w_k, const void *w_v,
+                         const float *x, float *out_q, float *out_k, float *out_v,
+                         int q_rows, int kv_rows, int n_cols, cudaStream_t stream) {
+    int warps_per_block = 4;
+    int threads = warps_per_block * 32;
+    int total_rows = q_rows + kv_rows + kv_rows;
+    int blocks = (total_rows + warps_per_block - 1) / warps_per_block;
+    matvec_q4k_qkv<<<blocks, threads, 0, stream>>>(
+        (const BlockQ4K *)w_q, (const BlockQ4K *)w_k, (const BlockQ4K *)w_v,
+        x, out_q, out_k, out_v, q_rows, kv_rows, n_cols);
     KERNEL_LAUNCH_CHECK();
 }
 
