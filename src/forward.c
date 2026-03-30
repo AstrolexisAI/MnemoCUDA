@@ -10,7 +10,15 @@
 #include <string.h>
 #include <math.h>
 #include <unistd.h>
+#include <time.h>
 #include <cuda_runtime.h>
+
+// Host-side timer for profiling (measures wall clock including GPU sync waits)
+static inline double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
 
 // Kernel declarations (extern "C" from kernels.cu)
 extern void cuda_matvec_q3k(const void *weights, const float *x, float *y,
@@ -53,6 +61,16 @@ extern void cuda_gdn_recurrence(const float *q, const float *k, const float *v,
 extern void cuda_rms_norm_gated(const float *x, const float *z, const float *w,
                                 float *out, int head_dim, int n_heads,
                                 cudaStream_t stream);
+extern void cuda_sample_token(const float *logits, int vocab_size,
+                              float temperature, float top_p,
+                              unsigned long long rng_state,
+                              int *d_result, cudaStream_t stream);
+extern void cuda_embedding_lookup_q4k(const void *embd_table, float *output,
+                                      int token_id, int hidden_size, int row_bytes,
+                                      cudaStream_t stream);
+extern void cuda_embedding_lookup_q3k(const void *embd_table, float *output,
+                                      int token_id, int hidden_size, int row_bytes,
+                                      cudaStream_t stream);
 
 // ── Helper: get tensor data on specific GPU ──
 
@@ -229,13 +247,51 @@ static void *prefetch_lookup(GPUState *gpu, int layer, int expert_id, size_t exp
     return NULL;
 }
 
-// ── Expert VRAM cache: lookup / insert ──
+// ── Expert VRAM cache: lookup / insert with slot FSM ──
+//
+// Slot states: EMPTY → LOADING → READY → (evict) → EMPTY
+//   EMPTY:   no expert, available for allocation
+//   LOADING: H2D async in flight; cache_pending_layer/expert set, NOT visible to lookup
+//   READY:   data on device, cache_layer/expert set, visible to lookup
+//
+// This separation prevents the race where compute reads a slot whose
+// H2D hasn't completed — the root cause of the NaN bug in batch uploads.
 
-// Returns device pointer to expert data in cache, or NULL if miss
+// Find an evictable slot (EMPTY preferred, then oldest READY non-pinned).
+// Never evicts LOADING slots. Returns slot index or -1.
+static int cache_find_evictable(GPUState *gpu) {
+    int target = -1;
+    uint64_t min_lru = UINT64_MAX;
+    for (int s = 0; s < gpu->expert_cache_slots; s++) {
+        if (gpu->cache_state[s] == SLOT_EMPTY) return s;
+        if (gpu->cache_state[s] == SLOT_LOADING) continue;
+        if (gpu->cache_pinned && gpu->cache_pinned[s]) continue;
+        if (gpu->cache_lru[s] < min_lru) { min_lru = gpu->cache_lru[s]; target = s; }
+    }
+    return target;
+}
+
+// Demote evicted expert to RAM cache via mmap (zero-copy from page cache)
+static void cache_demote_to_ram(MnemoCudaCtx *ctx, GPUState *gpu, int slot) {
+    if (!ctx || gpu->cache_layer[slot] < 0) return;
+    int evict_layer = gpu->cache_layer[slot];
+    int evict_expert = gpu->cache_expert[slot];
+    if (ctx->expert_layers && evict_layer < ctx->config.num_hidden_layers) {
+        ExpertLayerFile *elf = &ctx->expert_layers[evict_layer];
+        if (elf->mmap_data) {
+            void *src = (char *)elf->mmap_data + (size_t)evict_expert * elf->expert_size;
+            ram_cache_insert(&ctx->ram_cache, evict_layer, evict_expert,
+                             src, elf->expert_size);
+        }
+    }
+}
+
+// Returns device pointer to expert data, or NULL. Only returns READY slots.
 void *expert_cache_lookup(GPUState *gpu, int layer, int expert_id) {
     if (!gpu->d_expert_cache || gpu->expert_cache_slots == 0) return NULL;
     for (int s = 0; s < gpu->expert_cache_slots; s++) {
-        if (gpu->cache_layer[s] == layer && gpu->cache_expert[s] == expert_id) {
+        if (gpu->cache_state[s] == SLOT_READY &&
+            gpu->cache_layer[s] == layer && gpu->cache_expert[s] == expert_id) {
             gpu->cache_lru[s] = ++gpu->cache_clock;
             if (gpu->cache_hits) gpu->cache_hits[s]++;
             return (char *)gpu->d_expert_cache + (size_t)s * gpu->expert_slot_size;
@@ -244,62 +300,44 @@ void *expert_cache_lookup(GPUState *gpu, int layer, int expert_id) {
     return NULL;
 }
 
-// Check-only: returns true if expert is cached, without bumping LRU
+// Check-only: returns true if expert is READY, without bumping LRU
 bool expert_cache_has(GPUState *gpu, int layer, int expert_id) {
     if (!gpu->d_expert_cache || gpu->expert_cache_slots == 0) return false;
     for (int s = 0; s < gpu->expert_cache_slots; s++)
-        if (gpu->cache_layer[s] == layer && gpu->cache_expert[s] == expert_id) return true;
+        if (gpu->cache_state[s] == SLOT_READY &&
+            gpu->cache_layer[s] == layer && gpu->cache_expert[s] == expert_id)
+            return true;
     return false;
 }
 
-// Insert expert into cache (evict LRU if full), returns device pointer.
-// If ram_demote is non-NULL, evicted experts are demoted to RAM cache.
+// Check if an expert upload is already in flight
+bool expert_cache_is_loading(GPUState *gpu, int layer, int expert_id) {
+    if (!gpu->d_expert_cache || gpu->expert_cache_slots == 0) return false;
+    for (int s = 0; s < gpu->expert_cache_slots; s++)
+        if (gpu->cache_state[s] == SLOT_LOADING &&
+            gpu->cache_pending_layer[s] == layer && gpu->cache_pending_expert[s] == expert_id)
+            return true;
+    return false;
+}
+
+// Synchronous insert: evict → upload → immediately mark READY.
+// Used by the existing path where caller does cudaStreamSynchronize after.
 void *expert_cache_insert_ctx(struct MnemoCudaCtx *ctx, GPUState *gpu,
-                                      int layer, int expert_id,
-                                      const void *host_data, size_t data_size,
-                                      cudaStream_t stream) {
+                              int layer, int expert_id,
+                              const void *host_data, size_t data_size,
+                              cudaStream_t stream) {
     if (!gpu->d_expert_cache || gpu->expert_cache_slots == 0) return NULL;
 
-    // Find empty slot or LRU slot (skip pinned slots)
-    // NOTE: Tested composite scoring (heat + frequency + recency) — it performed WORSE
-    // than pure LRU for MoE expert streaming (78% vs 88% hit rate). LRU is optimal here
-    // because expert access patterns are highly temporal: what was used last token is
-    // most likely needed next token. Heat/frequency protect stale experts.
-    int target = -1;
-    uint64_t min_lru = UINT64_MAX;
-    for (int s = 0; s < gpu->expert_cache_slots; s++) {
-        if (gpu->cache_layer[s] == -1) { target = s; break; } // empty
-        if (gpu->cache_pinned && gpu->cache_pinned[s]) continue; // pinned — don't evict
-        if (gpu->cache_lru[s] < min_lru) { min_lru = gpu->cache_lru[s]; target = s; }
-    }
-    if (target < 0) return NULL; // all slots pinned, can't evict
+    int target = cache_find_evictable(gpu);
+    if (target < 0) return NULL;
 
-    // ── VRAM→RAM demotion: save evicted expert to RAM cache ──
-    if (ctx && gpu->cache_layer[target] >= 0) {
-        // Read evicted expert data back from VRAM to a temp pinned buffer, then insert into RAM cache
-        // Optimization: use the host_data buffer as temp (it's about to be overwritten anyway)
-        // Instead, just insert from the incoming host_data's neighbor — but that's the NEW data.
-        // Simplest: demote using the incoming host_data as the source is wrong.
-        // Real demotion: copy VRAM slot → RAM. But cudaMemcpy D2H is expensive (~1ms for 12MB).
-        // Better approach: when the expert was loaded, it passed through host memory.
-        // If it's in the mmap page cache, re-reading is free. Just record it in RAM cache
-        // from the mmap data (which is already in page cache if recently used).
-        int evict_layer = gpu->cache_layer[target];
-        int evict_expert = gpu->cache_expert[target];
-        if (ctx->expert_layers && evict_layer < ctx->config.num_hidden_layers) {
-            ExpertLayerFile *elf = &ctx->expert_layers[evict_layer];
-            if (elf->mmap_data) {
-                void *src = (char *)elf->mmap_data + (size_t)evict_expert * elf->expert_size;
-                ram_cache_insert(&ctx->ram_cache, evict_layer, evict_expert,
-                                 src, elf->expert_size);
-            }
-        }
-    }
+    cache_demote_to_ram(ctx, gpu, target);
 
+    gpu->cache_state[target] = SLOT_READY;
     gpu->cache_layer[target] = layer;
     gpu->cache_expert[target] = expert_id;
     gpu->cache_lru[target] = ++gpu->cache_clock;
-    if (gpu->cache_hits) gpu->cache_hits[target] = 0; // reset frequency for new entry
+    if (gpu->cache_hits) gpu->cache_hits[target] = 0;
 
     void *slot = (char *)gpu->d_expert_cache + (size_t)target * gpu->expert_slot_size;
     cudaMemcpyAsync(slot, host_data, data_size, cudaMemcpyHostToDevice, stream);
@@ -308,9 +346,94 @@ void *expert_cache_insert_ctx(struct MnemoCudaCtx *ctx, GPUState *gpu,
 
 // Simple wrapper without context (for heat_pin and prefetch where we don't need demotion)
 void *expert_cache_insert(GPUState *gpu, int layer, int expert_id,
-                                  const void *host_data, size_t data_size,
-                                  cudaStream_t stream) {
+                          const void *host_data, size_t data_size,
+                          cudaStream_t stream) {
     return expert_cache_insert_ctx(NULL, gpu, layer, expert_id, host_data, data_size, stream);
+}
+
+// Deferred insert: reserve slot as LOADING, enqueue async H2D, record event.
+// The slot is NOT visible to lookup until expert_cache_poll_ready() promotes it.
+// Returns device pointer (for later compute after poll_ready), or NULL.
+void *expert_cache_insert_deferred(struct MnemoCudaCtx *ctx, GPUState *gpu,
+                                   int layer, int expert_id,
+                                   const void *host_data, size_t data_size,
+                                   cudaStream_t stream) {
+    if (!gpu->d_expert_cache || gpu->expert_cache_slots == 0) return NULL;
+
+    int target = cache_find_evictable(gpu);
+    if (target < 0) return NULL;
+
+    cache_demote_to_ram(ctx, gpu, target);
+
+    // Mark LOADING — invisible to lookup
+    gpu->cache_state[target] = SLOT_LOADING;
+    gpu->cache_pending_layer[target] = layer;
+    gpu->cache_pending_expert[target] = expert_id;
+    gpu->cache_layer[target] = -1;  // not visible
+    gpu->cache_expert[target] = -1;
+
+    void *slot = (char *)gpu->d_expert_cache + (size_t)target * gpu->expert_slot_size;
+    cudaMemcpyAsync(slot, host_data, data_size, cudaMemcpyHostToDevice, stream);
+    cudaEventRecord(gpu->cache_ready_event[target], stream);
+    return slot;
+}
+
+// Poll all LOADING slots: promote to READY when their H2D event has completed.
+// This is the commit phase — call after cudaStreamSynchronize or event wait.
+void expert_cache_poll_ready(GPUState *gpu) {
+    if (!gpu->cache_state) return;
+    for (int s = 0; s < gpu->expert_cache_slots; s++) {
+        if (gpu->cache_state[s] != SLOT_LOADING) continue;
+        if (cudaEventQuery(gpu->cache_ready_event[s]) == cudaSuccess) {
+            gpu->cache_state[s] = SLOT_READY;
+            gpu->cache_layer[s] = gpu->cache_pending_layer[s];
+            gpu->cache_expert[s] = gpu->cache_pending_expert[s];
+            gpu->cache_lru[s] = ++gpu->cache_clock;
+            if (gpu->cache_hits) gpu->cache_hits[s] = 0;
+            gpu->cache_pending_layer[s] = -1;
+            gpu->cache_pending_expert[s] = -1;
+        }
+    }
+}
+
+// Wait for deferred slots to become READY.
+// Matches device_ptrs against cache slots. For any that are still LOADING,
+// waits on their events, then promotes them to READY.
+// After return: all matched slots are READY, compute_stream is safe to use them.
+void expert_cache_wait_until_ready(GPUState *gpu, void **device_ptrs, int n,
+                                   cudaStream_t compute_stream) {
+    if (!gpu->cache_state || n == 0) return;
+
+    // Find which slots correspond to the requested device pointers
+    // and collect those still in LOADING state
+    bool any_loading = false;
+    for (int i = 0; i < n; i++) {
+        if (!device_ptrs[i]) continue;
+        // Map device pointer back to slot index
+        ptrdiff_t offset = (char *)device_ptrs[i] - (char *)gpu->d_expert_cache;
+        if (offset < 0) continue;
+        int slot = (int)((size_t)offset / gpu->expert_slot_size);
+        if (slot < 0 || slot >= gpu->expert_cache_slots) continue;
+        if (gpu->cache_state[slot] == SLOT_LOADING) {
+            any_loading = true;
+            break;
+        }
+    }
+
+    if (!any_loading) return;
+
+    // Synchronize stream_io so all H2D ops complete on host side
+    cudaStreamSynchronize(gpu->stream_io);
+
+    // Now promote all LOADING slots that have completed
+    expert_cache_poll_ready(gpu);
+
+    // Make compute stream wait on stream_io to ensure device-side ordering
+    cudaEvent_t io_done;
+    cudaEventCreateWithFlags(&io_done, cudaEventDisableTiming);
+    cudaEventRecord(io_done, gpu->stream_io);
+    cudaStreamWaitEvent(compute_stream, io_done, 0);
+    cudaEventDestroy(io_done);
 }
 
 // ── SSM/Mamba forward for hybrid layers ──
@@ -437,6 +560,7 @@ static void forward_gdn_block(MnemoCudaCtx *ctx, int layer, int gpu_idx) {
 void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
     GPUState *gpu = &ctx->gpus[gpu_idx];
     cudaSetDevice(gpu->gpu_id);
+
     ModelConfig *cfg = &ctx->config;
     int H = cfg->hidden_size;
     int NH = cfg->num_attention_heads;
@@ -449,6 +573,7 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
     cudaStream_t cs = gpu->stream_compute;
 
     char tname[128];
+    double t0, t1;  // profiling timers
 
     // Detect if this is an attention layer or SSM layer (hybrid MoE+SSM models)
     // full_attention_interval=4 means layers 0,4,8,... have attention, rest are SSM
@@ -457,6 +582,7 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
         is_attention_layer = (layer % cfg->full_attention_interval == 0);
     }
 
+    t0 = now_ms();
     if (is_attention_layer) {
         // ── 1. Pre-attention RMS norm ──
         snprintf(tname, sizeof(tname), "blk.%d.attn_norm.weight", layer);
@@ -539,7 +665,15 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
         forward_gdn_block(ctx, layer, gpu_idx);
     }
 
+    // Profile: attention block done
+    if (ctx->profiling_enabled) {
+        cudaStreamSynchronize(cs);
+        t1 = now_ms();
+        ctx->prof_attn_ms += t1 - t0;
+    }
+
     // ── 8. Pre-FFN RMS norm ──
+    t0 = now_ms();
     snprintf(tname, sizeof(tname), "blk.%d.ffn_norm.weight", layer);
     void *ffn_norm_w = tensor_data_on_gpu(ctx, tname, gpu_idx);
     if (!ffn_norm_w) return;  // no FFN on this layer (pure SSM without MoE)
@@ -558,15 +692,21 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
     matvec(tensor_ptr_on_gpu(ctx, wr, gpu_idx),
            gpu->d_normed, gpu->d_router_out, NE, H, wr->type_id, cs);
 
-    // ── 10. Top-K expert selection (GPU — no explicit stream sync) ──
+    // ── 10. Top-K expert selection (GPU → async D2H via pinned memory) ──
     cuda_topk_softmax(gpu->d_router_out, gpu->d_expert_indices,
                       gpu->d_expert_weights, NE, K, cs);
-    int expert_indices[16];
-    float expert_weights_h[16];
-    cudaMemcpy(expert_indices, gpu->d_expert_indices, K * sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(expert_weights_h, gpu->d_expert_weights, K * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(gpu->h_expert_indices, gpu->d_expert_indices,
+                    K * sizeof(int), cudaMemcpyDeviceToHost, cs);
+    cudaMemcpyAsync(gpu->h_expert_weights, gpu->d_expert_weights,
+                    K * sizeof(float), cudaMemcpyDeviceToHost, cs);
+    cudaStreamSynchronize(cs);  // need results on host for classification
+    int *expert_indices = gpu->h_expert_indices;
+    float *expert_weights_h = gpu->h_expert_weights;
+    t1 = now_ms();
+    ctx->prof_router_ms += t1 - t0;
 
     // ── 11 + 12. Expert load (cache-first) + forward on GPU ──
+    t0 = now_ms();
     ExpertLayerFile *elf = &ctx->expert_layers[layer];
     if (elf->fd <= 0 && !elf->mmap_data) return;
 
@@ -615,14 +755,14 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
         }
 
         // Level 2: Prefetch buffer (pinned host, predicted)
+        // Deferred insert: H2D enqueued async, slot stays LOADING until wait
         void *prefetched = prefetch_lookup(gpu, layer, eid, expert_size);
         if (prefetched) {
             total_prefetch_hits++;
             total_hits++;
-            void *d = expert_cache_insert_ctx(ctx, gpu, layer, eid, prefetched,
-                                               expert_size, gpu->stream_io);
+            void *d = expert_cache_insert_deferred(ctx, gpu, layer, eid, prefetched,
+                                                    expert_size, gpu->stream_io);
             if (d) {
-                cudaStreamSynchronize(gpu->stream_io);
                 hit_ptrs[n_hits] = d;
                 hit_weights[n_hits++] = expert_weights_h[e];
             } else {
@@ -664,25 +804,32 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
                 total_lookups - total_hits,
                 total_lookups, 100.0 * total_hits / total_lookups);
 
-    // ── Upload RAM-hit experts to VRAM (fast: pinned → device DMA) ──
+    // ── Upload RAM-hit experts to VRAM (deferred: batched async H2D) ──
     for (int r = 0; r < n_ram_hits; r++) {
-        void *d = expert_cache_insert_ctx(ctx, gpu, layer, ram_hit_eids[r],
-                                           ram_hit_ptrs[r], expert_size, gpu->stream_io);
+        void *d = expert_cache_insert_deferred(ctx, gpu, layer, ram_hit_eids[r],
+                                                ram_hit_ptrs[r], expert_size, gpu->stream_io);
         if (d) {
-            cudaStreamSynchronize(gpu->stream_io);
             hit_ptrs[n_hits] = d;
             hit_weights[n_hits++] = ram_hit_weights[r];
         } else {
-            // VRAM full and all pinned — compute directly from device temp buffer
+            // VRAM full — use temp buffer with deferred sync
             cudaMemcpyAsync(gpu->d_expert_buf, ram_hit_ptrs[r], expert_size,
                             cudaMemcpyHostToDevice, gpu->stream_io);
-            cudaStreamSynchronize(gpu->stream_io);
             hit_ptrs[n_hits] = gpu->d_expert_buf;
             hit_weights[n_hits++] = ram_hit_weights[r];
         }
     }
 
+    // ── Wait for all deferred uploads to become READY ──
+    // Single sync point: waits only if any hit_ptrs are in LOADING state.
+    // After this call, all deferred slots are promoted to READY and
+    // compute_stream is safe to read from them.
+    expert_cache_wait_until_ready(gpu, hit_ptrs, n_hits, cs);
+    t1 = now_ms();
+    ctx->prof_cache_ms += t1 - t0;
+
     // ── Load NVMe misses: batch I/O in chunks of io_pool_size() ──
+    t0 = now_ms();
     if (n_misses > 0) {
         int pool_sz = io_pool_size();
         if (pool_sz < 1) pool_sz = 1;
@@ -723,18 +870,18 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
                     matvec((char *)d + gate_sz + up_sz, gpu->d_expert_act, gpu->d_expert_out, H, EFF, down_type_id, cs);
                     cuda_scaled_add(gpu->d_moe_out, gpu->d_expert_out, hit_weights[h], H, cs);
                 }
-                cudaStreamSynchronize(cs);
                 hits_computed = 1;
             }
 
-            // Wait for this batch
-            io_pool_wait(batch_n);
-
-            // Process loaded experts
-            for (int b = 0; b < batch_n; b++) {
+            // Process experts as they complete (overlap I/O of remaining with compute)
+            int processed[16] = {0};
+            for (int done_count = 0; done_count < batch_n; done_count++) {
+                int b = io_pool_wait_any(batch_n);
+                if (b < 0) break;
+                if (processed[b]) continue;
+                processed[b] = 1;
                 int i = batch_start + b;
 
-                // Skip experts with I/O errors
                 if (io_pool_task_error(b) != 0) {
                     LOG_ERROR("I/O error loading layer %d expert %d, skipping",
                             layer, miss_eids[i]);
@@ -790,6 +937,13 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
         }
     }
 
+    // Profile: expert I/O + compute done
+    if (ctx->profiling_enabled) {
+        cudaStreamSynchronize(cs);
+        t1 = now_ms();
+        ctx->prof_expert_ms += t1 - t0;
+    }
+
     // ── 12b. Start prefetching hot experts for NEXT layer (overlaps with GPU compute) ──
     {
         int next_layer = layer + 1;
@@ -822,6 +976,150 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
 
 }
 
+// ── Embedding lookup helper: GPU dequant if tensor is on GPU, else CPU fallback ──
+static int embed_token(MnemoCudaCtx *ctx, int token_id) {
+    ModelConfig *cfg = &ctx->config;
+    int H = cfg->hidden_size;
+    GPUState *gpu0 = &ctx->gpus[0];
+
+    TensorEntry *embd = tensor_get(ctx, "token_embd.weight");
+    if (!embd) { LOG_ERROR("Missing token_embd.weight"); return -1; }
+
+    int block_values, block_bytes_size;
+    switch (embd->type_id) {
+        case 11: block_values = 256; block_bytes_size = 110; break;
+        case 12: block_values = 256; block_bytes_size = 144; break;
+        case 14: block_values = 256; block_bytes_size = 210; break;
+        case 8:  block_values = 32;  block_bytes_size = 34; break;
+        default: block_values = 1; block_bytes_size = 4; break;
+    }
+    size_t row_bytes = (size_t)((H + block_values - 1) / block_values) * block_bytes_size;
+
+    // Try GPU-side dequant (embedding table is on GPU 0 as part of d_resident)
+    void *d_embd = tensor_ptr_on_gpu(ctx, embd, 0);
+    cudaSetDevice(gpu0->gpu_id);
+    if (d_embd) {
+        if (embd->type_id == 12) {
+            cuda_embedding_lookup_q4k(d_embd, gpu0->d_hidden,
+                                      token_id, H, (int)row_bytes, gpu0->stream_compute);
+            return 0;
+        } else if (embd->type_id == 11) {
+            cuda_embedding_lookup_q3k(d_embd, gpu0->d_hidden,
+                                      token_id, H, (int)row_bytes, gpu0->stream_compute);
+            return 0;
+        } else if (embd->type_id == 0) {
+            cudaMemcpyAsync(gpu0->d_hidden,
+                            (char *)d_embd + (size_t)token_id * H * sizeof(float),
+                            H * sizeof(float), cudaMemcpyDeviceToDevice, gpu0->stream_compute);
+            return 0;
+        }
+    }
+
+    // Fallback: CPU dequant + H2D (for types not yet supported on GPU)
+    size_t row_offset = (size_t)token_id * row_bytes;
+    const void *embd_row = (const char *)ctx->h_resident_mmap + embd->offset + row_offset;
+    float *h_hidden = (float *)malloc(H * sizeof(float));
+    if (!h_hidden) { LOG_ERROR("OOM: embedding buffer"); return -1; }
+
+    if (embd->type_id == 12) {
+        int blocks_per_row = (H + 255) / 256;
+        const uint8_t *raw = (const uint8_t *)embd_row;
+        for (int b = 0; b < blocks_per_row; b++) {
+            const uint8_t *blk = raw + b * 144;
+            uint16_t d_bits = *(const uint16_t *)blk;
+            uint16_t dmin_bits = *(const uint16_t *)(blk + 2);
+            float d, dmin;
+            { uint32_t exp = (d_bits & 0x7C00); uint32_t mant = (d_bits & 0x03FF);
+              uint32_t sign = (uint32_t)(d_bits & 0x8000) << 16; uint32_t t;
+              if (exp == 0) { if (mant == 0) t = sign;
+                else { float f = (float)mant / 1024.0f; f *= (1.0f / 16384.0f); memcpy(&t, &f, 4); t = (t & 0x7FFFFFFF) | sign; } }
+              else { t = sign | ((exp + 0x1C000) << 13) | (mant << 13); }
+              memcpy(&d, &t, 4); }
+            { uint32_t exp = (dmin_bits & 0x7C00); uint32_t mant = (dmin_bits & 0x03FF);
+              uint32_t sign = (uint32_t)(dmin_bits & 0x8000) << 16; uint32_t t;
+              if (exp == 0) { if (mant == 0) t = sign;
+                else { float f = (float)mant / 1024.0f; f *= (1.0f / 16384.0f); memcpy(&t, &f, 4); t = (t & 0x7FFFFFFF) | sign; } }
+              else { t = sign | ((exp + 0x1C000) << 13) | (mant << 13); }
+              memcpy(&dmin, &t, 4); }
+            const uint8_t *scales = blk + 4;
+            const uint8_t *qs = blk + 16;
+            int base = b * 256;
+            for (int j = 0; j < 256 && (base + j) < H; j += 64) {
+                int is = j / 32; uint8_t sc, m;
+                if (is < 4) { sc = scales[is] & 63; m = scales[is + 4] & 63; }
+                else { sc = (scales[is + 4] & 0xF) | ((scales[is - 4] >> 6) << 4);
+                       m = (scales[is + 4] >> 4) | ((scales[is] >> 6) << 4); }
+                float d1 = d * sc, m1 = dmin * m;
+                int qs_off = j / 2;
+                for (int l = 0; l < 32 && (base + j + l) < H; l++)
+                    h_hidden[base + j + l] = d1 * (qs[qs_off + l] & 0xF) - m1;
+                is++;
+                if (is < 4) { sc = scales[is] & 63; m = scales[is + 4] & 63; }
+                else { sc = (scales[is + 4] & 0xF) | ((scales[is - 4] >> 6) << 4);
+                       m = (scales[is + 4] >> 4) | ((scales[is] >> 6) << 4); }
+                float d2 = d * sc, m2 = dmin * m;
+                for (int l = 0; l < 32 && (base + j + 32 + l) < H; l++)
+                    h_hidden[base + j + 32 + l] = d2 * ((qs[qs_off + l] >> 4) & 0xF) - m2;
+            }
+        }
+    } else if (embd->type_id == 11) {
+        int blocks_per_row = (H + 255) / 256;
+        const uint8_t *raw = (const uint8_t *)embd_row;
+        for (int b = 0; b < blocks_per_row; b++) {
+            const uint8_t *blk = raw + b * 110;
+            const uint8_t *hmask = blk; const uint8_t *qs = blk + 32;
+            const uint8_t *scales_raw = blk + 96;
+            uint16_t d_bits = *(const uint16_t *)(blk + 108);
+            float d_all;
+            { uint32_t t = ((uint32_t)(d_bits & 0x8000) << 16) |
+                           (((uint32_t)(d_bits & 0x7C00) + 0x1C000) << 13) |
+                           ((uint32_t)(d_bits & 0x03FF) << 13);
+              memcpy(&d_all, &t, 4); }
+            int8_t sc16[16];
+            for (int i = 0; i < 8; i++) {
+                sc16[i]     = (int8_t)((scales_raw[i] & 0xF) | (((scales_raw[8 + (i >> 2)] >> (2 * (i & 3))) & 3) << 4)) - 32;
+                sc16[i + 8] = (int8_t)((scales_raw[i] >> 4)  | (((scales_raw[8 + (i >> 2)] >> (2 * (i & 3) + 4)) & 3) << 4)) - 32;
+            }
+            int base = b * 256;
+            const uint8_t *q = qs; int is = 0; uint8_t mm = 1; int val_idx = 0;
+            for (int chunk = 0; chunk < 2; chunk++) {
+                int shift = 0;
+                for (int grp = 0; grp < 4; grp++) {
+                    float dl = d_all * sc16[is++];
+                    for (int l = 0; l < 16; l++) {
+                        if (base + val_idx < H) {
+                            int8_t q2 = (q[l] >> shift) & 3;
+                            int8_t val = q2 - ((hmask[l] & mm) ? 0 : 4);
+                            h_hidden[base + val_idx] = dl * val;
+                        }
+                        val_idx++;
+                    }
+                    float dl2 = d_all * sc16[is++];
+                    for (int l = 0; l < 16; l++) {
+                        if (base + val_idx < H) {
+                            int8_t q2 = (q[l + 16] >> shift) & 3;
+                            int8_t val = q2 - ((hmask[l + 16] & mm) ? 0 : 4);
+                            h_hidden[base + val_idx] = dl2 * val;
+                        }
+                        val_idx++;
+                    }
+                    shift += 2; mm <<= 1;
+                }
+                q += 32;
+            }
+        }
+    } else if (embd->type_id == 0) {
+        memcpy(h_hidden, embd_row, H * sizeof(float));
+    } else {
+        memset(h_hidden, 0, H * sizeof(float));
+    }
+
+    cudaMemcpyAsync(gpu0->d_hidden, h_hidden, H * sizeof(float),
+                    cudaMemcpyHostToDevice, gpu0->stream_compute);
+    free(h_hidden);
+    return 0;
+}
+
 // ── Full forward pass: embedding → layers → lm_head ──
 
 int forward_pass(MnemoCudaCtx *ctx, int token_id, int pos, float *h_logits) {
@@ -835,194 +1133,48 @@ int forward_pass(MnemoCudaCtx *ctx, int token_id, int pos, float *h_logits) {
         return -4;
     }
 
-    // ── 1. Token embedding lookup ──
-    TensorEntry *embd = tensor_get(ctx, "token_embd.weight");
-    if (!embd) { LOG_ERROR("Missing token_embd.weight"); return -1; }
+    // Reset per-token profiling accumulators
+    ctx->prof_attn_ms = 0;
+    ctx->prof_router_ms = 0;
+    ctx->prof_cache_ms = 0;
+    ctx->prof_expert_ms = 0;
+    ctx->prof_io_ms = 0;
+    ctx->prof_handoff_ms = 0;
 
-    // Embedding is quantized — extract one row on host, then upload
-    // Row size depends on quant type
-    // For Q4_K: block_size = 256 values, block_bytes = sizeof(BlockQ4K) = 144
-    // Row bytes = (H / 256) * 144
-    int block_values, block_bytes_size;
-    switch (embd->type_id) {
-        case 11: block_values = 256; block_bytes_size = 110; break; // Q3_K
-        case 12: block_values = 256; block_bytes_size = 144; break; // Q4_K
-        case 14: block_values = 256; block_bytes_size = 210; break; // Q6_K
-        case 8:  block_values = 32;  block_bytes_size = 34; break;  // Q8_0
-        default: block_values = 1; block_bytes_size = 4; break;     // F32
-    }
-
-    size_t row_bytes = (size_t)((H + block_values - 1) / block_values) * block_bytes_size;
-    size_t row_offset = (size_t)token_id * row_bytes;
-
-    // Upload embedding row to GPU 0 and dequant via matvec with identity
-    // Actually: for embedding lookup, we need a dequant kernel, not matvec.
-    // Simpler approach: dequant on host, upload float vector.
-    const void *embd_row = (const char *)ctx->h_resident_mmap + embd->offset + row_offset;
-
-    // Host-side dequant of one embedding row
-    float *h_hidden = (float *)malloc(H * sizeof(float));
-
-    if (embd->type_id == 12) {
-        // Q4_K dequant
-        int blocks_per_row = (H + 255) / 256;
-        const uint8_t *raw = (const uint8_t *)embd_row;
-        for (int b = 0; b < blocks_per_row; b++) {
-            // BlockQ4K: [d:2][dmin:2][scales:12][qs:128] = 144 bytes
-            const uint8_t *blk = raw + b * 144;
-            uint16_t d_bits = *(const uint16_t *)blk;
-            uint16_t dmin_bits = *(const uint16_t *)(blk + 2);
-            // f16 → f32 (handles denormals correctly)
-            float d, dmin;
-            { uint32_t exp = (d_bits & 0x7C00);
-              uint32_t mant = (d_bits & 0x03FF);
-              uint32_t sign = (uint32_t)(d_bits & 0x8000) << 16;
-              uint32_t t;
-              if (exp == 0) {
-                  if (mant == 0) { t = sign; }
-                  else { float f = (float)mant / 1024.0f; f *= (1.0f / 16384.0f); memcpy(&t, &f, 4); t = (t & 0x7FFFFFFF) | sign; }
-              } else {
-                  t = sign | ((exp + 0x1C000) << 13) | (mant << 13);
-              }
-              memcpy(&d, &t, 4); }
-            { uint32_t exp = (dmin_bits & 0x7C00);
-              uint32_t mant = (dmin_bits & 0x03FF);
-              uint32_t sign = (uint32_t)(dmin_bits & 0x8000) << 16;
-              uint32_t t;
-              if (exp == 0) {
-                  if (mant == 0) { t = sign; }
-                  else { float f = (float)mant / 1024.0f; f *= (1.0f / 16384.0f); memcpy(&t, &f, 4); t = (t & 0x7FFFFFFF) | sign; }
-              } else {
-                  t = sign | ((exp + 0x1C000) << 13) | (mant << 13);
-              }
-              memcpy(&dmin, &t, 4); }
-
-            const uint8_t *scales = blk + 4;
-            const uint8_t *qs = blk + 16;
-            int base = b * 256;
-
-            for (int j = 0; j < 256 && (base + j) < H; j += 64) {
-                int is = j / 32;  // scale index (0..7 across the 256-value block)
-                uint8_t sc, m;
-                // get_scale_min_k4: use is directly (NOT is/2)
-                if (is < 4) {
-                    sc = scales[is] & 63;
-                    m = scales[is + 4] & 63;
-                } else {
-                    sc = (scales[is + 4] & 0xF) | ((scales[is - 4] >> 6) << 4);
-                    m = (scales[is + 4] >> 4) | ((scales[is] >> 6) << 4);
-                }
-
-                float d1 = d * sc, m1 = dmin * m;
-                // First 32 values: LOW nibbles of qs[qs_off..qs_off+31]
-                int qs_off = j / 2;
-                for (int l = 0; l < 32 && (base + j + l) < H; l++) {
-                    uint8_t q_val = qs[qs_off + l] & 0xF;
-                    h_hidden[base + j + l] = d1 * q_val - m1;
-                }
-
-                // Second half of the 64-block: HIGH nibbles of SAME bytes
-                is++;
-                if (is < 4) {
-                    sc = scales[is] & 63;
-                    m = scales[is + 4] & 63;
-                } else {
-                    sc = (scales[is + 4] & 0xF) | ((scales[is - 4] >> 6) << 4);
-                    m = (scales[is + 4] >> 4) | ((scales[is] >> 6) << 4);
-                }
-                float d2 = d * sc, m2 = dmin * m;
-                for (int l = 0; l < 32 && (base + j + 32 + l) < H; l++) {
-                    uint8_t q_val = (qs[qs_off + l] >> 4) & 0xF;
-                    h_hidden[base + j + 32 + l] = d2 * q_val - m2;
-                }
-            }
-        }
-    } else if (embd->type_id == 11) {
-        // Q3_K dequant: [hmask:32][qs:64][scales:12][d:2] = 110 bytes per block of 256
-        int blocks_per_row = (H + 255) / 256;
-        const uint8_t *raw = (const uint8_t *)embd_row;
-        for (int b = 0; b < blocks_per_row; b++) {
-            const uint8_t *blk = raw + b * 110;
-            const uint8_t *hmask = blk;       // 32 bytes
-            const uint8_t *qs = blk + 32;     // 64 bytes
-            const uint8_t *scales_raw = blk + 96; // 12 bytes
-            uint16_t d_bits = *(const uint16_t *)(blk + 108);
-            float d_all;
-            { uint32_t t = ((uint32_t)(d_bits & 0x8000) << 16) |
-                           (((uint32_t)(d_bits & 0x7C00) + 0x1C000) << 13) |
-                           ((uint32_t)(d_bits & 0x03FF) << 13);
-              memcpy(&d_all, &t, 4); }
-
-            // Decode 6-bit packed scales → 16 int8 values
-            int8_t sc16[16];
-            for (int i = 0; i < 8; i++) {
-                sc16[i]     = (int8_t)((scales_raw[i] & 0xF) | (((scales_raw[8 + (i >> 2)] >> (2 * (i & 3))) & 3) << 4)) - 32;
-                sc16[i + 8] = (int8_t)((scales_raw[i] >> 4)  | (((scales_raw[8 + (i >> 2)] >> (2 * (i & 3) + 4)) & 3) << 4)) - 32;
-            }
-
-            int base = b * 256;
-            const uint8_t *q = qs;
-            int is = 0;
-            uint8_t m = 1;
-            int val_idx = 0;
-
-            for (int chunk = 0; chunk < 2; chunk++) {
-                int shift = 0;
-                for (int grp = 0; grp < 4; grp++) {
-                    float dl = d_all * sc16[is++];
-                    for (int l = 0; l < 16; l++) {
-                        if (base + val_idx < H) {
-                            int8_t q2 = (q[l] >> shift) & 3;
-                            int8_t val = q2 - ((hmask[l] & m) ? 0 : 4);
-                            h_hidden[base + val_idx] = dl * val;
-                        }
-                        val_idx++;
-                    }
-                    float dl2 = d_all * sc16[is++];
-                    for (int l = 0; l < 16; l++) {
-                        if (base + val_idx < H) {
-                            int8_t q2 = (q[l + 16] >> shift) & 3;
-                            int8_t val = q2 - ((hmask[l + 16] & m) ? 0 : 4);
-                            h_hidden[base + val_idx] = dl2 * val;
-                        }
-                        val_idx++;
-                    }
-                    shift += 2;
-                    m <<= 1;
-                }
-                q += 32;
-            }
-        }
-    } else if (embd->type_id == 0) {
-        // F32 — direct copy
-        memcpy(h_hidden, embd_row, H * sizeof(float));
-    } else {
-        // Fallback: zero (shouldn't happen)
-        memset(h_hidden, 0, H * sizeof(float));
-    }
-
-    // Upload to GPU 0
-    GPUState *gpu0 = &ctx->gpus[0];
-    cudaSetDevice(gpu0->gpu_id);
-    cudaMemcpyAsync(gpu0->d_hidden, h_hidden, H * sizeof(float),
-                    cudaMemcpyHostToDevice, gpu0->stream_compute);
-    free(h_hidden);
+    // ── 1. Token embedding lookup (GPU dequant or CPU fallback) ──
+    int embd_rc = embed_token(ctx, token_id);
+    if (embd_rc != 0) return embd_rc;
 
     // ── 2. Layer loop (multi-GPU pipeline) ──
+    // Uses async D2H + event + async H2D to avoid blocking the host thread
+    // between GPUs. The pinned h_hidden_transfer buffer enables DMA overlap.
     for (int g = 0; g < ctx->n_gpus; g++) {
         GPUState *gpu = &ctx->gpus[g];
         cudaSetDevice(gpu->gpu_id);
 
         // If not first GPU, transfer hidden state from previous GPU
         if (g > 0) {
+            double th0 = now_ms();
             GPUState *prev = &ctx->gpus[g - 1];
-            // prev GPU → pinned host → this GPU
-            cudaSetDevice(prev->gpu_id);
-            cudaMemcpy(ctx->h_hidden_transfer, prev->d_hidden, H * sizeof(float),
-                       cudaMemcpyDeviceToHost);
-            cudaSetDevice(gpu->gpu_id);
-            cudaMemcpyAsync(gpu->d_hidden, ctx->h_hidden_transfer, H * sizeof(float),
-                            cudaMemcpyHostToDevice, gpu->stream_compute);
+
+            if (ctx->p2p_enabled[g - 1][g]) {
+                // Direct GPU-to-GPU via P2P (NVLink/PCIe)
+                cudaSetDevice(gpu->gpu_id);
+                cudaMemcpyPeerAsync(gpu->d_hidden, gpu->gpu_id,
+                                    prev->d_hidden, prev->gpu_id,
+                                    H * sizeof(float), gpu->stream_compute);
+                cudaStreamSynchronize(gpu->stream_compute);
+            } else {
+                // Fallback: D2H → pinned host → H2D
+                cudaSetDevice(prev->gpu_id);
+                cudaMemcpy(ctx->h_hidden_transfer, prev->d_hidden,
+                           H * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaSetDevice(gpu->gpu_id);
+                cudaMemcpyAsync(gpu->d_hidden, ctx->h_hidden_transfer,
+                                H * sizeof(float), cudaMemcpyHostToDevice,
+                                gpu->stream_compute);
+            }
+            ctx->prof_handoff_ms += now_ms() - th0;
         }
 
         // Run all layers owned by this GPU
@@ -1057,6 +1209,171 @@ int forward_pass(MnemoCudaCtx *ctx, int token_id, int pos, float *h_logits) {
         LOG_ERROR("CUDA error before logits copy: %s", cudaGetErrorString(err));
     cudaMemcpy(h_logits, last_gpu->d_logits, V * sizeof(float), cudaMemcpyDeviceToHost);
 
+    // Emit per-token profiling summary (every 5th token to reduce noise)
+    ctx->prof_token_count++;
+    if (ctx->prof_token_count <= 3 || ctx->prof_token_count % 5 == 0) {
+        double total = ctx->prof_attn_ms + ctx->prof_router_ms +
+                       ctx->prof_cache_ms + ctx->prof_expert_ms + ctx->prof_handoff_ms;
+        LOG_INFO("PROF token=%d total=%.0fms attn=%.0f(%.0f%%) router=%.0f(%.0f%%) "
+                 "cache=%.0f(%.0f%%) expert=%.0f(%.0f%%) handoff=%.0f(%.0f%%)",
+                 ctx->prof_token_count, total,
+                 ctx->prof_attn_ms, 100.0 * ctx->prof_attn_ms / (total > 0 ? total : 1),
+                 ctx->prof_router_ms, 100.0 * ctx->prof_router_ms / (total > 0 ? total : 1),
+                 ctx->prof_cache_ms, 100.0 * ctx->prof_cache_ms / (total > 0 ? total : 1),
+                 ctx->prof_expert_ms, 100.0 * ctx->prof_expert_ms / (total > 0 ? total : 1),
+                 ctx->prof_handoff_ms, 100.0 * ctx->prof_handoff_ms / (total > 0 ? total : 1));
+    }
+
+    return 0;
+}
+
+// ── Forward pass with GPU-side sampling (no logits D2H) ──
+
+int forward_pass_sample(MnemoCudaCtx *ctx, int token_id, int pos,
+                        float temperature, float top_p, uint64_t rng_state,
+                        int *out_token) {
+    ModelConfig *cfg = &ctx->config;
+    int H = cfg->hidden_size;
+    int V = cfg->vocab_size;
+
+    if (pos >= cfg->max_position_embeddings) {
+        LOG_ERROR("pos %d exceeds context length %d", pos, cfg->max_position_embeddings);
+        return -4;
+    }
+
+    // Reset per-token profiling
+    ctx->prof_attn_ms = ctx->prof_router_ms = ctx->prof_cache_ms = 0;
+    ctx->prof_expert_ms = ctx->prof_io_ms = ctx->prof_handoff_ms = 0;
+
+    // ── 1. Token embedding lookup ──
+    int embd_rc = embed_token(ctx, token_id);
+    if (embd_rc != 0) return embd_rc;
+
+    // ── 2. Layer loop ──
+    for (int g = 0; g < ctx->n_gpus; g++) {
+        GPUState *gpu = &ctx->gpus[g];
+        cudaSetDevice(gpu->gpu_id);
+        if (g > 0) {
+            GPUState *prev = &ctx->gpus[g - 1];
+            double th0 = now_ms();
+            if (ctx->p2p_enabled[g - 1][g]) {
+                cudaSetDevice(gpu->gpu_id);
+                cudaMemcpyPeerAsync(gpu->d_hidden, gpu->gpu_id,
+                                    prev->d_hidden, prev->gpu_id,
+                                    H * sizeof(float), gpu->stream_compute);
+                cudaStreamSynchronize(gpu->stream_compute);
+            } else {
+                cudaSetDevice(prev->gpu_id);
+                cudaMemcpy(ctx->h_hidden_transfer, prev->d_hidden,
+                           H * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaSetDevice(gpu->gpu_id);
+                cudaMemcpyAsync(gpu->d_hidden, ctx->h_hidden_transfer,
+                                H * sizeof(float), cudaMemcpyHostToDevice,
+                                gpu->stream_compute);
+            }
+            ctx->prof_handoff_ms += now_ms() - th0;
+        }
+        for (int layer = gpu->layer_start; layer < gpu->layer_end; layer++)
+            forward_layer(ctx, layer, g, pos);
+    }
+
+    // ── 3. Final RMS norm + LM head + GPU sampling ──
+    int last_g = ctx->n_gpus - 1;
+    GPUState *last_gpu = &ctx->gpus[last_g];
+    cudaSetDevice(last_gpu->gpu_id);
+    cudaStream_t cs = last_gpu->stream_compute;
+
+    TensorEntry *out_norm = tensor_get(ctx, "output_norm.weight");
+    if (out_norm) {
+        void *norm_w = tensor_ptr_on_gpu(ctx, out_norm, last_g);
+        cuda_rms_norm(last_gpu->d_hidden, (float *)norm_w, last_gpu->d_normed,
+                      H, cfg->rms_norm_eps, cs);
+    }
+
+    TensorEntry *lm_head_t = tensor_get(ctx, "output.weight");
+    if (lm_head_t && last_gpu->d_logits) {
+        void *lm_w = tensor_ptr_on_gpu(ctx, lm_head_t, last_g);
+        matvec(lm_w, last_gpu->d_normed, last_gpu->d_logits,
+               V, H, lm_head_t->type_id, cs);
+    }
+
+    // Sample on GPU — only 4 bytes D2H instead of V*4
+    cuda_sample_token(last_gpu->d_logits, V, temperature, top_p,
+                      rng_state, last_gpu->d_sampled_token, cs);
+    cudaMemcpyAsync(last_gpu->h_sampled_token, last_gpu->d_sampled_token,
+                    sizeof(int), cudaMemcpyDeviceToHost, cs);
+    cudaStreamSynchronize(cs);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        LOG_ERROR("CUDA error in forward_pass_sample: %s", cudaGetErrorString(err));
+
+    *out_token = *last_gpu->h_sampled_token;
+
+    // Profiling
+    ctx->prof_token_count++;
+    if (ctx->profiling_enabled && (ctx->prof_token_count <= 3 || ctx->prof_token_count % 5 == 0)) {
+        double total = ctx->prof_attn_ms + ctx->prof_router_ms +
+                       ctx->prof_cache_ms + ctx->prof_expert_ms + ctx->prof_handoff_ms;
+        LOG_INFO("PROF token=%d total=%.0fms attn=%.0f(%.0f%%) router=%.0f(%.0f%%) "
+                 "cache=%.0f(%.0f%%) expert=%.0f(%.0f%%) handoff=%.0f(%.0f%%)",
+                 ctx->prof_token_count, total,
+                 ctx->prof_attn_ms, 100.0 * ctx->prof_attn_ms / (total > 0 ? total : 1),
+                 ctx->prof_router_ms, 100.0 * ctx->prof_router_ms / (total > 0 ? total : 1),
+                 ctx->prof_cache_ms, 100.0 * ctx->prof_cache_ms / (total > 0 ? total : 1),
+                 ctx->prof_expert_ms, 100.0 * ctx->prof_expert_ms / (total > 0 ? total : 1),
+                 ctx->prof_handoff_ms, 100.0 * ctx->prof_handoff_ms / (total > 0 ? total : 1));
+    }
+
+    return 0;
+}
+
+// ── Forward pass without lm_head (prefill optimization) ──
+
+int forward_pass_no_logits(MnemoCudaCtx *ctx, int token_id, int pos) {
+    ModelConfig *cfg = &ctx->config;
+    int H = cfg->hidden_size;
+
+    if (pos >= cfg->max_position_embeddings) {
+        LOG_ERROR("pos %d exceeds context length %d", pos, cfg->max_position_embeddings);
+        return -4;
+    }
+
+    ctx->prof_attn_ms = ctx->prof_router_ms = ctx->prof_cache_ms = 0;
+    ctx->prof_expert_ms = ctx->prof_io_ms = ctx->prof_handoff_ms = 0;
+
+    // ── 1. Token embedding lookup ──
+    int embd_rc = embed_token(ctx, token_id);
+    if (embd_rc != 0) return embd_rc;
+
+    // ── 2. Layer loop ──
+    for (int g = 0; g < ctx->n_gpus; g++) {
+        GPUState *gpu = &ctx->gpus[g];
+        cudaSetDevice(gpu->gpu_id);
+        if (g > 0) {
+            GPUState *prev = &ctx->gpus[g - 1];
+            double th0 = now_ms();
+            if (ctx->p2p_enabled[g - 1][g]) {
+                cudaSetDevice(gpu->gpu_id);
+                cudaMemcpyPeerAsync(gpu->d_hidden, gpu->gpu_id,
+                                    prev->d_hidden, prev->gpu_id,
+                                    H * sizeof(float), gpu->stream_compute);
+                cudaStreamSynchronize(gpu->stream_compute);
+            } else {
+                cudaSetDevice(prev->gpu_id);
+                cudaMemcpy(ctx->h_hidden_transfer, prev->d_hidden,
+                           H * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaSetDevice(gpu->gpu_id);
+                cudaMemcpyAsync(gpu->d_hidden, ctx->h_hidden_transfer,
+                                H * sizeof(float), cudaMemcpyHostToDevice,
+                                gpu->stream_compute);
+            }
+            ctx->prof_handoff_ms += now_ms() - th0;
+        }
+        for (int layer = gpu->layer_start; layer < gpu->layer_end; layer++)
+            forward_layer(ctx, layer, g, pos);
+    }
+
+    // Skip lm_head entirely — no logits needed during prefill
     return 0;
 }
 

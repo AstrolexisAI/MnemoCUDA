@@ -21,12 +21,33 @@
 #include <arpa/inet.h>
 #include <time.h>
 #include <stdint.h>
+#include <pthread.h>
 #include "engine.h"
+#include "json_helpers.h"
 #include "log.h"
 
 static volatile int running = 1;
 static volatile int generating = 0;
 static uint64_t request_counter = 0;
+
+// ── Request queue for decoupling accept from generation ──
+
+#define REQUEST_QUEUE_SIZE 8
+
+typedef struct {
+    char *prompt;
+    int max_tokens;
+    float temperature;
+    int stream;
+    int raw_prompt;
+    int client_fd;
+    uint64_t req_id;
+} QueuedRequest;
+
+static QueuedRequest request_queue[REQUEST_QUEUE_SIZE];
+static int queue_head = 0, queue_tail = 0, queue_count = 0;
+static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t queue_not_empty = PTHREAD_COND_INITIALIZER;
 
 static void sigint_handler(int sig) {
     (void)sig;
@@ -44,7 +65,7 @@ typedef struct {
     int buf_cap;
 } OutputCtx;
 
-static char *json_escape(const char *src, int len);  // forward decl
+// json_escape provided by json_helpers.h
 
 static void on_token(const char *text, bool is_done, void *userdata) {
     OutputCtx *out = (OutputCtx *)userdata;
@@ -228,7 +249,7 @@ static void http_respond_cors_preflight(int fd) {
         "HTTP/1.1 204 No Content\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: Content-Type\r\n"
+        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
         "Access-Control-Max-Age: 86400\r\n"
         "Connection: close\r\n\r\n";
     write(fd, resp, strlen(resp));
@@ -298,127 +319,81 @@ static char *http_read_request(int fd, char **body_out, int *body_len_out) {
     return buf;
 }
 
-// Extract a JSON string value for a given key from a flat JSON object.
-// Handles basic escapes (\", \\, \n, \t, \/, \uXXXX).
-// Returns dynamically allocated string, or NULL if key not found.
-static char *json_extract_string(const char *json, const char *key) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(json, pattern);
-    if (!p) return NULL;
-    p += strlen(pattern);
-    while (*p == ' ' || *p == ':' || *p == '\t') p++;
-    if (*p != '"') return NULL;
-    p++;  // skip opening quote
+// ── HTTP server mode ──
 
-    // Estimate max output size (input length is safe upper bound)
-    int cap = strlen(p) + 1;
-    char *out = malloc(cap);
-    if (!out) return NULL;
+// ── Worker thread: dequeues and processes requests ──
 
-    int i = 0;
-    while (*p && *p != '"' && i < cap - 1) {
-        if (*p == '\\' && *(p + 1)) {
-            p++;
-            switch (*p) {
-                case '"':  out[i++] = '"'; break;
-                case '\\': out[i++] = '\\'; break;
-                case 'n':  out[i++] = '\n'; break;
-                case 't':  out[i++] = '\t'; break;
-                case 'r':  out[i++] = '\r'; break;
-                case '/':  out[i++] = '/'; break;
-                case 'u': {
-                    unsigned cp = 0;
-                    for (int j = 0; j < 4 && p[1 + j]; j++) {
-                        char c = p[1 + j];
-                        cp = cp * 16 + (c >= 'a' ? c - 'a' + 10 :
-                                        c >= 'A' ? c - 'A' + 10 : c - '0');
-                    }
-                    p += 4;
-                    // UTF-8 encode
-                    if (cp < 0x80) {
-                        out[i++] = (char)cp;
-                    } else if (cp < 0x800) {
-                        out[i++] = (char)(0xC0 | (cp >> 6));
-                        out[i++] = (char)(0x80 | (cp & 0x3F));
-                    } else {
-                        out[i++] = (char)(0xE0 | (cp >> 12));
-                        out[i++] = (char)(0x80 | ((cp >> 6) & 0x3F));
-                        out[i++] = (char)(0x80 | (cp & 0x3F));
-                    }
-                    break;
-                }
-                default: out[i++] = *p; break;
+static void *worker_thread(void *arg) {
+    MnemoCudaCtx *ctx = (MnemoCudaCtx *)arg;
+    OutputCtx out = { .fd = -1, .streaming = 0, .buf = malloc(65536), .buf_len = 0, .buf_cap = 65536 };
+
+    while (running) {
+        pthread_mutex_lock(&queue_mutex);
+        while (queue_count == 0 && running)
+            pthread_cond_wait(&queue_not_empty, &queue_mutex);
+        if (!running && queue_count == 0) {
+            pthread_mutex_unlock(&queue_mutex);
+            break;
+        }
+        QueuedRequest req = request_queue[queue_head];
+        queue_head = (queue_head + 1) % REQUEST_QUEUE_SIZE;
+        queue_count--;
+        pthread_mutex_unlock(&queue_mutex);
+
+        generating = 1;
+
+        if (req.stream) {
+            const char *hdr = "HTTP/1.1 200 OK\r\n"
+                              "Content-Type: text/event-stream; charset=utf-8\r\n"
+                              "Cache-Control: no-cache\r\n"
+                              "Access-Control-Allow-Origin: *\r\n"
+                              "Connection: close\r\n\r\n";
+            write(req.client_fd, hdr, strlen(hdr));
+            out.fd = req.client_fd;
+            int rc = generate(ctx, req.prompt, req.temperature, req.max_tokens, req.raw_prompt, &out, req.req_id);
+            out.fd = -1;
+            if (rc != 0) {
+                char err_evt[256];
+                int n = snprintf(err_evt, sizeof(err_evt),
+                    "data: {\"error\":\"generation failed (code %d)\",\"done\":true}\n\n", rc);
+                write(req.client_fd, err_evt, n);
             }
         } else {
-            out[i++] = *p;
-        }
-        p++;
-    }
-    out[i] = '\0';
-    return out;
-}
+            out.fd = -1;
+            int rc = generate(ctx, req.prompt, req.temperature, req.max_tokens, req.raw_prompt, &out, req.req_id);
 
-static int json_extract_int(const char *json, const char *key, int def) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(json, pattern);
-    if (!p) return def;
-    p += strlen(pattern);
-    while (*p == ' ' || *p == ':' || *p == '\t') p++;
-    return atoi(p);
-}
-
-static float json_extract_float(const char *json, const char *key, float def) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(json, pattern);
-    if (!p) return def;
-    p += strlen(pattern);
-    while (*p == ' ' || *p == ':' || *p == '\t') p++;
-    return (float)atof(p);
-}
-
-static int json_extract_bool(const char *json, const char *key, int def) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(json, pattern);
-    if (!p) return def;
-    p += strlen(pattern);
-    while (*p == ' ' || *p == ':' || *p == '\t') p++;
-    if (strncmp(p, "true", 4) == 0) return 1;
-    if (strncmp(p, "false", 5) == 0) return 0;
-    return def;
-}
-
-// Escape a string for JSON output. Returns malloc'd buffer.
-static char *json_escape(const char *src, int len) {
-    int cap = len * 6 + 1;  // worst case: every byte is \u00XX (6 chars each)
-    char *out = malloc(cap);
-    if (!out) return NULL;
-    int j = 0;
-    for (int i = 0; i < len; i++) {
-        switch (src[i]) {
-            case '"':  out[j++] = '\\'; out[j++] = '"'; break;
-            case '\\': out[j++] = '\\'; out[j++] = '\\'; break;
-            case '\n': out[j++] = '\\'; out[j++] = 'n'; break;
-            case '\t': out[j++] = '\\'; out[j++] = 't'; break;
-            case '\r': out[j++] = '\\'; out[j++] = 'r'; break;
-            case '\b': out[j++] = '\\'; out[j++] = 'b'; break;
-            case '\f': out[j++] = '\\'; out[j++] = 'f'; break;
-            default:
-                if ((unsigned char)src[i] < 0x20) {
-                    j += snprintf(out + j, 7, "\\u%04x", (unsigned char)src[i]);
+            if (rc != 0) {
+                int http_code = (rc == MNEMO_ERR_TOKENIZER) ? 503 : 500;
+                char msg[256];
+                snprintf(msg, sizeof(msg), "Generation failed: %s (code %d)",
+                         mnemo_cuda_strerror(rc), rc);
+                http_respond_error(req.client_fd, http_code, msg);
+            } else {
+                MnemoCudaStats stats = mnemo_cuda_get_stats(ctx);
+                char *escaped = json_escape(out.buf, out.buf_len);
+                if (!escaped) {
+                    http_respond_error(req.client_fd, 500, "Internal Server Error");
                 } else {
-                    out[j++] = src[i];
+                    int resp_cap = strlen(escaped) + 128;
+                    char *response = malloc(resp_cap);
+                    int rlen = snprintf(response, resp_cap,
+                        "{\"text\":\"%s\",\"tokens\":%d,\"tok_per_sec\":%.1f}",
+                        escaped, stats.tokens_generated, stats.tokens_per_second);
+                    http_respond_json(req.client_fd, response, rlen);
+                    free(response);
+                    free(escaped);
                 }
+            }
         }
-    }
-    out[j] = '\0';
-    return out;
-}
 
-// ── HTTP server mode ──
+        generating = 0;
+        free(req.prompt);
+        close(req.client_fd);
+    }
+
+    free(out.buf);
+    return NULL;
+}
 
 static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
                      const char *auth_token) {
@@ -444,6 +419,10 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
 
     LOG_INFO("HTTP server on %s:%d", bind_addr, port);
     LOG_INFO("POST /v1/completions to generate");
+
+    // Start worker thread for request processing
+    pthread_t worker;
+    pthread_create(&worker, NULL, worker_thread, ctx);
 
     OutputCtx out = { .fd = -1, .buf = malloc(65536), .buf_len = 0, .buf_cap = 65536 };
 
@@ -614,13 +593,6 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
             free(req); close(client_fd);
             continue;
         }
-        // Reject if already processing a request
-        if (generating) {
-            http_respond_error(client_fd, 503, "Server busy - generation in progress");
-            free(req); close(client_fd);
-            continue;
-        }
-
         if (!body || body_len == 0) {
             http_respond_error(client_fd, 400, "Empty body");
             free(req); close(client_fd);
@@ -643,68 +615,37 @@ static void run_http(MnemoCudaCtx *ctx, int port, const char *bind_addr,
         if (max_tokens <= 0) max_tokens = 256;
         if (max_tokens > 32768) max_tokens = 32768;
 
-        // raw_prompt is now passed through to mnemo_cuda_generate
-
-        generating = 1;
-        uint64_t req_id = ++request_counter;
-
-        if (stream) {
-            const char *hdr = "HTTP/1.1 200 OK\r\n"
-                              "Content-Type: text/event-stream; charset=utf-8\r\n"
-                              "Cache-Control: no-cache\r\n"
-                              "Access-Control-Allow-Origin: *\r\n"
-                              "Connection: close\r\n\r\n";
-            write(client_fd, hdr, strlen(hdr));
-            out.fd = client_fd;
-            int rc = generate(ctx, prompt, temperature, max_tokens, raw_prompt, &out, req_id);
-            out.fd = -1;
-            if (rc != 0) {
-                // Emit SSE error event before closing
-                char err_evt[256];
-                int n = snprintf(err_evt, sizeof(err_evt),
-                    "data: {\"error\":\"generation failed (code %d)\",\"done\":true}\n\n", rc);
-                write(client_fd, err_evt, n);
-            }
-        } else {
-            out.fd = -1;
-            int rc = generate(ctx, prompt, temperature, max_tokens, raw_prompt, &out, req_id);
-
-            if (rc != 0) {
-                int http_code = (rc == MNEMO_ERR_TOKENIZER) ? 503 : 500;
-                char msg[256];
-                snprintf(msg, sizeof(msg), "Generation failed: %s (code %d)",
-                         mnemo_cuda_strerror(rc), rc);
-                http_respond_error(client_fd, http_code, msg);
-                generating = 0;
-                free(prompt); free(req); close(client_fd);
-                continue;
-            }
-
-            MnemoCudaStats stats = mnemo_cuda_get_stats(ctx);
-            char *escaped = json_escape(out.buf, out.buf_len);
-            if (!escaped) {
-                http_respond_error(client_fd, 500, "Internal Server Error");
-                generating = 0;
-                free(prompt); free(req); close(client_fd);
-                continue;
-            }
-
-            int resp_cap = strlen(escaped) + 128;
-            char *response = malloc(resp_cap);
-            int rlen = snprintf(response, resp_cap,
-                "{\"text\":\"%s\",\"tokens\":%d,\"tok_per_sec\":%.1f}",
-                escaped, stats.tokens_generated, stats.tokens_per_second);
-
-            http_respond_json(client_fd, response, rlen);
-            free(escaped);
-            free(response);
+        // Enqueue request for worker thread
+        pthread_mutex_lock(&queue_mutex);
+        if (queue_count >= REQUEST_QUEUE_SIZE) {
+            pthread_mutex_unlock(&queue_mutex);
+            http_respond_error(client_fd, 503, "Queue full");
+            free(prompt); free(req); close(client_fd);
+            continue;
         }
+        request_queue[queue_tail] = (QueuedRequest){
+            .prompt = prompt,
+            .max_tokens = max_tokens,
+            .temperature = temperature,
+            .stream = stream,
+            .raw_prompt = raw_prompt,
+            .client_fd = client_fd,
+            .req_id = ++request_counter
+        };
+        queue_tail = (queue_tail + 1) % REQUEST_QUEUE_SIZE;
+        queue_count++;
+        pthread_cond_signal(&queue_not_empty);
+        pthread_mutex_unlock(&queue_mutex);
 
-        generating = 0;
-        free(prompt);
+        // prompt and client_fd are now owned by the queue — don't free/close here
         free(req);
-        close(client_fd);
     }
+
+    // Signal worker to stop and join
+    pthread_mutex_lock(&queue_mutex);
+    pthread_cond_signal(&queue_not_empty);
+    pthread_mutex_unlock(&queue_mutex);
+    pthread_join(worker, NULL);
 
     close(server_fd);
     free(out.buf);

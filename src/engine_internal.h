@@ -54,6 +54,14 @@ typedef struct {
     size_t mmap_size;
 } ExpertLayerFile;
 
+// ── Expert cache slot states ──
+
+typedef enum {
+    SLOT_EMPTY   = 0,  // No expert assigned
+    SLOT_LOADING = 1,  // Upload in flight (H2D async), not visible to lookup
+    SLOT_READY   = 2,  // Upload complete, visible to lookup and compute
+} ExpertSlotState;
+
 // ── Per-GPU state ──
 
 typedef struct {
@@ -99,12 +107,16 @@ typedef struct {
     int expert_cache_slots;
     size_t expert_slot_size;
 
-    int *cache_layer;
-    int *cache_expert;
+    int *cache_layer;           // READY layer (visible to lookup)
+    int *cache_expert;          // READY expert (visible to lookup)
     uint64_t *cache_lru;
     uint32_t *cache_hits;
     uint64_t cache_clock;
     bool *cache_pinned;
+    ExpertSlotState *cache_state;  // per-slot FSM state
+    int *cache_pending_layer;      // layer being uploaded (LOADING only)
+    int *cache_pending_expert;     // expert being uploaded (LOADING only)
+    cudaEvent_t *cache_ready_event; // signaled when H2D completes per slot
 
     bool expert_buf_pinned;
     bool prefetch_buf_pinned;
@@ -115,6 +127,14 @@ typedef struct {
     int prefetch_eids[16];
     int n_prefetched;
     volatile int prefetch_ready;
+
+    // GPU-side sampling result buffers
+    int *d_sampled_token;       // device: single int for sampled token ID
+    int *h_sampled_token;       // pinned host: single int for D2H copy
+
+    // Pinned host buffers for async router D2H
+    int   *h_expert_indices;    // pinned: K expert IDs from top-k
+    float *h_expert_weights;    // pinned: K expert weights from top-k
 
     // Gated Delta Net state (hybrid models only, NULL if pure attention)
     float *d_gdn_state;      // [n_gdn_layers, num_v_heads, key_head_dim, value_head_dim] persistent
@@ -201,10 +221,21 @@ struct MnemoCudaCtx {
     int n_last_activated;
 
     int extra_prefetch;       // 1 = prefetch layer+2 as well as layer+1
+    bool profiling_enabled;   // gate per-layer cudaStreamSynchronize for profiling
+    bool p2p_enabled[8][8];   // p2p_enabled[src_gpu_idx][dst_gpu_idx]
     volatile bool cancelled;
     bool loaded;
     MnemoCudaStats stats;
     char info[256];
+
+    // Per-token phase profiling (accumulated across layers, reset per token)
+    double prof_attn_ms;       // attention (norm + QKV + rope + attn + output)
+    double prof_router_ms;     // router norm + matvec + topk + D2H
+    double prof_cache_ms;      // expert classification + wait_until_ready
+    double prof_expert_ms;     // expert matvec compute (gate+up+swiglu+down)
+    double prof_io_ms;         // NVMe I/O wait (io_pool_wait)
+    double prof_handoff_ms;    // multi-GPU hidden state transfer
+    int prof_token_count;      // tokens profiled this session
 };
 
 // ── Internal functions shared between modules ──
@@ -242,6 +273,7 @@ void ram_cache_free(RAMCache *rc);
 // Expert VRAM cache operations
 void *expert_cache_lookup(GPUState *gpu, int layer, int expert_id);
 bool expert_cache_has(GPUState *gpu, int layer, int expert_id);
+bool expert_cache_is_loading(GPUState *gpu, int layer, int expert_id);
 void *expert_cache_insert(GPUState *gpu, int layer, int expert_id,
                           const void *host_data, size_t data_size,
                           cudaStream_t stream);
@@ -249,6 +281,20 @@ void *expert_cache_insert_ctx(struct MnemoCudaCtx *ctx, GPUState *gpu,
                               int layer, int expert_id,
                               const void *host_data, size_t data_size,
                               cudaStream_t stream);
+// Deferred insert: reserves slot as LOADING, enqueues async H2D, records event.
+// Slot becomes visible to lookup only after expert_cache_poll_ready().
+void *expert_cache_insert_deferred(struct MnemoCudaCtx *ctx, GPUState *gpu,
+                                   int layer, int expert_id,
+                                   const void *host_data, size_t data_size,
+                                   cudaStream_t stream);
+// Poll LOADING slots: promote to READY when their H2D event has completed.
+void expert_cache_poll_ready(GPUState *gpu);
+// Wait for specific deferred slots to become READY. Synchronizes stream_io,
+// promotes LOADING→READY, then makes compute_stream wait on the I/O event.
+// device_ptrs[i] are pointers returned by insert_deferred; only those in
+// LOADING state are waited on. After return, all requested slots are READY.
+void expert_cache_wait_until_ready(GPUState *gpu, void **device_ptrs, int n,
+                                   cudaStream_t compute_stream);
 
 // JSON helpers
 int json_get_int(const char *json, const char *key, int default_val);

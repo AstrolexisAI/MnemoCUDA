@@ -27,6 +27,12 @@ static int heat_entry_cmp_desc(const void *a, const void *b) {
 void mnemo_cuda_heat_pin(MnemoCudaCtx *ctx) {
     if (!ctx || !ctx->loaded || !ctx->heat_map) return;
 
+    if (ctx->heat_total_tokens < HEAT_MIN_TOKENS_FOR_PINNING) {
+        LOG_INFO("Heat pinning skipped: only %lu tokens, need %d",
+                 (unsigned long)ctx->heat_total_tokens, HEAT_MIN_TOKENS_FOR_PINNING);
+        return;
+    }
+
     ModelConfig *cfg = &ctx->config;
     int NL = cfg->num_hidden_layers;
     int NE = cfg->num_experts;

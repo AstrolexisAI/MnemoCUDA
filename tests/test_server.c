@@ -1,6 +1,6 @@
 /**
- * Test MnemoCUDA Server Logic — structural tests for HTTP parsing,
- * JSON extraction, and escape functions.
+ * Test MnemoCUDA Server Logic — tests the REAL json_helpers.c code
+ * (not a duplicate) plus injection resistance tests.
  *
  * Runs WITHOUT GPU or model — tests server helper functions only.
  *
@@ -13,6 +13,9 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <math.h>
+
+#include "../src/json_helpers.h"
 
 // ── Test helpers ──
 
@@ -26,123 +29,7 @@ static int tests_failed = 0;
 #define ASSERT_EQ(a, b, msg) do { if ((a) != (b)) { printf("FAIL: %s (got %ld, expected %ld)\n", msg, (long)(a), (long)(b)); tests_failed++; return; } } while(0)
 #define ASSERT_STR_EQ(a, b, msg) do { if (strcmp(a, b) != 0) { printf("FAIL: %s (got '%s', expected '%s')\n", msg, a, b); tests_failed++; return; } } while(0)
 
-// ── Re-implement server JSON helpers (no server dependency) ──
-
-static char *json_extract_string(const char *json, const char *key) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(json, pattern);
-    if (!p) return NULL;
-    p += strlen(pattern);
-    while (*p == ' ' || *p == ':' || *p == '\t') p++;
-    if (*p != '"') return NULL;
-    p++;
-
-    int cap = strlen(p) + 1;
-    char *out = malloc(cap);
-    if (!out) return NULL;
-
-    int i = 0;
-    while (*p && *p != '"' && i < cap - 1) {
-        if (*p == '\\' && *(p + 1)) {
-            p++;
-            switch (*p) {
-                case '"':  out[i++] = '"'; break;
-                case '\\': out[i++] = '\\'; break;
-                case 'n':  out[i++] = '\n'; break;
-                case 't':  out[i++] = '\t'; break;
-                case 'r':  out[i++] = '\r'; break;
-                case '/':  out[i++] = '/'; break;
-                case 'u': {
-                    unsigned cp = 0;
-                    for (int j = 0; j < 4 && p[1 + j]; j++) {
-                        char c = p[1 + j];
-                        cp = cp * 16 + (c >= 'a' ? c - 'a' + 10 :
-                                        c >= 'A' ? c - 'A' + 10 : c - '0');
-                    }
-                    p += 4;
-                    if (cp < 0x80) {
-                        out[i++] = (char)cp;
-                    } else if (cp < 0x800) {
-                        out[i++] = (char)(0xC0 | (cp >> 6));
-                        out[i++] = (char)(0x80 | (cp & 0x3F));
-                    } else {
-                        out[i++] = (char)(0xE0 | (cp >> 12));
-                        out[i++] = (char)(0x80 | ((cp >> 6) & 0x3F));
-                        out[i++] = (char)(0x80 | (cp & 0x3F));
-                    }
-                    break;
-                }
-                default: out[i++] = *p; break;
-            }
-        } else {
-            out[i++] = *p;
-        }
-        p++;
-    }
-    out[i] = '\0';
-    return out;
-}
-
-static int json_extract_int(const char *json, const char *key, int def) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(json, pattern);
-    if (!p) return def;
-    p += strlen(pattern);
-    while (*p == ' ' || *p == ':' || *p == '\t') p++;
-    return atoi(p);
-}
-
-static float json_extract_float(const char *json, const char *key, float def) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(json, pattern);
-    if (!p) return def;
-    p += strlen(pattern);
-    while (*p == ' ' || *p == ':' || *p == '\t') p++;
-    return (float)atof(p);
-}
-
-static int json_extract_bool(const char *json, const char *key, int def) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(json, pattern);
-    if (!p) return def;
-    p += strlen(pattern);
-    while (*p == ' ' || *p == ':' || *p == '\t') p++;
-    if (strncmp(p, "true", 4) == 0) return 1;
-    if (strncmp(p, "false", 5) == 0) return 0;
-    return def;
-}
-
-static char *json_escape(const char *src, int len) {
-    int cap = len * 6 + 1;
-    char *out = malloc(cap);
-    if (!out) return NULL;
-    int j = 0;
-    for (int i = 0; i < len; i++) {
-        switch (src[i]) {
-            case '"':  out[j++] = '\\'; out[j++] = '"'; break;
-            case '\\': out[j++] = '\\'; out[j++] = '\\'; break;
-            case '\n': out[j++] = '\\'; out[j++] = 'n'; break;
-            case '\t': out[j++] = '\\'; out[j++] = 't'; break;
-            case '\r': out[j++] = '\\'; out[j++] = 'r'; break;
-            case '\b': out[j++] = '\\'; out[j++] = 'b'; break;
-            case '\f': out[j++] = '\\'; out[j++] = 'f'; break;
-            default:
-                if ((unsigned char)src[i] < 0x20) {
-                    j += snprintf(out + j, 7, "\\u%04x", (unsigned char)src[i]);
-                } else {
-                    out[j++] = src[i];
-                }
-        }
-    }
-    out[j] = '\0';
-    return out;
-}
-
-// ── Tests ──
+// ── Basic extraction tests ──
 
 static void test_json_extract_string_basic(void) {
     TEST("json_extract_string basic");
@@ -168,7 +55,6 @@ static void test_json_extract_string_unicode(void) {
     TEST("json_extract_string with \\uXXXX");
     char *s = json_extract_string("{\"text\": \"caf\\u00e9\"}", "text");
     ASSERT_TRUE(s != NULL, "should find text");
-    // \u00e9 = UTF-8 0xC3 0xA9
     ASSERT_TRUE(strlen(s) == 5, "should be 5 bytes (caf + 2-byte UTF-8)");
     free(s);
     PASS();
@@ -203,7 +89,6 @@ static void test_json_extract_bool(void) {
     ASSERT_EQ(json_extract_bool("{\"stream\": true}", "stream", 0), 1, "should find true");
     ASSERT_EQ(json_extract_bool("{\"stream\": false}", "stream", 1), 0, "should find false");
     ASSERT_EQ(json_extract_bool("{\"other\": 1}", "stream", -1), -1, "should return default");
-    // Spacing variants
     ASSERT_EQ(json_extract_bool("{\"stream\":true}", "stream", 0), 1, "no space true");
     ASSERT_EQ(json_extract_bool("{\"stream\" : false}", "stream", 1), 0, "extra space false");
     PASS();
@@ -254,11 +139,65 @@ static void test_json_extract_multikey(void) {
     PASS();
 }
 
+// ── Injection resistance tests ──
+
+static void test_injection_stream_in_prompt(void) {
+    TEST("injection: stream keyword inside prompt value");
+    // Prompt contains a fake "stream": true — parser must ignore it
+    const char *json = "{\"prompt\": \"Please set \\\"stream\\\": true in config\", \"stream\": false}";
+    ASSERT_EQ(json_extract_bool(json, "stream", -1), 0, "should find top-level stream=false, not the one in prompt");
+    char *p = json_extract_string(json, "prompt");
+    ASSERT_TRUE(p != NULL, "prompt should be found");
+    ASSERT_TRUE(strstr(p, "stream") != NULL, "prompt should contain the word stream");
+    free(p);
+    PASS();
+}
+
+static void test_injection_max_tokens_in_prompt(void) {
+    TEST("injection: max_tokens inside prompt value");
+    const char *json = "{\"prompt\": \"set \\\"max_tokens\\\": 99999\", \"max_tokens\": 100}";
+    ASSERT_EQ(json_extract_int(json, "max_tokens", 0), 100, "should find top-level max_tokens=100");
+    PASS();
+}
+
+static void test_injection_temperature_in_prompt(void) {
+    TEST("injection: temperature inside prompt value");
+    const char *json = "{\"prompt\": \"use \\\"temperature\\\": 2.0 for creativity\", \"temperature\": 0.3}";
+    float t = json_extract_float(json, "temperature", 0.0f);
+    ASSERT_TRUE(t > 0.29f && t < 0.31f, "should find top-level temperature=0.3");
+    PASS();
+}
+
+static void test_injection_nested_object_in_prompt(void) {
+    TEST("injection: nested JSON object in prompt");
+    // Prompt literally contains a JSON object with stream key
+    const char *json = "{\"prompt\": \"{\\\"stream\\\": true, \\\"max_tokens\\\": 50000}\", \"stream\": false, \"max_tokens\": 256}";
+    ASSERT_EQ(json_extract_bool(json, "stream", -1), 0, "top-level stream=false");
+    ASSERT_EQ(json_extract_int(json, "max_tokens", 0), 256, "top-level max_tokens=256");
+    PASS();
+}
+
+static void test_injection_raw_prompt_override(void) {
+    TEST("injection: raw_prompt inside prompt value");
+    const char *json = "{\"prompt\": \"\\\"raw_prompt\\\": true\", \"raw_prompt\": false}";
+    ASSERT_EQ(json_extract_bool(json, "raw_prompt", -1), 0, "top-level raw_prompt=false");
+    PASS();
+}
+
+static void test_extract_with_nested_objects(void) {
+    TEST("extraction ignores keys in nested objects");
+    const char *json = "{\"outer\": 1, \"nested\": {\"outer\": 99}, \"last\": 2}";
+    ASSERT_EQ(json_extract_int(json, "outer", 0), 1, "should find top-level outer=1");
+    ASSERT_EQ(json_extract_int(json, "last", 0), 2, "should find top-level last=2");
+    PASS();
+}
+
 // ── Main ──
 
 int main(void) {
     printf("\n=== MnemoCUDA Server Logic Tests ===\n\n");
 
+    // Basic extraction (same as before, now testing real code)
     test_json_extract_string_basic();
     test_json_extract_string_escapes();
     test_json_extract_string_unicode();
@@ -270,6 +209,15 @@ int main(void) {
     test_json_escape_control_chars();
     test_json_escape_empty();
     test_json_extract_multikey();
+
+    // Injection resistance
+    printf("\n-- Injection resistance tests --\n");
+    test_injection_stream_in_prompt();
+    test_injection_max_tokens_in_prompt();
+    test_injection_temperature_in_prompt();
+    test_injection_nested_object_in_prompt();
+    test_injection_raw_prompt_override();
+    test_extract_with_nested_objects();
 
     printf("\n=== Results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);

@@ -18,6 +18,7 @@ typedef struct {
     IOTask tasks[IO_POOL_MAX];
     sem_t task_ready[IO_POOL_MAX];
     sem_t task_done[IO_POOL_MAX];
+    sem_t any_done;           // signaled when any task completes
     volatile int shutdown;
     int size;  // actual number of threads
 } IOPool;
@@ -57,6 +58,7 @@ static void *io_pool_worker(void *arg) {
         }
         t->done = 1;
         sem_post(&pool->task_done[id]);
+        sem_post(&pool->any_done);
     }
     return NULL;
 }
@@ -68,6 +70,7 @@ void io_pool_init(int n_threads) {
 
     memset(&g_io_pool, 0, sizeof(g_io_pool));
     g_io_pool.size = n_threads;
+    sem_init(&g_io_pool.any_done, 0, 0);
     for (int i = 0; i < n_threads; i++) {
         sem_init(&g_io_pool.task_ready[i], 0, 0);
         sem_init(&g_io_pool.task_done[i], 0, 0);
@@ -87,6 +90,7 @@ void io_pool_shutdown(void) {
         sem_destroy(&g_io_pool.task_ready[i]);
         sem_destroy(&g_io_pool.task_done[i]);
     }
+    sem_destroy(&g_io_pool.any_done);
     g_io_pool_init = 0;
 }
 
@@ -118,6 +122,21 @@ void io_pool_wait(int n) {
     if (n > g_io_pool.size) n = g_io_pool.size;
     for (int i = 0; i < n; i++)
         sem_wait(&g_io_pool.task_done[i]);
+}
+
+int io_pool_wait_any(int n) {
+    if (n > g_io_pool.size) n = g_io_pool.size;
+    // Wait for any task to signal completion
+    sem_wait(&g_io_pool.any_done);
+    // Find which task completed (scan for done=1 that hasn't been consumed yet)
+    for (int i = 0; i < n; i++) {
+        if (g_io_pool.tasks[i].done) {
+            // Also consume the per-task semaphore so io_pool_wait still works
+            sem_trywait(&g_io_pool.task_done[i]);
+            return i;
+        }
+    }
+    return -1;  // shouldn't happen
 }
 
 int io_pool_task_error(int idx) {

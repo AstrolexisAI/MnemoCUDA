@@ -108,6 +108,32 @@ Tokenizer *tokenizer_load(const char *model_dir) {
     }
 
     fclose(f);
+
+    // Build hash table for O(1) vocab lookup
+    {
+        int cap = 1;
+        while (cap < tok->vocab_size * 2) cap <<= 1;  // next power of 2
+        tok->ht_ids = malloc(cap * sizeof(int));
+        tok->ht_hashes = malloc(cap * sizeof(uint32_t));
+        tok->ht_cap = cap;
+        if (tok->ht_ids && tok->ht_hashes) {
+            for (int i = 0; i < cap; i++) tok->ht_ids[i] = -1;
+            uint32_t mask = (uint32_t)(cap - 1);
+            for (int i = 0; i < tok->vocab_size; i++) {
+                if (!tok->vocab[i]) continue;
+                uint32_t h = 0x811c9dc5;
+                for (int c = 0; c < tok->vocab_len[i]; c++) {
+                    h ^= (uint8_t)tok->vocab[i][c];
+                    h *= 0x01000193;
+                }
+                uint32_t idx = h & mask;
+                while (tok->ht_ids[idx] != -1) idx = (idx + 1) & mask;
+                tok->ht_ids[idx] = i;
+                tok->ht_hashes[idx] = h;
+            }
+        }
+    }
+
     LOG_INFO("Tokenizer: %d vocab, %d merges, %d special",
             tok->vocab_size, tok->n_merges, tok->n_special);
     return tok;
@@ -127,11 +153,32 @@ void tokenizer_free(Tokenizer *tok) {
     free(tok->merges);
     for (int i = 0; i < tok->n_special; i++) free(tok->special_tokens[i]);
     free(tok->special_tokens); free(tok->special_ids);
+    free(tok->ht_ids); free(tok->ht_hashes);
     free(tok);
 }
 
-// Find vocab ID for a string (linear scan — only used during tokenization)
-static int tokenizer_find_token(Tokenizer *tok, const char *str, int len) {
+// Find vocab ID for a string (hash table lookup, O(1) amortized)
+static int tokenizer_find_token(const Tokenizer *tok, const char *str, int len) {
+    if (tok->ht_ids && tok->ht_cap > 0) {
+        uint32_t h = 0x811c9dc5;
+        for (int c = 0; c < len; c++) {
+            h ^= (uint8_t)str[c];
+            h *= 0x01000193;
+        }
+        uint32_t mask = (uint32_t)(tok->ht_cap - 1);
+        uint32_t idx = h & mask;
+        for (int probe = 0; probe < tok->ht_cap; probe++) {
+            int id = tok->ht_ids[idx];
+            if (id < 0) return -1;
+            if (tok->ht_hashes[idx] == h &&
+                tok->vocab_len[id] == len &&
+                memcmp(tok->vocab[id], str, len) == 0)
+                return id;
+            idx = (idx + 1) & mask;
+        }
+        return -1;
+    }
+    // Fallback: linear scan
     for (int i = 0; i < tok->vocab_size; i++) {
         if (tok->vocab[i] && tok->vocab_len[i] == len &&
             memcmp(tok->vocab[i], str, len) == 0)
@@ -141,7 +188,7 @@ static int tokenizer_find_token(Tokenizer *tok, const char *str, int len) {
 }
 
 // BPE encode a non-special segment into token IDs
-static int bpe_encode_segment(Tokenizer *tok, const char *text, int text_len,
+static int bpe_encode_segment(const Tokenizer *tok, const char *text, int text_len,
                               int *out_ids, int max_ids) {
     if (text_len == 0) return 0;
 
@@ -210,7 +257,7 @@ static int bpe_encode_segment(Tokenizer *tok, const char *text, int text_len,
 }
 
 // Full tokenize: split on special tokens first, then BPE each segment
-int tokenizer_encode(Tokenizer *tok, const char *text,
+int tokenizer_encode(const Tokenizer *tok, const char *text,
                      int *out_ids, int max_ids) {
     int n_ids = 0;
     int text_len = strlen(text);
@@ -292,7 +339,7 @@ static const int16_t bytelevel_to_byte[512] = {
 
 static char decode_buf[1024];
 
-const char *tokenizer_decode(Tokenizer *tok, int id) {
+const char *tokenizer_decode(const Tokenizer *tok, int id) {
     const char *raw = NULL;
     if (id >= 0 && id < tok->vocab_size && tok->vocab[id])
         raw = tok->vocab[id];

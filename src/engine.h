@@ -24,6 +24,16 @@
     if (err != cudaSuccess) { \
         fprintf(stderr, "[MnemoCUDA] CUDA error at %s:%d: %s\n", \
                 __FILE__, __LINE__, cudaGetErrorString(err)); \
+        return; \
+    } \
+} while(0)
+
+#define CUDA_CHECK_RET(call, retval) do { \
+    cudaError_t err = (call); \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "[MnemoCUDA] CUDA error at %s:%d: %s\n", \
+                __FILE__, __LINE__, cudaGetErrorString(err)); \
+        return (retval); \
     } \
 } while(0)
 
@@ -98,6 +108,7 @@ const char *mnemo_cuda_get_info(MnemoCudaCtx *ctx);
 // Expert heat profiling
 #define MNEMO_MAX_EXPERT_K 16  // Max active experts per token (buffer limit in forward/kernels)
 #define HEAT_TOP_N 20
+#define HEAT_MIN_TOKENS_FOR_PINNING 1000  // Don't pin experts until heat map has enough signal
 
 typedef struct {
     uint64_t total_tokens;       // Tokens profiled

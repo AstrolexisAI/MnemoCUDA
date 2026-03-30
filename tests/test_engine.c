@@ -14,7 +14,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <unistd.h>
 #include "engine.h"
+
+// Delete expert_heat.bin from model_dir to isolate test runs
+static void clean_heat_file(const char *model_dir) {
+    if (!model_dir) return;
+    char path[1200];
+    snprintf(path, sizeof(path), "%s/expert_heat.bin", model_dir);
+    unlink(path);  // ignore error if doesn't exist
+}
 
 // ── Test helpers (same macros as test_heat.c) ──
 
@@ -373,6 +382,60 @@ static void test_heat_after_generate(const char *model_dir) {
     PASS();
 }
 
+// ── Test 12: Small heat map doesn't activate pinning, logits stable across runs ──
+
+static void test_heat_no_premature_pinning(const char *model_dir) {
+    TEST("small heat doesn't activate pinning, logits stable across runs");
+
+    // Run 1: generate a few tokens → saves small heat map
+    {
+        MnemoCudaCtx *ctx = mnemo_cuda_create();
+        ASSERT_TRUE(ctx != NULL, "create failed (run 1)");
+        MnemoCudaConfig cfg = mnemo_cuda_config_default();
+        cfg.model_dir = model_dir;
+        cfg.context_length = 2048;
+        int rc = mnemo_cuda_load(ctx, cfg);
+        ASSERT_EQ(rc, 0, "load failed (run 1)");
+
+        GenResult r1 = {0};
+        rc = mnemo_cuda_generate(ctx, "Hello world", 4, 0.0, false, on_token, &r1);
+        ASSERT_EQ(rc, 0, "generate failed (run 1)");
+        ASSERT_TRUE(r1.token_count > 0, "no tokens (run 1)");
+
+        MnemoCudaHeatStats hs = mnemo_cuda_get_heat_stats(ctx);
+        ASSERT_TRUE(!hs.pinning_active, "pinning should NOT be active with < 1000 tokens");
+
+        mnemo_cuda_destroy(ctx);
+    }
+
+    // Run 2: reload with the small heat map from run 1 — pinning must stay off
+    {
+        MnemoCudaCtx *ctx = mnemo_cuda_create();
+        ASSERT_TRUE(ctx != NULL, "create failed (run 2)");
+        MnemoCudaConfig cfg = mnemo_cuda_config_default();
+        cfg.model_dir = model_dir;
+        cfg.context_length = 2048;
+        int rc = mnemo_cuda_load(ctx, cfg);
+        ASSERT_EQ(rc, 0, "load failed (run 2)");
+
+        MnemoCudaHeatStats hs = mnemo_cuda_get_heat_stats(ctx);
+        ASSERT_TRUE(!hs.pinning_active, "pinning should NOT be active on reload with small heat");
+
+        GenResult r2 = {0};
+        rc = mnemo_cuda_generate(ctx, "Hello world", 4, 0.0, false, on_token, &r2);
+        ASSERT_EQ(rc, 0, "generate failed (run 2)");
+        ASSERT_TRUE(r2.token_count > 0, "no tokens (run 2)");
+
+        // Pinning must still not be active (total tokens still < 1000)
+        hs = mnemo_cuda_get_heat_stats(ctx);
+        ASSERT_TRUE(!hs.pinning_active, "pinning activated prematurely after run 2");
+
+        mnemo_cuda_destroy(ctx);
+    }
+
+    PASS();
+}
+
 // ── Main ──
 
 int main(void) {
@@ -398,13 +461,19 @@ int main(void) {
     printf("\n-- GPU inference tests --\n");
     if (model_dir && model_dir[0]) {
         printf("  MODEL_DIR=%s\n", model_dir);
+        clean_heat_file(model_dir);
         test_full_cycle(model_dir);
+        clean_heat_file(model_dir);
         test_cancel(model_dir);
+        clean_heat_file(model_dir);
         test_heat_after_generate(model_dir);
+        clean_heat_file(model_dir);
+        test_heat_no_premature_pinning(model_dir);
+        clean_heat_file(model_dir);
     } else {
         printf("  MODEL_DIR not set — skipping GPU tests\n");
         printf("  Set MODEL_DIR=/path/to/split_model to run full suite\n");
-        tests_skipped += 3;
+        tests_skipped += 4;
     }
 
     printf("\n=== Results: %d passed, %d failed, %d skipped ===\n\n",

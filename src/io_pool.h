@@ -21,6 +21,10 @@ typedef struct {
     int error;          // errno on failure, 0 on success
 } IOTask;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void io_pool_init(int n_threads);  // n_threads clamped to [1, IO_POOL_MAX]
 void io_pool_shutdown(void);
 int  io_pool_size(void);           // current pool size (0 if not init'd)
@@ -28,5 +32,10 @@ void io_pool_submit_wait(IOTask *tasks, int n);
 void io_pool_submit(IOTask *tasks, int n);
 void io_pool_wait(int n);
 int  io_pool_task_error(int idx);     // error code for completed task idx (0 = ok)
+int  io_pool_wait_any(int n);        // wait for any one of n submitted tasks; returns task index
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -85,11 +85,12 @@ static const char *json_next_string(const char *p, char *out, int maxlen) {
                 case '/': out[i++] = '/'; break;
                 case 'u': {
                     unsigned cp = 0;
-                    for (int j = 0; j < 4 && p[1+j]; j++) {
+                    int j;
+                    for (j = 0; j < 4 && p[1+j]; j++) {
                         char c = p[1+j];
                         cp = cp * 16 + (c >= 'a' ? c-'a'+10 : c >= 'A' ? c-'A'+10 : c-'0');
                     }
-                    p += 4;
+                    p += j;
                     if (cp < 0x80) {
                         out[i++] = (char)cp;
                     } else if (cp < 0x800) {
@@ -528,7 +529,10 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         long mf2_size = ftell(mf2);
         fseek(mf2, 0, SEEK_SET);
         char *mf2_json = malloc(mf2_size + 1);
-        fread(mf2_json, 1, mf2_size, mf2);
+        if (!mf2_json) { fclose(mf2); LOG_ERROR("OOM: manifest json"); return MNEMO_ERR_CUDA; }
+        if ((long)fread(mf2_json, 1, mf2_size, mf2) != mf2_size) {
+            LOG_WARN("Short read on resident_manifest.json");
+        }
         mf2_json[mf2_size] = '\0';
         fclose(mf2);
 
@@ -539,6 +543,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
 
         memset(&ctx->tensor_table, 0, sizeof(TensorTable));
         ctx->tensor_table.entries = calloc(tensor_count, sizeof(TensorEntry));
+        if (!ctx->tensor_table.entries) { free(mf2_json); LOG_ERROR("OOM: tensor table"); return MNEMO_ERR_CUDA; }
         ctx->tensor_table.n_entries = 0;
 
         // Parse each tensor entry
@@ -667,6 +672,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
 
     // Open expert files BEFORE CUDA allocations (CUDA may invalidate fds)
     ctx->expert_layers = calloc(cfg->num_hidden_layers, sizeof(ExpertLayerFile));
+    if (!ctx->expert_layers) { LOG_ERROR("OOM: expert_layers"); return MNEMO_ERR_CUDA; }
     ctx->n_expert_layers = 0;
     {
         snprintf(path, sizeof(path), "%s/expert_manifest.json", config.model_dir);
@@ -674,7 +680,13 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         char *em_json = NULL;
         if (emf) {
             fseek(emf, 0, SEEK_END); long emsz = ftell(emf); fseek(emf, 0, SEEK_SET);
-            em_json = malloc(emsz + 1); fread(em_json, 1, emsz, emf); em_json[emsz] = '\0'; fclose(emf);
+            em_json = malloc(emsz + 1);
+            if (em_json) {
+                if ((long)fread(em_json, 1, emsz, emf) != emsz)
+                    LOG_WARN("Short read on expert_manifest.json");
+                em_json[emsz] = '\0';
+            }
+            fclose(emf);
         }
         for (int i = 0; i < cfg->num_hidden_layers; i++) {
             snprintf(path, sizeof(path), "%s/experts/layer_%02d.bin", config.model_dir, i);
@@ -703,8 +715,10 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
                 ctx->expert_layers[i].mmap_size = mst.st_size;
                 ctx->expert_layers[i].mmap_data = mmap(NULL, mst.st_size, PROT_READ,
                                                         MAP_SHARED, efd, 0);
-                if (ctx->expert_layers[i].mmap_data == MAP_FAILED)
+                if (ctx->expert_layers[i].mmap_data == MAP_FAILED) {
                     ctx->expert_layers[i].mmap_data = NULL;
+                    ctx->expert_layers[i].mmap_size = 0;
+                }
             }
         }
         free(em_json);
@@ -926,6 +940,8 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_router_out, cfg->num_experts * sizeof(float)));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_expert_indices, K * sizeof(int)));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_expert_weights, K * sizeof(float)));
+        CUDA_LOAD_CHECK(cudaMallocHost((void**)&gpu->h_expert_indices, 16 * sizeof(int)));
+        CUDA_LOAD_CHECK(cudaMallocHost((void**)&gpu->h_expert_weights, 16 * sizeof(float)));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_expert_gate, EFF * sizeof(float)));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_expert_up,   EFF * sizeof(float)));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_expert_act,  EFF * sizeof(float)));
@@ -933,11 +949,14 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_moe_out,     (size_t)H * K * sizeof(float)));
 
         // Logits only on last GPU
-        if (g == ctx->n_gpus - 1)
+        if (g == ctx->n_gpus - 1) {
             CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_logits, V * sizeof(float)));
+            CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_sampled_token, sizeof(int)));
+            CUDA_LOAD_CHECK(cudaMallocHost((void**)&gpu->h_sampled_token, sizeof(int)));
+        }
 
         // Expert I/O buffer (pinned host, K experts for parallel pread)
-        gpu->expert_buf_size = max_expert_sz * K;
+        gpu->expert_buf_size = (size_t)max_expert_sz * (size_t)K;
         gpu->expert_buf_pinned = config.use_pinned_memory;
         if (config.use_pinned_memory) {
             CUDA_LOAD_CHECK(cudaMallocHost(&gpu->h_expert_buf, gpu->expert_buf_size));
@@ -970,6 +989,10 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         gpu->cache_hits = NULL;
         gpu->cache_pinned = NULL;
         gpu->cache_clock = 0;
+        gpu->cache_state = NULL;
+        gpu->cache_pending_layer = NULL;
+        gpu->cache_pending_expert = NULL;
+        gpu->cache_ready_event = NULL;
 
         // Prefetch buffer — holds up to K experts for speculative next-layer reads
         gpu->prefetch_buf_size = max_expert_sz * K;
@@ -1072,14 +1095,23 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
             }
 
             if (gpu->d_expert_cache) {
-                gpu->cache_layer = (int *)calloc(gpu->expert_cache_slots, sizeof(int));
-                gpu->cache_expert = (int *)calloc(gpu->expert_cache_slots, sizeof(int));
-                gpu->cache_lru = (uint64_t *)calloc(gpu->expert_cache_slots, sizeof(uint64_t));
-                gpu->cache_hits = (uint32_t *)calloc(gpu->expert_cache_slots, sizeof(uint32_t));
-                gpu->cache_pinned = (bool *)calloc(gpu->expert_cache_slots, sizeof(bool));
-                for (int s = 0; s < gpu->expert_cache_slots; s++) {
+                int ns = gpu->expert_cache_slots;
+                gpu->cache_layer = (int *)calloc(ns, sizeof(int));
+                gpu->cache_expert = (int *)calloc(ns, sizeof(int));
+                gpu->cache_lru = (uint64_t *)calloc(ns, sizeof(uint64_t));
+                gpu->cache_hits = (uint32_t *)calloc(ns, sizeof(uint32_t));
+                gpu->cache_pinned = (bool *)calloc(ns, sizeof(bool));
+                gpu->cache_state = (ExpertSlotState *)calloc(ns, sizeof(ExpertSlotState));
+                gpu->cache_pending_layer = (int *)calloc(ns, sizeof(int));
+                gpu->cache_pending_expert = (int *)calloc(ns, sizeof(int));
+                gpu->cache_ready_event = (cudaEvent_t *)calloc(ns, sizeof(cudaEvent_t));
+                for (int s = 0; s < ns; s++) {
                     gpu->cache_layer[s] = -1;
                     gpu->cache_expert[s] = -1;
+                    gpu->cache_state[s] = SLOT_EMPTY;
+                    gpu->cache_pending_layer[s] = -1;
+                    gpu->cache_pending_expert[s] = -1;
+                    cudaEventCreateWithFlags(&gpu->cache_ready_event[s], cudaEventDisableTiming);
                 }
                 LOG_INFO("GPU %d: VRAM cache %.1f MB (%d slots × %.1f MB)",
                         gpu->gpu_id, (double)gpu->expert_cache_size / (1024*1024),
@@ -1089,6 +1121,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
     }
 
     ctx->kv_pos = 0;
+    ctx->prof_token_count = 0;
 
     // RAM-tier cache (disabled by default — OS page cache handles this via mmap)
     if (RAM_CACHE_DEFAULT_GB > 0)
@@ -1103,6 +1136,11 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
     ctx->heat_pinning_active = false;
     ctx->layer_hits = (uint32_t *)calloc(cfg->num_hidden_layers, sizeof(uint32_t));
     ctx->layer_misses = (uint32_t *)calloc(cfg->num_hidden_layers, sizeof(uint32_t));
+    if (!ctx->heat_map || !ctx->layer_hits || !ctx->layer_misses) {
+        LOG_ERROR("OOM: heat profiling buffers");
+        mnemo_cuda_unload(ctx);
+        return MNEMO_ERR_CUDA;
+    }
     ctx->n_last_activated = 0;
 
     // Try to load saved heat map from previous sessions
@@ -1117,7 +1155,8 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
                 fread(&n_layers, 4, 1, hf) == 1 && (int)n_layers == cfg->num_hidden_layers &&
                 fread(&n_experts, 4, 1, hf) == 1 && (int)n_experts == cfg->num_experts &&
                 fread(&saved_tokens, 8, 1, hf) == 1) {
-                fread(ctx->heat_map, sizeof(uint32_t), heat_size, hf);
+                if (fread(ctx->heat_map, sizeof(uint32_t), heat_size, hf) != heat_size)
+                    LOG_WARN("Short read on heat map data");
                 ctx->heat_total_tokens = saved_tokens;
                 LOG_INFO("Loaded heat map (%lu tokens of history)",
                         (unsigned long)saved_tokens);
@@ -1136,6 +1175,34 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
 
     io_pool_init(config.io_threads);
     ctx->extra_prefetch = config.extra_prefetch;
+    ctx->profiling_enabled = (getenv("MNEMO_PROFILE") != NULL);
+
+    // Probe and enable P2P GPU access for direct GPU-to-GPU transfers
+    if (ctx->n_gpus > 1) {
+        for (int i = 0; i < ctx->n_gpus; i++) {
+            for (int j = 0; j < ctx->n_gpus; j++) {
+                if (i == j) continue;
+                int can_access = 0;
+                cudaDeviceCanAccessPeer(&can_access, ctx->gpus[i].gpu_id, ctx->gpus[j].gpu_id);
+                if (can_access) {
+                    cudaSetDevice(ctx->gpus[i].gpu_id);
+                    cudaError_t err = cudaDeviceEnablePeerAccess(ctx->gpus[j].gpu_id, 0);
+                    if (err == cudaSuccess || err == cudaErrorPeerAccessAlreadyEnabled) {
+                        ctx->p2p_enabled[i][j] = true;
+                        if (err == cudaErrorPeerAccessAlreadyEnabled)
+                            cudaGetLastError();  // clear the error
+                    }
+                }
+            }
+        }
+        int p2p_count = 0;
+        for (int i = 0; i < ctx->n_gpus; i++)
+            for (int j = 0; j < ctx->n_gpus; j++)
+                if (ctx->p2p_enabled[i][j]) p2p_count++;
+        if (p2p_count > 0)
+            LOG_INFO("P2P enabled for %d GPU pairs", p2p_count);
+    }
+
     ctx->loaded = true;
     LOG_INFO("Ready: %s", ctx->info);
     return 0;
@@ -1162,9 +1229,13 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
         cudaFree(gpu->d_attn_out); cudaFree(gpu->d_normed);
         cudaFree(gpu->d_router_logits); cudaFree(gpu->d_router_out);
         cudaFree(gpu->d_expert_indices); cudaFree(gpu->d_expert_weights);
+        if (gpu->h_expert_indices) cudaFreeHost(gpu->h_expert_indices);
+        if (gpu->h_expert_weights) cudaFreeHost(gpu->h_expert_weights);
         cudaFree(gpu->d_expert_gate); cudaFree(gpu->d_expert_up);
         cudaFree(gpu->d_expert_act); cudaFree(gpu->d_expert_out);
         cudaFree(gpu->d_moe_out); cudaFree(gpu->d_logits);
+        cudaFree(gpu->d_sampled_token);
+        if (gpu->h_sampled_token) cudaFreeHost(gpu->h_sampled_token);
         cudaFree(gpu->d_kv_k); cudaFree(gpu->d_kv_v);
         cudaFree(gpu->d_expert_buf);
         cudaFree(gpu->d_expert_cache);
@@ -1177,11 +1248,19 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
             if (gpu->prefetch_buf_pinned) cudaFreeHost(gpu->h_prefetch_buf);
             else free(gpu->h_prefetch_buf);
         }
+        if (gpu->cache_ready_event) {
+            for (int s = 0; s < gpu->expert_cache_slots; s++)
+                cudaEventDestroy(gpu->cache_ready_event[s]);
+        }
         free(gpu->cache_layer);
         free(gpu->cache_expert);
         free(gpu->cache_lru);
         free(gpu->cache_hits);
         free(gpu->cache_pinned);
+        free(gpu->cache_state);
+        free(gpu->cache_pending_layer);
+        free(gpu->cache_pending_expert);
+        free(gpu->cache_ready_event);
         free(gpu->tensor_offsets);
 
         // GDN buffers
@@ -1279,9 +1358,12 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
     char *chatml;
     if (raw_prompt || strncmp(prompt, "<|im_start|>", 12) == 0) {
         chatml = strdup(prompt);
+        if (!chatml) { LOG_ERROR("OOM: chatml strdup"); return MNEMO_ERR_CUDA; }
     } else {
-        chatml = malloc(strlen(prompt) + 128);
-        sprintf(chatml, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", prompt);
+        size_t chatml_size = strlen(prompt) + 128;
+        chatml = malloc(chatml_size);
+        if (!chatml) { LOG_ERROR("OOM: chatml alloc"); return MNEMO_ERR_CUDA; }
+        snprintf(chatml, chatml_size, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", prompt);
     }
 
     // Try to find tokenize.py
@@ -1322,10 +1404,18 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
     // Pipe chatml to tokenize.py via fork+exec (stdin→stdout binary protocol)
     if (tok_script) {
         int pipe_in[2], pipe_out[2];
-        pipe(pipe_in);
-        pipe(pipe_out);
+        if (pipe(pipe_in) < 0 || pipe(pipe_out) < 0) {
+            LOG_WARN("pipe() failed: %s, skipping Python tokenizer", strerror(errno));
+            goto fallback_tokenizer;
+        }
 
         pid_t pid = fork();
+        if (pid < 0) {
+            LOG_WARN("fork() failed: %s, skipping Python tokenizer", strerror(errno));
+            close(pipe_in[0]); close(pipe_in[1]);
+            close(pipe_out[0]); close(pipe_out[1]);
+            goto fallback_tokenizer;
+        }
         if (pid == 0) {
             // Child: run tokenize.py
             close(pipe_in[1]);
@@ -1350,6 +1440,7 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
         if (read_full(pipe_out[0], &n_tok, 4) == 4 && n_tok > 0 && n_tok < 1000000) {
             n_tokens = (int)n_tok;
             tokens = malloc(n_tokens * sizeof(int));
+            if (!tokens) { n_tokens = 0; close(pipe_out[0]); waitpid(pid, NULL, 0); free(chatml); LOG_ERROR("OOM: tokens"); return MNEMO_ERR_CUDA; }
             ssize_t expected = (ssize_t)(n_tokens * sizeof(int));
             if (read_full(pipe_out[0], tokens, expected) != expected) {
                 free(tokens);
@@ -1365,18 +1456,23 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
 
     free(chatml);
 
+fallback_tokenizer:
     if (!tokens || n_tokens == 0) {
         // Fallback to built-in BPE tokenizer
         LOG_WARN("Python tokenizer failed, using built-in BPE");
         if (raw_prompt || strncmp(prompt, "<|im_start|>", 12) == 0) {
             chatml = strdup(prompt);
+            if (!chatml) { LOG_ERROR("OOM: chatml strdup"); return MNEMO_ERR_CUDA; }
         } else {
-            chatml = malloc(strlen(prompt) + 128);
-            sprintf(chatml, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", prompt);
+            size_t chatml_size = strlen(prompt) + 128;
+            chatml = malloc(chatml_size);
+            if (!chatml) { LOG_ERROR("OOM: chatml alloc"); return MNEMO_ERR_CUDA; }
+            snprintf(chatml, chatml_size, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", prompt);
         }
         int max_prompt_tokens = cfg->max_position_embeddings - max_tokens;
         if (max_prompt_tokens < 32) max_prompt_tokens = 32;
         tokens = malloc(max_prompt_tokens * sizeof(int));
+        if (!tokens) { free(chatml); LOG_ERROR("OOM: tokens alloc"); return MNEMO_ERR_CUDA; }
         n_tokens = tokenizer_encode(ctx->tokenizer, chatml, tokens, max_prompt_tokens);
         free(chatml);
     }
@@ -1393,17 +1489,29 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
 
     LOG_INFO("Prompt: %d tokens, generating up to %d", n_tokens, max_tokens);
 
-    // Allocate host logits buffer
-    float *h_logits = malloc(V * sizeof(float));
-
     // ── 2. Prefill: process all prompt tokens ──
+    // Use forward_pass_no_logits for all but the last token (skip lm_head).
+    // Last prefill token uses forward_pass_sample to get the first generated token.
     ctx->kv_pos = 0;
-    for (int i = 0; i < n_tokens; i++) {
-        if (ctx->cancelled) { free(tokens); free(h_logits); return MNEMO_ERR_CANCELLED; }
-        int rc = forward_pass(ctx, tokens[i], ctx->kv_pos, h_logits);
-        if (rc != 0) { free(tokens); free(h_logits); return rc; }
+    for (int i = 0; i < n_tokens - 1; i++) {
+        if (ctx->cancelled) { free(tokens); return MNEMO_ERR_CANCELLED; }
+        int rc = forward_pass_no_logits(ctx, tokens[i], ctx->kv_pos);
+        if (rc != 0) { free(tokens); return rc; }
         ctx->kv_pos++;
     }
+
+    // Last prefill token: need to sample from it
+    int first_token_id = -1;
+    if (n_tokens > 0) {
+        if (ctx->cancelled) { free(tokens); return MNEMO_ERR_CANCELLED; }
+        int rc = forward_pass_sample(ctx, tokens[n_tokens - 1], ctx->kv_pos,
+                                     temperature, 0.9f, rng_next(),
+                                     &first_token_id);
+        if (rc != 0) { free(tokens); return rc; }
+        ctx->kv_pos++;
+    }
+    free(tokens);
+    tokens = NULL;
 
     // ── 3. Autoregressive generation ──
     int tokens_generated = 0;
@@ -1411,15 +1519,14 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
     struct timespec t_gen_start;
     clock_gettime(CLOCK_MONOTONIC, &t_gen_start);
 
+    int next_id = first_token_id;
     for (int t = 0; t < max_tokens; t++) {
         if (ctx->cancelled) break;
         if (ctx->kv_pos >= max_ctx) {
             LOG_INFO("Context full at %d tokens", ctx->kv_pos);
             break;
         }
-
-        // Sample next token
-        int next_id = sample_token(h_logits, V, temperature, 0.9f);
+        if (next_id < 0) break;
 
         // Check for EOS
         if (next_id == ctx->tokenizer->eos_id ||
@@ -1427,22 +1534,21 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
             LOG_INFO("EOS token %d at position %d", next_id, t);
             break;
         }
-        // if (t < 5) fprintf(stderr, "[MnemoCUDA] token[%d] = %d '%s'\n",
-        //                     t, next_id, tokenizer_decode(ctx->tokenizer, next_id));
 
         // Decode and emit (with UTF-8 accumulation for multi-byte chars)
         {
             const char *text = tokenizer_decode(ctx->tokenizer, next_id);
-            // NOTE: these must NOT be static — stale state across generate
-            // calls corrupts multi-byte sequences for non-ASCII (accents, CJK)
             char utf8_buf[32];
             int utf8_len = 0;
 
             for (int ci = 0; text[ci]; ci++) {
+                if (utf8_len >= (int)sizeof(utf8_buf) - 1) {
+                    callback(utf8_buf, false, userdata);
+                    utf8_len = 0;
+                }
                 utf8_buf[utf8_len++] = text[ci];
                 utf8_buf[utf8_len] = '\0';
 
-                // Check if we have a complete UTF-8 sequence
                 uint8_t first = (uint8_t)utf8_buf[0];
                 int expected;
                 if (first < 0x80) expected = 1;
@@ -1458,10 +1564,13 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
         }
         tokens_generated++;
 
-        // Forward pass for next token
-        int rc = forward_pass(ctx, next_id, ctx->kv_pos, h_logits);
+        // Forward pass + GPU sampling for next token
+        int sampled = -1;
+        int rc = forward_pass_sample(ctx, next_id, ctx->kv_pos,
+                                     temperature, 0.9f, rng_next(), &sampled);
         if (rc != 0) { gen_error = rc; break; }
         ctx->kv_pos++;
+        next_id = sampled;
     }
 
     // Signal completion
@@ -1486,8 +1595,8 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
     ctx->stats.n_gpus_active = ctx->n_gpus;
     ctx->heat_total_tokens += (uint64_t)(n_tokens + tokens_generated);
 
-    // Auto-pin hot experts after enough data (100 tokens warmup)
-    if (!ctx->heat_pinning_active && ctx->heat_total_tokens >= 100)
+    // Auto-pin hot experts after sufficient statistical signal
+    if (!ctx->heat_pinning_active && ctx->heat_total_tokens >= HEAT_MIN_TOKENS_FOR_PINNING)
         mnemo_cuda_heat_pin(ctx);
 
     // Calculate total VRAM used across all GPUs
@@ -1541,8 +1650,6 @@ int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
         LOG_INFO("Worst layers by hit rate:%s", worst_buf);
     }
 
-    free(tokens);
-    free(h_logits);
     return gen_error;
 }
 

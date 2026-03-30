@@ -14,4 +14,13 @@
 // Full forward pass: token embedding → transformer layers → logits
 int forward_pass(MnemoCudaCtx *ctx, int token_id, int pos, float *h_logits);
 
+// Forward pass with GPU-side sampling: returns sampled token ID.
+// Avoids copying full logits vector to host (4 bytes D2H instead of V*4).
+int forward_pass_sample(MnemoCudaCtx *ctx, int token_id, int pos,
+                        float temperature, float top_p, uint64_t rng_state,
+                        int *out_token);
+
+// Forward pass without lm_head: used during prefill (no logits needed).
+int forward_pass_no_logits(MnemoCudaCtx *ctx, int token_id, int pos);
+
 #endif
