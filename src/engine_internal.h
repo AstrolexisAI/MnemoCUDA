@@ -168,8 +168,11 @@ typedef struct {
     int   *h_expert_indices;    // pinned: K expert IDs from top-k
     float *h_expert_weights;    // pinned: K expert weights from top-k
 
-    // GEMM Q4K tensor core buffer (block_q8_1_mmq format)
-    void *d_gemm_q8;          // [(H/128) × 144 bytes × MAX_BATCH]
+    // GEMM Q4K tensor core buffers
+    void  *d_gemm_q8;         // Q8_1 MMQ format [(H/128) × 144 bytes × MAX_BATCH]
+    float *d_batch_normed;    // gathered normed vectors [MAX_BATCH × H]
+    float *d_batch_q;         // gathered Q output [MAX_BATCH × NH*HD]
+    float *d_batch_kv;        // gathered K+V output [MAX_BATCH × 2*NKV*HD]
 
     // Pre-created CUDA events (avoid per-layer create/destroy overhead)
     cudaEvent_t ev_router;        // router D2H completion

@@ -936,8 +936,11 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_v,        NKV * HD * sizeof(float)));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_attn_out, NH * HD * sizeof(float)));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_normed,   H * sizeof(float)));
-        // GEMM Q8_1 buffer: (H/128) blocks × 144 bytes × MAX_BATCH
+        // GEMM buffers
         CUDA_LOAD_CHECK(cudaMalloc(&gpu->d_gemm_q8, (size_t)(H / 128) * 144 * MAX_BATCH));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_batch_normed, (size_t)MAX_BATCH * H * sizeof(float)));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_batch_q, (size_t)MAX_BATCH * NH * HD * sizeof(float)));
+        CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_batch_kv, (size_t)MAX_BATCH * 2 * NKV * HD * sizeof(float)));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_router_logits, cfg->num_experts * sizeof(float)));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_router_out, cfg->num_experts * sizeof(float)));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_expert_indices, K * sizeof(int)));
@@ -1336,6 +1339,9 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
         cudaFree(gpu->d_attn_out); cudaFree(gpu->d_normed);
         cudaFree(gpu->d_router_logits); cudaFree(gpu->d_router_out);
         cudaFree(gpu->d_gemm_q8);
+        cudaFree(gpu->d_batch_normed);
+        cudaFree(gpu->d_batch_q);
+        cudaFree(gpu->d_batch_kv);
         cudaFree(gpu->d_expert_indices); cudaFree(gpu->d_expert_weights);
         if (gpu->h_expert_indices) cudaFreeHost(gpu->h_expert_indices);
         if (gpu->h_expert_weights) cudaFreeHost(gpu->h_expert_weights);
@@ -1518,6 +1524,64 @@ void mnemo_cuda_batch_bench(MnemoCudaCtx *ctx, int n_steps) {
 
     LOG_INFO("Batch throughput: %.1f tok/s (batch=1) vs %.1f tok/s (batch=2) = %.2fx",
              n_steps / b1, n_steps * 2 / b2, (n_steps * 2 / b2) / (n_steps / b1));
+
+    // Raw GEMM kernel timing: compare matvec vs GEMM for Q projection
+    if (ctx->gpus[0].d_gemm_q8 && getenv("MNEMO_GEMM")) {
+        extern void cuda_gemm_q4k(const void *, const void *, float *, int, int, int, cudaStream_t);
+        extern void cuda_quantize_mmq_q8_1(const float *, void *, int, int, cudaStream_t);
+        extern void cuda_matvec_q4k(const void *, const float *, float *,
+                                     int, int, cudaStream_t);
+
+        GPUState *gpu = &ctx->gpus[0];
+        cudaSetDevice(gpu->gpu_id);
+        cudaStream_t cs = gpu->stream_compute;
+        int H = cfg->hidden_size;
+        int NH = cfg->num_attention_heads, HD = cfg->head_dim;
+
+        // Find Q projection weights for layer 0
+        TensorEntry *wq = ctx->layer_tensors ? ctx->layer_tensors[0].attn_q : NULL;
+        if (!wq || wq->type_id != 12) { LOG_INFO("No Q4K Q tensor for GEMM test"); return; }
+        int ti = wq - ctx->tensor_table.entries;
+        void *w = (char *)gpu->d_resident + gpu->tensor_offsets[ti];
+
+        int iters = 100;
+
+        // Time: 2 sequential matvecs (simulating batch=2 without GEMM)
+        cudaStreamSynchronize(cs);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int i = 0; i < iters; i++) {
+            cuda_matvec_q4k(w, gpu->d_normed, gpu->d_q, NH*HD, H, cs);
+            cuda_matvec_q4k(w, gpu->d_normed, gpu->d_q, NH*HD, H, cs);
+        }
+        cudaStreamSynchronize(cs);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double t_2mv = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+        LOG_INFO("Raw: 2× matvec Q[%dx%d] × %d iters = %.2fms avg per pair",
+                 NH*HD, H, iters, t_2mv / iters * 1000);
+
+        // Time: 1 GEMM batch=2
+        // First, set up batch=2 buffer: copy normed to both rows
+        cudaMemcpyAsync(gpu->d_batch_normed, gpu->d_normed, H * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cs);
+        cudaMemcpyAsync(gpu->d_batch_normed + H, gpu->d_normed, H * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cs);
+        cuda_quantize_mmq_q8_1(gpu->d_batch_normed, gpu->d_gemm_q8, H, 2, cs);
+        cudaStreamSynchronize(cs);
+
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int i = 0; i < iters; i++) {
+            cuda_quantize_mmq_q8_1(gpu->d_batch_normed, gpu->d_gemm_q8, H, 2, cs);
+            cuda_gemm_q4k(w, gpu->d_gemm_q8, gpu->d_batch_q, NH*HD, H, 2, cs);
+        }
+        cudaStreamSynchronize(cs);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double t_gemm = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+        LOG_INFO("Raw: GEMM batch=2 Q[%dx%d] × %d iters = %.2fms avg",
+                 NH*HD, H, iters, t_gemm / iters * 1000);
+
+        LOG_INFO("GEMM batch=2 vs 2×matvec: %.2fx speedup",
+                 (t_2mv / iters) / (t_gemm / iters));
+    }
 }
 
 int mnemo_cuda_generate(MnemoCudaCtx *ctx, const char *prompt, int max_tokens,
