@@ -63,6 +63,20 @@ typedef enum {
     SLOT_READY   = 2,  // Upload complete, visible to lookup and compute
 } ExpertSlotState;
 
+// ── Batch slot: per-request GPU buffers for continuous batching ──
+
+#define MAX_BATCH 4
+
+typedef struct {
+    float *d_hidden, *d_residual;
+    float *d_q, *d_k, *d_v;
+    float *d_attn_out, *d_normed;
+    float *d_moe_out, *d_logits;
+    void  *d_kv_k, *d_kv_v;
+    float *d_kv_k_scales, *d_kv_v_scales;
+    bool   allocated;
+} BatchSlot;
+
 // ── Per-GPU state ──
 
 typedef struct {
@@ -83,22 +97,27 @@ typedef struct {
     int layer_start;
     int layer_end;
 
-    float *d_hidden;
-    float *d_residual;
+    // Slot 0 = primary (used by all existing single-request code paths)
+    float *d_hidden, *d_residual;
     float *d_q, *d_k, *d_v;
-    float *d_attn_out;
-    float *d_normed;
+    float *d_attn_out, *d_normed;
+    float *d_moe_out, *d_logits;
+
+    // Shared compute buffers (not per-request — reused across slots)
     float *d_router_logits;
     float *d_expert_gate, *d_expert_up, *d_expert_act, *d_expert_out;
-    float *d_moe_out;
-    float *d_logits;
 
     void *h_expert_buf;
     void *d_expert_buf;
     size_t expert_buf_size;
 
+    // Slot 0 KV cache
     void *d_kv_k, *d_kv_v;
-    float *d_kv_k_scales, *d_kv_v_scales;  // INT8 KV per-position per-head scales
+    float *d_kv_k_scales, *d_kv_v_scales;
+
+    // Additional batch slots (slot 1..MAX_BATCH-1)
+    BatchSlot extra_slots[MAX_BATCH - 1];
+    int n_extra_slots;  // how many are allocated
 
     float *d_router_out;
     int   *d_expert_indices;
@@ -240,6 +259,10 @@ struct MnemoCudaCtx {
     float *h_hidden_transfer;
 
     int kv_pos;
+
+    // Continuous batching: per-request KV positions
+    int batch_kv_pos[MAX_BATCH];  // kv_pos per batch slot
+    int active_batch_size;         // 0 = single-request mode
 
     RAMCache ram_cache;
 

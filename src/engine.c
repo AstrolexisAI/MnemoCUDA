@@ -1263,6 +1263,51 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
             build_attention_graphs(ctx);
     }
 
+    // Allocate extra batch slots for continuous batching (1 extra slot = batch=2)
+    {
+        int NKV_l = cfg->num_key_value_heads, HD_l = cfg->head_dim;
+        int NH_l = cfg->num_attention_heads, V_l = cfg->vocab_size;
+        for (int g = 0; g < ctx->n_gpus; g++) {
+            GPUState *gpu = &ctx->gpus[g];
+            cudaSetDevice(gpu->gpu_id);
+            int n_layers = gpu->layer_end - gpu->layer_start;
+            size_t kv_elem_sz = cfg->kv_int8 ? 1 : 2;
+            size_t kv_size = (size_t)n_layers * config.context_length * NKV_l * HD_l * kv_elem_sz;
+
+            BatchSlot *s = &gpu->extra_slots[0];
+            memset(s, 0, sizeof(*s));
+            cudaError_t e = cudaSuccess;
+            e |= cudaMalloc((void**)&s->d_hidden,  H * sizeof(float));
+            e |= cudaMalloc((void**)&s->d_residual, H * sizeof(float));
+            e |= cudaMalloc((void**)&s->d_normed,   H * sizeof(float));
+            e |= cudaMalloc((void**)&s->d_q,        NH_l * HD_l * sizeof(float));
+            e |= cudaMalloc((void**)&s->d_k,        NKV_l * HD_l * sizeof(float));
+            e |= cudaMalloc((void**)&s->d_v,        NKV_l * HD_l * sizeof(float));
+            e |= cudaMalloc((void**)&s->d_attn_out,  NH_l * HD_l * sizeof(float));
+            e |= cudaMalloc((void**)&s->d_moe_out,   (size_t)H * K * sizeof(float));
+            if (g == ctx->n_gpus - 1)
+                e |= cudaMalloc((void**)&s->d_logits, V_l * sizeof(float));
+            e |= cudaMalloc((void**)&s->d_kv_k, kv_size);
+            e |= cudaMalloc((void**)&s->d_kv_v, kv_size);
+            if (e == cudaSuccess) {
+                cudaMemset(s->d_kv_k, 0, kv_size);
+                cudaMemset(s->d_kv_v, 0, kv_size);
+                s->allocated = true;
+                gpu->n_extra_slots = 1;
+                LOG_INFO("GPU %d: batch slot 1 allocated (KV %.1f MB)",
+                         gpu->gpu_id, (double)kv_size * 2 / (1024*1024));
+            } else {
+                cudaFree(s->d_hidden); cudaFree(s->d_residual); cudaFree(s->d_normed);
+                cudaFree(s->d_q); cudaFree(s->d_k); cudaFree(s->d_v);
+                cudaFree(s->d_attn_out); cudaFree(s->d_moe_out); cudaFree(s->d_logits);
+                cudaFree(s->d_kv_k); cudaFree(s->d_kv_v);
+                memset(s, 0, sizeof(*s));
+                cudaGetLastError();
+                LOG_WARN("GPU %d: batch slot 1 OOM — single-request only", gpu->gpu_id);
+            }
+        }
+    }
+
     ctx->loaded = true;
     LOG_INFO("Ready: %s", ctx->info);
     return 0;
