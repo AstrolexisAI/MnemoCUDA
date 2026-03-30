@@ -936,6 +936,8 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_v,        NKV * HD * sizeof(float)));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_attn_out, NH * HD * sizeof(float)));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_normed,   H * sizeof(float)));
+        // GEMM Q8_1 buffer: (H/128) blocks × 144 bytes × MAX_BATCH
+        CUDA_LOAD_CHECK(cudaMalloc(&gpu->d_gemm_q8, (size_t)(H / 128) * 144 * MAX_BATCH));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_router_logits, cfg->num_experts * sizeof(float)));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_router_out, cfg->num_experts * sizeof(float)));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_expert_indices, K * sizeof(int)));
@@ -1333,6 +1335,7 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
         cudaFree(gpu->d_q); cudaFree(gpu->d_k); cudaFree(gpu->d_v);
         cudaFree(gpu->d_attn_out); cudaFree(gpu->d_normed);
         cudaFree(gpu->d_router_logits); cudaFree(gpu->d_router_out);
+        cudaFree(gpu->d_gemm_q8);
         cudaFree(gpu->d_expert_indices); cudaFree(gpu->d_expert_weights);
         if (gpu->h_expert_indices) cudaFreeHost(gpu->h_expert_indices);
         if (gpu->h_expert_weights) cudaFreeHost(gpu->h_expert_weights);
