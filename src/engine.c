@@ -1133,6 +1133,8 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
                 cudaMalloc((void**)&gpu->d_class_hit_slots, 16 * sizeof(int));
                 cudaMalloc((void**)&gpu->d_class_miss_mask, 16 * sizeof(int));
                 cudaMallocHost((void**)&gpu->h_class_miss_mask, 16 * sizeof(int));
+                cudaMalloc((void**)&gpu->d_n_hits, sizeof(int));
+                cudaMallocHost((void**)&gpu->h_n_hits, sizeof(int));
                 // Initialize device cache state to -1 (empty)
                 cudaMemset(gpu->d_cache_layer, 0xFF, ns * sizeof(int));
                 cudaMemset(gpu->d_cache_expert, 0xFF, ns * sizeof(int));
@@ -1305,6 +1307,8 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
         cudaFree(gpu->d_class_hit_slots);
         cudaFree(gpu->d_class_miss_mask);
         if (gpu->h_class_miss_mask) cudaFreeHost(gpu->h_class_miss_mask);
+        cudaFree(gpu->d_n_hits);
+        if (gpu->h_n_hits) cudaFreeHost(gpu->h_n_hits);
 
         // Free CUDA graphs
         if (gpu->attn_graph_exec) {

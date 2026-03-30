@@ -128,6 +128,8 @@ typedef struct {
     int *d_class_hit_slots;       // slot indices for VRAM hits (max K=16)
     int *d_class_miss_mask;       // 1 = miss, 0 = VRAM hit (per expert index)
     int *h_class_miss_mask;       // pinned host copy of miss_mask
+    int *d_n_hits;                // device: count of L1 hits
+    int *h_n_hits;                // pinned host: count of L1 hits
 
     bool expert_buf_pinned;
     bool prefetch_buf_pinned;

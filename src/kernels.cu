@@ -1771,11 +1771,10 @@ __global__ void classify_experts_kernel(
     int eid = expert_indices[e];
     if (eid < 0 || eid >= n_experts) {
         hit_slots[e] = -1;
-        miss_mask[e] = 0;  // invalid expert, skip
+        miss_mask[e] = 0;
         return;
     }
 
-    // Linear scan of cache slots (n_slots typically 1000-4000)
     for (int s = 0; s < n_slots; s++) {
         if (cache_layer[s] == layer && cache_expert[s] == eid) {
             hit_slots[e] = s;
@@ -1785,6 +1784,17 @@ __global__ void classify_experts_kernel(
     }
     hit_slots[e] = -1;
     miss_mask[e] = 1;
+}
+
+// Count L1 hits from classification result
+__global__ void count_hits_kernel(
+    const int *__restrict__ miss_mask, int K, int *__restrict__ n_hits_out
+) {
+    if (threadIdx.x != 0) return;
+    int count = 0;
+    for (int e = 0; e < K; e++)
+        if (miss_mask[e] == 0) count++;
+    *n_hits_out = count;
 }
 
 // ── GPU-side embedding lookup + dequantization ──
@@ -2066,6 +2076,11 @@ __global__ void sample_token_kernel(
 
     #undef TOPP_LOCAL_K
     #undef TOPP_TOTAL_CANDS
+}
+
+void cuda_count_hits(const int *miss_mask, int K, int *n_hits_out, cudaStream_t stream) {
+    count_hits_kernel<<<1, 1, 0, stream>>>(miss_mask, K, n_hits_out);
+    KERNEL_LAUNCH_CHECK();
 }
 
 void cuda_classify_experts(const int *expert_indices,

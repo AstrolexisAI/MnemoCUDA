@@ -811,6 +811,11 @@ attn_done:
                               layer, gpu->expert_cache_slots, K, NE, cs);
     }
 
+    // Count L1 hits on GPU and copy count to host (fast path check)
+    extern void cuda_count_hits(const int *, int, int *, cudaStream_t);
+    if (gpu->d_n_hits)
+        cuda_count_hits(gpu->d_class_miss_mask, K, gpu->d_n_hits, cs);
+
     // Copy classification results + expert IDs/weights to host (all on cs)
     cudaMemcpyAsync(gpu->h_expert_indices, gpu->d_expert_indices,
                     K * sizeof(int), cudaMemcpyDeviceToHost, cs);
@@ -819,6 +824,9 @@ attn_done:
     if (gpu->h_class_miss_mask)
         cudaMemcpyAsync(gpu->h_class_miss_mask, gpu->d_class_miss_mask,
                         K * sizeof(int), cudaMemcpyDeviceToHost, cs);
+    if (gpu->h_n_hits)
+        cudaMemcpyAsync(gpu->h_n_hits, gpu->d_n_hits,
+                        sizeof(int), cudaMemcpyDeviceToHost, cs);
     cudaEventRecord(gpu->ev_router, cs);
 
     // ── 11 + 12. Expert load (cache-first) + forward on GPU ──
