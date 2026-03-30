@@ -23,4 +23,8 @@ int forward_pass_sample(MnemoCudaCtx *ctx, int token_id, int pos,
 // Forward pass without lm_head: used during prefill (no logits needed).
 int forward_pass_no_logits(MnemoCudaCtx *ctx, int token_id, int pos);
 
+// Batched prefill: process multiple tokens sequentially without returning
+// to host between tokens. Reduces function call overhead and keeps GPU busy.
+int forward_prefill_batch(MnemoCudaCtx *ctx, const int *token_ids, int n_tokens, int start_pos);
+
 #endif

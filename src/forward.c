@@ -586,7 +586,6 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
     float eps = cfg->rms_norm_eps;
     cudaStream_t cs = gpu->stream_compute;
 
-    char tname[128];
     double t0, t1;  // profiling timers
 
     // Detect if this is an attention layer or SSM layer (hybrid MoE+SSM models)
@@ -596,12 +595,15 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
         is_attention_layer = (layer % cfg->full_attention_interval == 0);
     }
 
+    // Use cached tensor pointers (avoids 19× snprintf+hash per layer per token)
+    #define LT ctx->layer_tensors[layer]
+
     t0 = now_ms();
     if (is_attention_layer) {
         // ── 1. Pre-attention RMS norm ──
-        snprintf(tname, sizeof(tname), "blk.%d.attn_norm.weight", layer);
-        void *norm_w = tensor_data_on_gpu(ctx, tname, gpu_idx);
-        if (norm_w) {
+        TensorEntry *an = LT.attn_norm;
+        if (an) {
+            void *norm_w = tensor_ptr_on_gpu(ctx, an, gpu_idx);
             cuda_rms_norm(gpu->d_hidden, (float *)norm_w, gpu->d_normed, H, eps, cs);
         }
 
@@ -610,30 +612,25 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
                         cudaMemcpyDeviceToDevice, cs);
 
         // ── 2. Q/K/V projections (GPU dequant matvec) ──
-        snprintf(tname, sizeof(tname), "blk.%d.attn_q.weight", layer);
-        TensorEntry *wq = tensor_get(ctx, tname);
+        TensorEntry *wq = LT.attn_q;
         if (wq) matvec(tensor_ptr_on_gpu(ctx, wq, gpu_idx),
                         gpu->d_normed, gpu->d_q, NH * HD, H, wq->type_id, cs);
 
-        snprintf(tname, sizeof(tname), "blk.%d.attn_k.weight", layer);
-        TensorEntry *wk = tensor_get(ctx, tname);
+        TensorEntry *wk = LT.attn_k;
         if (wk) matvec(tensor_ptr_on_gpu(ctx, wk, gpu_idx),
                         gpu->d_normed, gpu->d_k, NKV * HD, H, wk->type_id, cs);
 
-        snprintf(tname, sizeof(tname), "blk.%d.attn_v.weight", layer);
-        TensorEntry *wv = tensor_get(ctx, tname);
+        TensorEntry *wv = LT.attn_v;
         if (wv) matvec(tensor_ptr_on_gpu(ctx, wv, gpu_idx),
                         gpu->d_normed, gpu->d_v, NKV * HD, H, wv->type_id, cs);
 
         // ── 3. QK norms (optional, Qwen3 uses them) — batched: 1 launch per Q, 1 per K ──
-        snprintf(tname, sizeof(tname), "blk.%d.attn_q_norm.weight", layer);
-        TensorEntry *qn = tensor_get(ctx, tname);
+        TensorEntry *qn = LT.attn_q_norm;
         if (qn)
             cuda_rms_norm_batched(gpu->d_q, (float *)tensor_ptr_on_gpu(ctx, qn, gpu_idx),
                                   gpu->d_q, HD, NH, eps, cs);
 
-        snprintf(tname, sizeof(tname), "blk.%d.attn_k_norm.weight", layer);
-        TensorEntry *kn = tensor_get(ctx, tname);
+        TensorEntry *kn = LT.attn_k_norm;
         if (kn)
             cuda_rms_norm_batched(gpu->d_k, (float *)tensor_ptr_on_gpu(ctx, kn, gpu_idx),
                                   gpu->d_k, HD, NKV, eps, cs);
@@ -662,8 +659,7 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
                              NH, HD, NKV, seq_len, gqa_ratio, attn_scale, cs);
 
         // ── 7. Output projection + residual (GPU) ──
-        snprintf(tname, sizeof(tname), "blk.%d.attn_output.weight", layer);
-        TensorEntry *wo = tensor_get(ctx, tname);
+        TensorEntry *wo = LT.attn_output;
         if (wo) matvec(tensor_ptr_on_gpu(ctx, wo, gpu_idx),
                         gpu->d_attn_out, gpu->d_hidden, H, NH * HD, wo->type_id, cs);
 
@@ -682,9 +678,10 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
 
     // ── 8. Pre-FFN RMS norm ──
     t0 = now_ms();
-    snprintf(tname, sizeof(tname), "blk.%d.ffn_norm.weight", layer);
-    void *ffn_norm_w = tensor_data_on_gpu(ctx, tname, gpu_idx);
-    if (!ffn_norm_w) return;  // no FFN on this layer (pure SSM without MoE)
+    TensorEntry *fn = LT.ffn_norm;
+    if (!fn) return;
+    void *ffn_norm_w = tensor_ptr_on_gpu(ctx, fn, gpu_idx);
+    if (!ffn_norm_w) return;
     cuda_rms_norm(gpu->d_hidden, (float *)ffn_norm_w, gpu->d_normed, H, eps, cs);
 
     // Save residual for MoE skip connection
@@ -692,8 +689,7 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
                     cudaMemcpyDeviceToDevice, cs);
 
     // ── 9. Router: F32 matvec on GPU ──
-    snprintf(tname, sizeof(tname), "blk.%d.ffn_gate_inp.weight", layer);
-    TensorEntry *wr = tensor_get(ctx, tname);
+    TensorEntry *wr = LT.ffn_gate_inp;
     if (!wr) return;
 
     // Router is F32 column-major [H, NE] — use F32 matvec kernel on GPU
@@ -999,6 +995,7 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
     // ── 13. MoE output + residual (GPU) ──
     cuda_residual_add(gpu->d_moe_out, gpu->d_residual, gpu->d_hidden, H, cs);
 
+    #undef LT
 }
 
 // ── Expert forward helper: gate + up + swiglu + down + scaled_add ──
@@ -1419,6 +1416,57 @@ int forward_pass_no_logits(MnemoCudaCtx *ctx, int token_id, int pos) {
     }
 
     // Skip lm_head entirely — no logits needed during prefill
+    return 0;
+}
+
+// ── Batched prefill: process multiple tokens without host round-trips ──
+
+int forward_prefill_batch(MnemoCudaCtx *ctx, const int *token_ids, int n_tokens, int start_pos) {
+    ModelConfig *cfg = &ctx->config;
+    int H = cfg->hidden_size;
+
+    for (int t = 0; t < n_tokens; t++) {
+        int pos = start_pos + t;
+        if (pos >= cfg->max_position_embeddings) {
+            LOG_ERROR("pos %d exceeds context length %d", pos, cfg->max_position_embeddings);
+            return -4;
+        }
+
+        // Reset profiling per token
+        ctx->prof_attn_ms = ctx->prof_router_ms = ctx->prof_cache_ms = 0;
+        ctx->prof_expert_ms = ctx->prof_io_ms = ctx->prof_handoff_ms = 0;
+
+        // Embedding lookup (GPU-side)
+        int rc = embed_token(ctx, token_ids[t]);
+        if (rc != 0) return rc;
+
+        // Layer loop
+        for (int g = 0; g < ctx->n_gpus; g++) {
+            GPUState *gpu = &ctx->gpus[g];
+            cudaSetDevice(gpu->gpu_id);
+            if (g > 0) {
+                GPUState *prev = &ctx->gpus[g - 1];
+                if (ctx->p2p_enabled[g - 1][g]) {
+                    cudaSetDevice(gpu->gpu_id);
+                    cudaMemcpyPeerAsync(gpu->d_hidden, gpu->gpu_id,
+                                        prev->d_hidden, prev->gpu_id,
+                                        H * sizeof(float), gpu->stream_compute);
+                } else {
+                    cudaSetDevice(prev->gpu_id);
+                    cudaMemcpy(ctx->h_hidden_transfer, prev->d_hidden,
+                               H * sizeof(float), cudaMemcpyDeviceToHost);
+                    cudaSetDevice(gpu->gpu_id);
+                    cudaMemcpyAsync(gpu->d_hidden, ctx->h_hidden_transfer,
+                                    H * sizeof(float), cudaMemcpyHostToDevice,
+                                    gpu->stream_compute);
+                }
+            }
+            for (int layer = gpu->layer_start; layer < gpu->layer_end; layer++)
+                forward_layer(ctx, layer, g, pos);
+        }
+        // No lm_head, no logits copy — just advance KV position
+    }
+
     return 0;
 }
 

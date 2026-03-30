@@ -233,6 +233,14 @@ struct MnemoCudaCtx {
     int last_activated[16];
     int n_last_activated;
 
+    // Per-layer cached tensor pointers (avoids snprintf+hash per layer per token)
+    struct {
+        TensorEntry *attn_norm, *attn_q, *attn_k, *attn_v;
+        TensorEntry *attn_q_norm, *attn_k_norm;
+        TensorEntry *attn_output;
+        TensorEntry *ffn_norm, *ffn_gate_inp;
+    } *layer_tensors;  // [num_hidden_layers]
+
     int extra_prefetch;       // 1 = prefetch layer+2 as well as layer+1
     bool profiling_enabled;   // gate per-layer cudaStreamSynchronize for profiling
     bool p2p_enabled[8][8];   // p2p_enabled[src_gpu_idx][dst_gpu_idx]

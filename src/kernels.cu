@@ -579,6 +579,7 @@ __global__ void matvec_f32(
 #define ATTN_TILE 2048
 
 // Tiled attention kernel for FP32 KV cache (same online softmax approach).
+// Q vector cached in shared memory to avoid repeated global memory reads.
 __global__ void attention_kernel(
     const float *__restrict__ q, const float *__restrict__ kv_k,
     const float *__restrict__ kv_v, float *__restrict__ out,
@@ -587,11 +588,17 @@ __global__ void attention_kernel(
     int head = blockIdx.x, kv_head = head / gqa_ratio, tid = threadIdx.x;
     extern __shared__ float shared[];
     float *tile_scores = shared;
+    float *s_q = shared + ATTN_TILE;  // Q vector cache
     __shared__ float smax[32], ssum[32];
     int warp_id = tid / 32, lane = tid % 32;
     const float *qh = q + head * head_dim;
     int kv_stride = n_kv_heads * head_dim;
     float *out_h = out + head * head_dim;
+
+    // Cache Q in shared memory
+    for (int d = tid; d < head_dim; d += blockDim.x)
+        s_q[d] = qh[d];
+    __syncthreads();
 
     float global_max = -1e30f, global_sum = 0.0f;
     for (int d = tid; d < head_dim; d += blockDim.x) out_h[d] = 0.0f;
@@ -605,7 +612,7 @@ __global__ void attention_kernel(
             int p = tile_start + i;
             const float *kp = kv_k + (size_t)p * kv_stride + (size_t)kv_head * head_dim;
             float dot = 0.0f;
-            for (int d = 0; d < head_dim; d++) dot += qh[d] * kp[d];
+            for (int d = 0; d < head_dim; d++) dot += s_q[d] * kp[d];
             tile_scores[i] = dot * scale;
         }
         __syncthreads();
@@ -873,9 +880,8 @@ void cuda_matvec_f32(const float *weights, const float *x, float *y,
 void cuda_attention(const float *q, const float *kv_k, const float *kv_v,
                     float *out, int n_heads_q, int head_dim, int n_kv_heads,
                     int seq_len, int gqa_ratio, float scale, cudaStream_t stream) {
-    // One block per query head, 256 threads per block
     int threads = 256;
-    size_t smem = ATTN_TILE * sizeof(float) + 64 * sizeof(float);
+    size_t smem = (ATTN_TILE + head_dim + 64) * sizeof(float);
     attention_kernel<<<n_heads_q, threads, smem, stream>>>(
         q, kv_k, kv_v, out, head_dim, n_kv_heads, seq_len, gqa_ratio, scale);
     KERNEL_LAUNCH_CHECK();
@@ -917,34 +923,36 @@ __global__ void attention_kernel_f16kv(
 ) {
     int head = blockIdx.x, kv_head = head / gqa_ratio, tid = threadIdx.x;
     extern __shared__ float shared[];
-    float *tile_scores = shared;  // [ATTN_TILE] — fits in ~8KB
+    float *tile_scores = shared;  // [ATTN_TILE]
+    float *s_q = shared + ATTN_TILE;  // [head_dim] — Q vector cached in shared mem
     __shared__ float smax[32], ssum[32];
     int warp_id = tid / 32, lane = tid % 32;
     const float *qh = q + head * head_dim;
     int kv_stride = n_kv_heads * head_dim;
     float *out_h = out + head * head_dim;
 
-    // Initialize output accumulator and online softmax state
-    // Each thread accumulates its own output dimensions
+    // Cache Q vector in shared memory (avoids repeated global reads)
+    for (int d = tid; d < head_dim; d += blockDim.x)
+        s_q[d] = qh[d];
+    __syncthreads();
+
     float global_max = -1e30f;
     float global_sum = 0.0f;
 
-    // Zero output
     for (int d = tid; d < head_dim; d += blockDim.x)
         out_h[d] = 0.0f;
 
-    // Process tiles of positions
     for (int tile_start = 0; tile_start < seq_len; tile_start += ATTN_TILE) {
         int tile_end = tile_start + ATTN_TILE;
         if (tile_end > seq_len) tile_end = seq_len;
         int tile_len = tile_end - tile_start;
 
-        // Compute Q @ K^T for this tile
+        // Q @ K^T: each thread handles one position, reads Q from shared mem
         for (int i = tid; i < tile_len; i += blockDim.x) {
             int p = tile_start + i;
             const __half *kp = kv_k + (size_t)p * kv_stride + (size_t)kv_head * head_dim;
             float dot = 0.0f;
-            for (int d = 0; d < head_dim; d++) dot += qh[d] * __half2float(kp[d]);
+            for (int d = 0; d < head_dim; d++) dot += s_q[d] * __half2float(kp[d]);
             tile_scores[i] = dot * scale;
         }
         __syncthreads();
@@ -1018,8 +1026,8 @@ __global__ void attention_kernel_f16kv(
 void cuda_attention_f16kv(const void *q, const void *kv_k, const void *kv_v,
                           float *out, int n_heads_q, int head_dim, int n_kv_heads,
                           int seq_len, int gqa_ratio, float scale, cudaStream_t stream) {
-    // Tiled: shared memory is fixed at ATTN_TILE floats + reduction buffers
-    size_t smem = ATTN_TILE * sizeof(float) + 64 * sizeof(float);
+    // Shared: ATTN_TILE (scores) + head_dim (Q cache) + 64 (reduction)
+    size_t smem = (ATTN_TILE + head_dim + 64) * sizeof(float);
     attention_kernel_f16kv<<<n_heads_q, 256, smem, stream>>>(
         (const float *)q, (const __half *)kv_k, (const __half *)kv_v,
         out, head_dim, n_kv_heads, seq_len, gqa_ratio, scale);

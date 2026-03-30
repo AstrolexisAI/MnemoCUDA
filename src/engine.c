@@ -1189,6 +1189,27 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
     ctx->extra_prefetch = config.extra_prefetch;
     ctx->profiling_enabled = (getenv("MNEMO_PROFILE") != NULL);
 
+    // Pre-cache per-layer tensor pointers (avoids snprintf+hash per layer per token)
+    {
+        int NL = cfg->num_hidden_layers;
+        ctx->layer_tensors = calloc(NL, sizeof(*ctx->layer_tensors));
+        char tn[128];
+        for (int l = 0; l < NL; l++) {
+            #define LT(field, name) do { snprintf(tn, sizeof(tn), "blk.%d." name, l); \
+                ctx->layer_tensors[l].field = tensor_find(&ctx->tensor_table, tn); } while(0)
+            LT(attn_norm, "attn_norm.weight");
+            LT(attn_q, "attn_q.weight");
+            LT(attn_k, "attn_k.weight");
+            LT(attn_v, "attn_v.weight");
+            LT(attn_q_norm, "attn_q_norm.weight");
+            LT(attn_k_norm, "attn_k_norm.weight");
+            LT(attn_output, "attn_output.weight");
+            LT(ffn_norm, "ffn_norm.weight");
+            LT(ffn_gate_inp, "ffn_gate_inp.weight");
+            #undef LT
+        }
+    }
+
     // Probe and enable P2P GPU access for direct GPU-to-GPU transfers
     if (ctx->n_gpus > 1) {
         for (int i = 0; i < ctx->n_gpus; i++) {
@@ -1328,6 +1349,8 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
 
     free(ctx->heat_map);
     ctx->heat_map = NULL;
+    free(ctx->layer_tensors);
+    ctx->layer_tensors = NULL;
     free(ctx->layer_hits);
     ctx->layer_hits = NULL;
     free(ctx->layer_misses);
@@ -1509,14 +1532,14 @@ fallback_tokenizer:
     LOG_INFO("Prompt: %d tokens, generating up to %d", n_tokens, max_tokens);
 
     // ── 2. Prefill: process all prompt tokens ──
-    // Use forward_pass_no_logits for all but the last token (skip lm_head).
+    // Batched prefill for all but the last token (no lm_head needed).
     // Last prefill token uses forward_pass_sample to get the first generated token.
     ctx->kv_pos = 0;
-    for (int i = 0; i < n_tokens - 1; i++) {
+    if (n_tokens > 1) {
         if (ctx->cancelled) { free(tokens); return MNEMO_ERR_CANCELLED; }
-        int rc = forward_pass_no_logits(ctx, tokens[i], ctx->kv_pos);
+        int rc = forward_prefill_batch(ctx, tokens, n_tokens - 1, 0);
         if (rc != 0) { free(tokens); return rc; }
-        ctx->kv_pos++;
+        ctx->kv_pos = n_tokens - 1;
     }
 
     // Last prefill token: need to sample from it
