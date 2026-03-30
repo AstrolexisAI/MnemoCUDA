@@ -69,9 +69,9 @@ __global__ void matvec_q4k(
     float          *__restrict__ y,
     int n_rows, int n_cols
 ) {
-    // Tiled x-vector: load 256 floats (1KB) per tile, aligned with Q4K blocks.
-    // All warps in the block process the same tile's Q4K block for their own row.
-    // 1KB shared vs 16KB → allows 12+ blocks/SM instead of 3.
+    // Vectorized Q4K matvec: 32 lanes load qs[128] as 32×uint32_t in 1 coalesced
+    // transaction (128 bytes). Each lane unpacks 4 bytes = 8 Q4K values (lo+hi nibbles).
+    // No branches in inner loop, fully unrolled per group.
     __shared__ float s_tile[256];
 
     int warps_per_block = blockDim.x / 32;
@@ -82,47 +82,50 @@ __global__ void matvec_q4k(
 
     float sum = 0.0f;
 
-    // Iterate over Q4K blocks (tiles of 256 elements of x)
     for (int b = 0; b < blocks_per_row; b++) {
-        // Cooperatively load x-tile into shared memory
         int base = b * 256;
         for (int i = threadIdx.x; i < 256 && (base + i) < n_cols; i += blockDim.x)
             s_tile[i] = x[base + i];
         __syncthreads();
 
         if (row < n_rows) {
-            const BlockQ4K &blk = weights[row * blocks_per_row + b];
-            float d   = f16_to_f32(blk.d);
-            float dmin = f16_to_f32(blk.dmin);
-            const uint8_t *q = blk.qs;
+            const BlockQ4K *blk_ptr = &weights[(size_t)row * blocks_per_row + b];
+            float d   = f16_to_f32(blk_ptr->d);
+            float dmin = f16_to_f32(blk_ptr->dmin);
 
-            // Each lane processes a subset of the 256 values
-            for (int j = lane; j < 256 && (base + j) < n_cols; j += 32) {
-                int sub = j / 32;  // sub-block index (0..7)
-                uint8_t sc, m;
-                get_scale_min_k4(sub, blk.scales, sc, m);
-                float dsc = d * sc, mf = dmin * m;
+            // Vectorized load: 32 lanes × 4 bytes = 128 bytes in 1 transaction
+            uint32_t my_qs = ((const uint32_t *)blk_ptr->qs)[lane];
+            uint8_t q0 = my_qs & 0xFF;
+            uint8_t q1 = (my_qs >> 8) & 0xFF;
+            uint8_t q2 = (my_qs >> 16) & 0xFF;
+            uint8_t q3 = (my_qs >> 24) & 0xFF;
 
-                uint8_t q_val;
-                if (j % 64 < 32)
-                    q_val = q[j / 2] & 0xF;        // low nibble
-                else
-                    q_val = q[(j - 32) / 2] >> 4;   // high nibble (same byte)
+            // Lane k owns qs[4k..4k+3]. Group = lane/8, pos_in_group = (lane%8)*4
+            int grp = lane / 8;
+            int pos = (lane % 8) * 4;
 
-                // Corrected qs indexing: within each 64-value group,
-                // first 32 use low nibbles of qs[0..31], next 32 use high nibbles
-                int grp64 = j / 64;     // which 64-value group (0..3)
-                int within = j % 64;    // position within group
-                int qs_off = grp64 * 32;
-                if (within < 32) {
-                    q_val = q[qs_off + within] & 0xF;
-                    get_scale_min_k4(grp64 * 2, blk.scales, sc, m);
-                } else {
-                    q_val = q[qs_off + (within - 32)] >> 4;
-                    get_scale_min_k4(grp64 * 2 + 1, blk.scales, sc, m);
-                }
-                dsc = d * sc; mf = dmin * m;
-                sum += (dsc * q_val - mf) * s_tile[j];
+            uint8_t sc_lo, m_lo, sc_hi, m_hi;
+            get_scale_min_k4(grp * 2,     blk_ptr->scales, sc_lo, m_lo);
+            get_scale_min_k4(grp * 2 + 1, blk_ptr->scales, sc_hi, m_hi);
+            float d_lo = d * sc_lo, mf_lo = dmin * m_lo;
+            float d_hi = d * sc_hi, mf_hi = dmin * m_hi;
+
+            // Low nibbles: values at grp*64 + pos + {0,1,2,3}
+            int lo_base = grp * 64 + pos;
+            if (lo_base + 3 < n_cols - base) {
+                sum += (d_lo * (q0 & 0xF) - mf_lo) * s_tile[lo_base];
+                sum += (d_lo * (q1 & 0xF) - mf_lo) * s_tile[lo_base + 1];
+                sum += (d_lo * (q2 & 0xF) - mf_lo) * s_tile[lo_base + 2];
+                sum += (d_lo * (q3 & 0xF) - mf_lo) * s_tile[lo_base + 3];
+            }
+
+            // High nibbles: values at grp*64 + 32 + pos + {0,1,2,3}
+            int hi_base = grp * 64 + 32 + pos;
+            if (hi_base + 3 < n_cols - base) {
+                sum += (d_hi * (q0 >> 4) - mf_hi) * s_tile[hi_base];
+                sum += (d_hi * (q1 >> 4) - mf_hi) * s_tile[hi_base + 1];
+                sum += (d_hi * (q2 >> 4) - mf_hi) * s_tile[hi_base + 2];
+                sum += (d_hi * (q3 >> 4) - mf_hi) * s_tile[hi_base + 3];
             }
         }
         __syncthreads();
@@ -135,7 +138,7 @@ __global__ void matvec_q4k(
 }
 
 // ── Q4_K Dual Matvec (gate + up projections in one kernel) ──
-// Tiled x-vector: 256 floats (1KB) per tile.
+// Vectorized uint32_t loads, same pattern as matvec_q4k.
 __global__ void matvec_q4k_dual(
     const BlockQ4K *__restrict__ weights_a,
     const BlockQ4K *__restrict__ weights_b,
@@ -159,30 +162,49 @@ __global__ void matvec_q4k_dual(
         __syncthreads();
 
         if (row < n_rows) {
-            const BlockQ4K &blk_a = weights_a[row * blocks_per_row + b];
-            const BlockQ4K &blk_b = weights_b[row * blocks_per_row + b];
-            float da = f16_to_f32(blk_a.d), dmin_a = f16_to_f32(blk_a.dmin);
-            float db = f16_to_f32(blk_b.d), dmin_b = f16_to_f32(blk_b.dmin);
-            const uint8_t *qa = blk_a.qs, *qb = blk_b.qs;
+            const BlockQ4K *ba = &weights_a[(size_t)row * blocks_per_row + b];
+            const BlockQ4K *bb = &weights_b[(size_t)row * blocks_per_row + b];
+            float da = f16_to_f32(ba->d), dmin_a = f16_to_f32(ba->dmin);
+            float db = f16_to_f32(bb->d), dmin_b = f16_to_f32(bb->dmin);
 
-            for (int j = lane; j < 256 && (base + j) < n_cols; j += 32) {
-                int grp64 = j / 64, within = j % 64;
-                int qs_off = grp64 * 32;
-                uint8_t sc_a, m_a, sc_b, m_b; uint8_t qva, qvb;
-                if (within < 32) {
-                    qva = qa[qs_off + within] & 0xF;
-                    qvb = qb[qs_off + within] & 0xF;
-                    get_scale_min_k4(grp64 * 2, blk_a.scales, sc_a, m_a);
-                    get_scale_min_k4(grp64 * 2, blk_b.scales, sc_b, m_b);
-                } else {
-                    qva = qa[qs_off + (within - 32)] >> 4;
-                    qvb = qb[qs_off + (within - 32)] >> 4;
-                    get_scale_min_k4(grp64 * 2 + 1, blk_a.scales, sc_a, m_a);
-                    get_scale_min_k4(grp64 * 2 + 1, blk_b.scales, sc_b, m_b);
+            uint32_t qa4 = ((const uint32_t *)ba->qs)[lane];
+            uint32_t qb4 = ((const uint32_t *)bb->qs)[lane];
+
+            int grp = lane / 8;
+            int pos = (lane % 8) * 4;
+
+            uint8_t sca_lo, ma_lo, sca_hi, ma_hi;
+            uint8_t scb_lo, mb_lo, scb_hi, mb_hi;
+            get_scale_min_k4(grp * 2,     ba->scales, sca_lo, ma_lo);
+            get_scale_min_k4(grp * 2 + 1, ba->scales, sca_hi, ma_hi);
+            get_scale_min_k4(grp * 2,     bb->scales, scb_lo, mb_lo);
+            get_scale_min_k4(grp * 2 + 1, bb->scales, scb_hi, mb_hi);
+            float da_lo = da * sca_lo, mfa_lo = dmin_a * ma_lo;
+            float da_hi = da * sca_hi, mfa_hi = dmin_a * ma_hi;
+            float db_lo = db * scb_lo, mfb_lo = dmin_b * mb_lo;
+            float db_hi = db * scb_hi, mfb_hi = dmin_b * mb_hi;
+
+            int lo_base = grp * 64 + pos;
+            if (lo_base + 3 < n_cols - base) {
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    uint8_t va = (qa4 >> (k * 8)) & 0xF;
+                    uint8_t vb = (qb4 >> (k * 8)) & 0xF;
+                    float xv = s_tile[lo_base + k];
+                    sum_a += (da_lo * va - mfa_lo) * xv;
+                    sum_b += (db_lo * vb - mfb_lo) * xv;
                 }
-                float xv = s_tile[j];
-                sum_a += (da * sc_a * qva - dmin_a * m_a) * xv;
-                sum_b += (db * sc_b * qvb - dmin_b * m_b) * xv;
+            }
+            int hi_base = grp * 64 + 32 + pos;
+            if (hi_base + 3 < n_cols - base) {
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    uint8_t va = (qa4 >> (k * 8 + 4)) & 0xF;
+                    uint8_t vb = (qb4 >> (k * 8 + 4)) & 0xF;
+                    float xv = s_tile[hi_base + k];
+                    sum_a += (da_hi * va - mfa_hi) * xv;
+                    sum_b += (db_hi * vb - mfb_hi) * xv;
+                }
             }
         }
         __syncthreads();
@@ -196,7 +218,7 @@ __global__ void matvec_q4k_dual(
 }
 
 // ── Q4_K Matvec + Scaled Accumulate (fused down-projection + weighted add) ──
-// Tiled x-vector: 256 floats (1KB) per tile.
+// Vectorized uint32_t loads, same pattern as matvec_q4k.
 __global__ void matvec_q4k_scaled_add(
     const BlockQ4K *__restrict__ weights,
     const float    *__restrict__ x,
@@ -218,23 +240,33 @@ __global__ void matvec_q4k_scaled_add(
         __syncthreads();
 
         if (row < n_rows) {
-            const BlockQ4K &blk = weights[row * blocks_per_row + b];
-            float d   = f16_to_f32(blk.d);
-            float dmin = f16_to_f32(blk.dmin);
-            const uint8_t *q = blk.qs;
+            const BlockQ4K *blk_ptr = &weights[(size_t)row * blocks_per_row + b];
+            float d   = f16_to_f32(blk_ptr->d);
+            float dmin = f16_to_f32(blk_ptr->dmin);
 
-            for (int j = lane; j < 256 && (base + j) < n_cols; j += 32) {
-                int grp64 = j / 64, within = j % 64;
-                int qs_off = grp64 * 32;
-                uint8_t sc, m, q_val;
-                if (within < 32) {
-                    q_val = q[qs_off + within] & 0xF;
-                    get_scale_min_k4(grp64 * 2, blk.scales, sc, m);
-                } else {
-                    q_val = q[qs_off + (within - 32)] >> 4;
-                    get_scale_min_k4(grp64 * 2 + 1, blk.scales, sc, m);
-                }
-                sum += (d * sc * q_val - dmin * m) * s_tile[j];
+            uint32_t my_qs = ((const uint32_t *)blk_ptr->qs)[lane];
+            int grp = lane / 8;
+            int pos = (lane % 8) * 4;
+
+            uint8_t sc_lo, m_lo, sc_hi, m_hi;
+            get_scale_min_k4(grp * 2,     blk_ptr->scales, sc_lo, m_lo);
+            get_scale_min_k4(grp * 2 + 1, blk_ptr->scales, sc_hi, m_hi);
+            float d_lo = d * sc_lo, mf_lo = dmin * m_lo;
+            float d_hi = d * sc_hi, mf_hi = dmin * m_hi;
+
+            int lo_base = grp * 64 + pos;
+            if (lo_base + 3 < n_cols - base) {
+                sum += (d_lo * ((my_qs)       & 0xF) - mf_lo) * s_tile[lo_base];
+                sum += (d_lo * ((my_qs >> 8)  & 0xF) - mf_lo) * s_tile[lo_base + 1];
+                sum += (d_lo * ((my_qs >> 16) & 0xF) - mf_lo) * s_tile[lo_base + 2];
+                sum += (d_lo * ((my_qs >> 24) & 0xF) - mf_lo) * s_tile[lo_base + 3];
+            }
+            int hi_base = grp * 64 + 32 + pos;
+            if (hi_base + 3 < n_cols - base) {
+                sum += (d_hi * ((my_qs >> 4)  & 0xF) - mf_hi) * s_tile[hi_base];
+                sum += (d_hi * ((my_qs >> 12) & 0xF) - mf_hi) * s_tile[hi_base + 1];
+                sum += (d_hi * ((my_qs >> 20) & 0xF) - mf_hi) * s_tile[hi_base + 2];
+                sum += (d_hi * ((my_qs >> 28) & 0xF) - mf_hi) * s_tile[hi_base + 3];
             }
         }
         __syncthreads();
