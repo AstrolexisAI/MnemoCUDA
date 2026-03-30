@@ -402,6 +402,37 @@ __global__ void rms_norm_kernel(
         output[i] = input[i] * scale * weight[i];
 }
 
+// ── Batched RMS Norm (all heads in one launch) ──
+// Each block processes one head: input[block_id * head_dim .. (block_id+1) * head_dim]
+// Weight is shared across all heads (same norm weight vector of length head_dim).
+__global__ void rms_norm_batched_kernel(
+    const float *__restrict__ input,
+    const float *__restrict__ weight,
+    float       *__restrict__ output,
+    int head_dim, float eps
+) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int head = blockIdx.x;
+    const float *in  = input  + head * head_dim;
+    float       *out = output + head * head_dim;
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float v = in[i];
+        local_sum += v * v;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);
+    for (int i = tid; i < head_dim; i += blockDim.x)
+        out[i] = in[i] * scale * weight[i];
+}
+
 // ── Residual Add ──
 
 __global__ void residual_add_kernel(
@@ -473,8 +504,9 @@ __global__ void rope_kernel(
 }
 
 // ── F32 Matrix-Vector Multiply (for router weights) ──
-// GGUF stores F32 tensors row-major: weights[row * n_cols + col]
-// y[row] = sum_col(weights[row * n_cols + col] * x[col])
+// Warp-parallel: 1 warp (32 threads) per row, each thread accumulates
+// n_cols/32 elements, then warp-level shuffle reduction.
+// Block = 4 warps = 128 threads → 4 rows per block.
 
 __global__ void matvec_f32(
     const float *__restrict__ weights, // [n_rows × n_cols], row-major
@@ -482,13 +514,21 @@ __global__ void matvec_f32(
     float       *__restrict__ y,
     int n_rows, int n_cols
 ) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int row = blockIdx.x * 4 + warp_id;  // 4 warps per block
     if (row >= n_rows) return;
 
+    const float *row_ptr = weights + (size_t)row * n_cols;
     float sum = 0.0f;
-    for (int col = 0; col < n_cols; col++)
-        sum += weights[row * n_cols + col] * x[col];
-    y[row] = sum;
+    for (int col = lane; col < n_cols; col += 32)
+        sum += row_ptr[col] * x[col];
+
+    // Warp-level reduction
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+    if (lane == 0) y[row] = sum;
 }
 
 // ── GQA Attention kernel: Q@K^T → softmax → @V (one kernel per head) ──
@@ -734,6 +774,14 @@ void cuda_rms_norm(const float *input, const float *weight, float *output,
     KERNEL_LAUNCH_CHECK();
 }
 
+void cuda_rms_norm_batched(const float *input, const float *weight, float *output,
+                           int head_dim, int n_heads, float eps, cudaStream_t stream) {
+    int threads = (head_dim < 256) ? head_dim : 256;
+    rms_norm_batched_kernel<<<n_heads, threads, threads * sizeof(float), stream>>>(
+        input, weight, output, head_dim, eps);
+    KERNEL_LAUNCH_CHECK();
+}
+
 void cuda_residual_add(const float *a, const float *b, float *out,
                        int n, cudaStream_t stream) {
     int threads = 256;
@@ -764,8 +812,8 @@ void cuda_rope(float *q, float *k, int head_dim, int pos, float theta,
 
 void cuda_matvec_f32(const float *weights, const float *x, float *y,
                      int n_rows, int n_cols, cudaStream_t stream) {
-    int threads = 256;
-    int blocks = (n_rows + threads - 1) / threads;
+    int threads = 128;  // 4 warps, 1 warp per row
+    int blocks = (n_rows + 3) / 4;
     matvec_f32<<<blocks, threads, 0, stream>>>(weights, x, y, n_rows, n_cols);
     KERNEL_LAUNCH_CHECK();
 }

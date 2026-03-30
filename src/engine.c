@@ -315,7 +315,7 @@ const char *mnemo_cuda_strerror(int err) {
 
 MnemoCudaConfig mnemo_cuda_config_default(void) {
     MnemoCudaConfig c = {0};
-    c.context_length = 8192;  // 8K default — balances KV VRAM vs expert cache space
+    c.context_length = 2048;  // 2K default — keeps KV cache small, maximizes expert cache slots
     c.n_gpus = 0;             // 0 = auto-detect
     c.io_threads = 8;
     c.use_pinned_memory = true;
@@ -942,6 +942,8 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_expert_weights, K * sizeof(float)));
         CUDA_LOAD_CHECK(cudaMallocHost((void**)&gpu->h_expert_indices, 16 * sizeof(int)));
         CUDA_LOAD_CHECK(cudaMallocHost((void**)&gpu->h_expert_weights, 16 * sizeof(float)));
+        cudaEventCreateWithFlags(&gpu->ev_router, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&gpu->ev_upload, cudaEventDisableTiming);
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_expert_gate, EFF * sizeof(float)));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_expert_up,   EFF * sizeof(float)));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_expert_act,  EFF * sizeof(float)));
@@ -1231,6 +1233,8 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
         cudaFree(gpu->d_expert_indices); cudaFree(gpu->d_expert_weights);
         if (gpu->h_expert_indices) cudaFreeHost(gpu->h_expert_indices);
         if (gpu->h_expert_weights) cudaFreeHost(gpu->h_expert_weights);
+        cudaEventDestroy(gpu->ev_router);
+        cudaEventDestroy(gpu->ev_upload);
         cudaFree(gpu->d_expert_gate); cudaFree(gpu->d_expert_up);
         cudaFree(gpu->d_expert_act); cudaFree(gpu->d_expert_out);
         cudaFree(gpu->d_moe_out); cudaFree(gpu->d_logits);

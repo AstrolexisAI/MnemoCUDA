@@ -53,7 +53,7 @@ static void test_create_destroy(void) {
 static void test_config_defaults(void) {
     TEST("config defaults");
     MnemoCudaConfig cfg = mnemo_cuda_config_default();
-    ASSERT_EQ(cfg.context_length, 8192, "context_length default");
+    ASSERT_EQ(cfg.context_length, 2048, "context_length default");
     ASSERT_EQ(cfg.n_gpus, 0, "n_gpus default (auto-detect)");
     ASSERT_EQ(cfg.io_threads, 8, "io_threads default");
     ASSERT_TRUE(cfg.use_pinned_memory, "use_pinned_memory default");

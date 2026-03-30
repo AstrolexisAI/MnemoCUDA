@@ -65,6 +65,8 @@ extern void cuda_sample_token(const float *logits, int vocab_size,
                               float temperature, float top_p,
                               unsigned long long rng_state,
                               int *d_result, cudaStream_t stream);
+extern void cuda_rms_norm_batched(const float *input, const float *weight, float *output,
+                                  int head_dim, int n_heads, float eps, cudaStream_t stream);
 extern void cuda_embedding_lookup_q4k(const void *embd_table, float *output,
                                       int token_id, int hidden_size, int row_bytes,
                                       cudaStream_t stream);
@@ -429,11 +431,8 @@ void expert_cache_wait_until_ready(GPUState *gpu, void **device_ptrs, int n,
     expert_cache_poll_ready(gpu);
 
     // Make compute stream wait on stream_io to ensure device-side ordering
-    cudaEvent_t io_done;
-    cudaEventCreateWithFlags(&io_done, cudaEventDisableTiming);
-    cudaEventRecord(io_done, gpu->stream_io);
-    cudaStreamWaitEvent(compute_stream, io_done, 0);
-    cudaEventDestroy(io_done);
+    cudaEventRecord(gpu->ev_upload, gpu->stream_io);
+    cudaStreamWaitEvent(compute_stream, gpu->ev_upload, 0);
 }
 
 // ── SSM/Mamba forward for hybrid layers ──
@@ -611,24 +610,18 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
         if (wv) matvec(tensor_ptr_on_gpu(ctx, wv, gpu_idx),
                         gpu->d_normed, gpu->d_v, NKV * HD, H, wv->type_id, cs);
 
-        // ── 3. QK norms (optional, Qwen3 uses them) ──
+        // ── 3. QK norms (optional, Qwen3 uses them) — batched: 1 launch per Q, 1 per K ──
         snprintf(tname, sizeof(tname), "blk.%d.attn_q_norm.weight", layer);
         TensorEntry *qn = tensor_get(ctx, tname);
-        if (qn) {
-            for (int h = 0; h < NH; h++)
-                cuda_rms_norm(gpu->d_q + h * HD,
-                             (float *)tensor_ptr_on_gpu(ctx, qn, gpu_idx),
-                             gpu->d_q + h * HD, HD, eps, cs);
-        }
+        if (qn)
+            cuda_rms_norm_batched(gpu->d_q, (float *)tensor_ptr_on_gpu(ctx, qn, gpu_idx),
+                                  gpu->d_q, HD, NH, eps, cs);
 
         snprintf(tname, sizeof(tname), "blk.%d.attn_k_norm.weight", layer);
         TensorEntry *kn = tensor_get(ctx, tname);
-        if (kn) {
-            for (int h = 0; h < NKV; h++)
-                cuda_rms_norm(gpu->d_k + h * HD,
-                             (float *)tensor_ptr_on_gpu(ctx, kn, gpu_idx),
-                             gpu->d_k + h * HD, HD, eps, cs);
-        }
+        if (kn)
+            cuda_rms_norm_batched(gpu->d_k, (float *)tensor_ptr_on_gpu(ctx, kn, gpu_idx),
+                                  gpu->d_k, HD, NKV, eps, cs);
 
         // ── 4. RoPE (GPU kernel) ──
         cuda_rope(gpu->d_q, gpu->d_k, HD, pos, cfg->rope_theta, NH, NKV, cs);
@@ -700,17 +693,12 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
     cudaMemcpyAsync(gpu->h_expert_weights, gpu->d_expert_weights,
                     K * sizeof(float), cudaMemcpyDeviceToHost, cs);
     // Record event after D2H copies — sync deferred until we need the data
-    cudaEvent_t router_done;
-    cudaEventCreateWithFlags(&router_done, cudaEventDisableTiming);
-    cudaEventRecord(router_done, cs);
+    cudaEventRecord(gpu->ev_router, cs);
 
     // ── 11 + 12. Expert load (cache-first) + forward on GPU ──
     t0 = now_ms();
     ExpertLayerFile *elf = &ctx->expert_layers[layer];
-    if (elf->fd <= 0 && !elf->mmap_data) {
-        cudaEventDestroy(router_done);
-        return;
-    }
+    if (elf->fd <= 0 && !elf->mmap_data) return;
 
     size_t expert_size = elf->expert_size;
     size_t gate_sz = elf->gate_size > 0 ? elf->gate_size : expert_size / 3;
@@ -728,8 +716,7 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
         prefetch_wait(gpu, gpu->n_prefetched);
 
     // Now sync: we need expert_indices/weights on host for classification
-    cudaEventSynchronize(router_done);
-    cudaEventDestroy(router_done);
+    cudaEventSynchronize(gpu->ev_router);
     int *expert_indices = gpu->h_expert_indices;
     float *expert_weights_h = gpu->h_expert_weights;
     t1 = now_ms();
@@ -910,11 +897,8 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
                     d = gpu->d_expert_buf;
                 }
 
-                cudaEvent_t upload_done;
-                cudaEventCreateWithFlags(&upload_done, cudaEventDisableTiming);
-                cudaEventRecord(upload_done, gpu->stream_io);
-                cudaStreamWaitEvent(cs, upload_done, 0);
-                cudaEventDestroy(upload_done);
+                cudaEventRecord(gpu->ev_upload, gpu->stream_io);
+                cudaStreamWaitEvent(cs, gpu->ev_upload, 0);
 
                 matvec(d, gpu->d_normed, gpu->d_expert_gate, EFF, H, 12, cs);
                 matvec((char *)d + gate_sz, gpu->d_normed, gpu->d_expert_up, EFF, H, 12, cs);

@@ -136,6 +136,10 @@ typedef struct {
     int   *h_expert_indices;    // pinned: K expert IDs from top-k
     float *h_expert_weights;    // pinned: K expert weights from top-k
 
+    // Pre-created CUDA events (avoid per-layer create/destroy overhead)
+    cudaEvent_t ev_router;        // router D2H completion
+    cudaEvent_t ev_upload;        // expert upload completion (reused per expert)
+
     // Gated Delta Net state (hybrid models only, NULL if pure attention)
     float *d_gdn_state;      // [n_gdn_layers, num_v_heads, key_head_dim, value_head_dim] persistent
     float *d_conv_state;     // [n_gdn_layers, conv1d_dim, conv_kernel-1] persistent

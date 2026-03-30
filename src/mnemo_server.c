@@ -661,7 +661,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  %s <model_dir> --http <port>       HTTP API server\n", argv[0]);
         fprintf(stderr, "  %s <model_dir> \"prompt\"            Single generation\n", argv[0]);
         fprintf(stderr, "\nOptions:\n");
-        fprintf(stderr, "  --context N     Context length (default 8192, range 128-131072)\n");
+        fprintf(stderr, "  --context N     Context length (default 2048, range 128-131072)\n");
         fprintf(stderr, "  --bind ADDR     Bind address for HTTP (default 127.0.0.1)\n");
         fprintf(stderr, "  --warmup MODE   Warmup mode: off, light (1 prompt), full (6 prompts, default)\n");
         fprintf(stderr, "  --auth TOKEN    Require Bearer token for HTTP requests\n");
