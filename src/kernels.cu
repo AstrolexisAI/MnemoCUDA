@@ -69,54 +69,73 @@ __global__ void matvec_q4k(
     float          *__restrict__ y,
     int n_rows, int n_cols
 ) {
-    // Cooperatively load x-vector into shared memory (all warps share it).
-    // For H=6144: 24KB shared mem — fits comfortably.
-    extern __shared__ float s_x[];
-    for (int i = threadIdx.x; i < n_cols; i += blockDim.x)
-        s_x[i] = x[i];
-    __syncthreads();
+    // Tiled x-vector: load 256 floats (1KB) per tile, aligned with Q4K blocks.
+    // All warps in the block process the same tile's Q4K block for their own row.
+    // 1KB shared vs 16KB → allows 12+ blocks/SM instead of 3.
+    __shared__ float s_tile[256];
 
-    int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    int warps_per_block = blockDim.x / 32;
+    int row = blockIdx.x * warps_per_block + (threadIdx.x / 32);
     int lane = threadIdx.x % 32;
-    if (row >= n_rows) return;
 
     int blocks_per_row = (n_cols + 255) / 256;
-    const BlockQ4K *row_blocks = weights + row * blocks_per_row;
 
     float sum = 0.0f;
 
-    for (int b = lane; b < blocks_per_row; b += 32) {
-        const BlockQ4K &blk = row_blocks[b];
-        float d   = f16_to_f32(blk.d);
-        float dmin = f16_to_f32(blk.dmin);
-        const uint8_t *q = blk.qs;
+    // Iterate over Q4K blocks (tiles of 256 elements of x)
+    for (int b = 0; b < blocks_per_row; b++) {
+        // Cooperatively load x-tile into shared memory
         int base = b * 256;
-        int is = 0;
+        for (int i = threadIdx.x; i < 256 && (base + i) < n_cols; i += blockDim.x)
+            s_tile[i] = x[base + i];
+        __syncthreads();
 
-        for (int j = 0; j < 256; j += 64) {
-            uint8_t sc1, m1, sc2, m2;
-            get_scale_min_k4(is, blk.scales, sc1, m1);
-            float d1 = d * sc1, m1f = dmin * m1;
-            get_scale_min_k4(is + 1, blk.scales, sc2, m2);
-            float d2 = d * sc2, m2f = dmin * m2;
+        if (row < n_rows) {
+            const BlockQ4K &blk = weights[row * blocks_per_row + b];
+            float d   = f16_to_f32(blk.d);
+            float dmin = f16_to_f32(blk.dmin);
+            const uint8_t *q = blk.qs;
 
-            for (int l = 0; l < 32 && (base + j + l) < n_cols; l++)
-                sum += (d1 * (q[l] & 0xF) - m1f) * s_x[base + j + l];
-            for (int l = 0; l < 32 && (base + j + 32 + l) < n_cols; l++)
-                sum += (d2 * (q[l] >> 4) - m2f) * s_x[base + j + 32 + l];
+            // Each lane processes a subset of the 256 values
+            for (int j = lane; j < 256 && (base + j) < n_cols; j += 32) {
+                int sub = j / 32;  // sub-block index (0..7)
+                uint8_t sc, m;
+                get_scale_min_k4(sub, blk.scales, sc, m);
+                float dsc = d * sc, mf = dmin * m;
 
-            q += 32;
-            is += 2;
+                uint8_t q_val;
+                if (j % 64 < 32)
+                    q_val = q[j / 2] & 0xF;        // low nibble
+                else
+                    q_val = q[(j - 32) / 2] >> 4;   // high nibble (same byte)
+
+                // Corrected qs indexing: within each 64-value group,
+                // first 32 use low nibbles of qs[0..31], next 32 use high nibbles
+                int grp64 = j / 64;     // which 64-value group (0..3)
+                int within = j % 64;    // position within group
+                int qs_off = grp64 * 32;
+                if (within < 32) {
+                    q_val = q[qs_off + within] & 0xF;
+                    get_scale_min_k4(grp64 * 2, blk.scales, sc, m);
+                } else {
+                    q_val = q[qs_off + (within - 32)] >> 4;
+                    get_scale_min_k4(grp64 * 2 + 1, blk.scales, sc, m);
+                }
+                dsc = d * sc; mf = dmin * m;
+                sum += (dsc * q_val - mf) * s_tile[j];
+            }
         }
+        __syncthreads();
     }
 
-    sum = warp_reduce_sum(sum);
-    if (lane == 0) y[row] = sum;
+    if (row < n_rows) {
+        sum = warp_reduce_sum(sum);
+        if (lane == 0) y[row] = sum;
+    }
 }
 
 // ── Q4_K Dual Matvec (gate + up projections in one kernel) ──
-// Computes two matvecs with the same input vector x: y_a = Wa @ x, y_b = Wb @ x.
-// Shares the x-vector read and shared memory load — halves global bandwidth for x.
+// Tiled x-vector: 256 floats (1KB) per tile.
 __global__ void matvec_q4k_dual(
     const BlockQ4K *__restrict__ weights_a,
     const BlockQ4K *__restrict__ weights_b,
@@ -125,105 +144,106 @@ __global__ void matvec_q4k_dual(
     float          *__restrict__ y_b,
     int n_rows, int n_cols
 ) {
-    extern __shared__ float s_x[];
-    for (int i = threadIdx.x; i < n_cols; i += blockDim.x) s_x[i] = x[i];
-    __syncthreads();
-
-    int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    __shared__ float s_tile[256];
+    int warps_per_block = blockDim.x / 32;
+    int row = blockIdx.x * warps_per_block + (threadIdx.x / 32);
     int lane = threadIdx.x % 32;
-    if (row >= n_rows) return;
-
     int blocks_per_row = (n_cols + 255) / 256;
-    const BlockQ4K *row_a = weights_a + row * blocks_per_row;
-    const BlockQ4K *row_b = weights_b + row * blocks_per_row;
 
     float sum_a = 0.0f, sum_b = 0.0f;
 
-    for (int b = lane; b < blocks_per_row; b += 32) {
-        const BlockQ4K &blk_a = row_a[b];
-        const BlockQ4K &blk_b = row_b[b];
-        float da = f16_to_f32(blk_a.d), dmin_a = f16_to_f32(blk_a.dmin);
-        float db = f16_to_f32(blk_b.d), dmin_b = f16_to_f32(blk_b.dmin);
-        const uint8_t *qa = blk_a.qs, *qb = blk_b.qs;
+    for (int b = 0; b < blocks_per_row; b++) {
         int base = b * 256;
-        int is = 0;
+        for (int i = threadIdx.x; i < 256 && (base + i) < n_cols; i += blockDim.x)
+            s_tile[i] = x[base + i];
+        __syncthreads();
 
-        for (int j = 0; j < 256; j += 64) {
-            uint8_t sc1a, m1a, sc2a, m2a, sc1b, m1b, sc2b, m2b;
-            get_scale_min_k4(is,     blk_a.scales, sc1a, m1a);
-            get_scale_min_k4(is + 1, blk_a.scales, sc2a, m2a);
-            get_scale_min_k4(is,     blk_b.scales, sc1b, m1b);
-            get_scale_min_k4(is + 1, blk_b.scales, sc2b, m2b);
+        if (row < n_rows) {
+            const BlockQ4K &blk_a = weights_a[row * blocks_per_row + b];
+            const BlockQ4K &blk_b = weights_b[row * blocks_per_row + b];
+            float da = f16_to_f32(blk_a.d), dmin_a = f16_to_f32(blk_a.dmin);
+            float db = f16_to_f32(blk_b.d), dmin_b = f16_to_f32(blk_b.dmin);
+            const uint8_t *qa = blk_a.qs, *qb = blk_b.qs;
 
-            float d1a = da * sc1a, m1fa = dmin_a * m1a;
-            float d2a = da * sc2a, m2fa = dmin_a * m2a;
-            float d1b = db * sc1b, m1fb = dmin_b * m1b;
-            float d2b = db * sc2b, m2fb = dmin_b * m2b;
-
-            for (int l = 0; l < 32 && (base + j + l) < n_cols; l++) {
-                float xv = s_x[base + j + l];
-                sum_a += (d1a * (qa[l] & 0xF) - m1fa) * xv;
-                sum_b += (d1b * (qb[l] & 0xF) - m1fb) * xv;
+            for (int j = lane; j < 256 && (base + j) < n_cols; j += 32) {
+                int grp64 = j / 64, within = j % 64;
+                int qs_off = grp64 * 32;
+                uint8_t sc_a, m_a, sc_b, m_b; uint8_t qva, qvb;
+                if (within < 32) {
+                    qva = qa[qs_off + within] & 0xF;
+                    qvb = qb[qs_off + within] & 0xF;
+                    get_scale_min_k4(grp64 * 2, blk_a.scales, sc_a, m_a);
+                    get_scale_min_k4(grp64 * 2, blk_b.scales, sc_b, m_b);
+                } else {
+                    qva = qa[qs_off + (within - 32)] >> 4;
+                    qvb = qb[qs_off + (within - 32)] >> 4;
+                    get_scale_min_k4(grp64 * 2 + 1, blk_a.scales, sc_a, m_a);
+                    get_scale_min_k4(grp64 * 2 + 1, blk_b.scales, sc_b, m_b);
+                }
+                float xv = s_tile[j];
+                sum_a += (da * sc_a * qva - dmin_a * m_a) * xv;
+                sum_b += (db * sc_b * qvb - dmin_b * m_b) * xv;
             }
-            for (int l = 0; l < 32 && (base + j + 32 + l) < n_cols; l++) {
-                float xv = s_x[base + j + 32 + l];
-                sum_a += (d2a * (qa[l] >> 4) - m2fa) * xv;
-                sum_b += (d2b * (qb[l] >> 4) - m2fb) * xv;
-            }
-            qa += 32; qb += 32;
-            is += 2;
         }
+        __syncthreads();
     }
 
-    sum_a = warp_reduce_sum(sum_a);
-    sum_b = warp_reduce_sum(sum_b);
-    if (lane == 0) { y_a[row] = sum_a; y_b[row] = sum_b; }
+    if (row < n_rows) {
+        sum_a = warp_reduce_sum(sum_a);
+        sum_b = warp_reduce_sum(sum_b);
+        if (lane == 0) { y_a[row] = sum_a; y_b[row] = sum_b; }
+    }
 }
 
 // ── Q4_K Matvec + Scaled Accumulate (fused down-projection + weighted add) ──
-// y[row] += scale * dot(weights[row], x) — avoids separate scaled_add kernel.
+// Tiled x-vector: 256 floats (1KB) per tile.
 __global__ void matvec_q4k_scaled_add(
     const BlockQ4K *__restrict__ weights,
     const float    *__restrict__ x,
     float          *__restrict__ y,
     int n_rows, int n_cols, float scale
 ) {
-    extern __shared__ float s_x[];
-    for (int i = threadIdx.x; i < n_cols; i += blockDim.x)
-        s_x[i] = x[i];
-    __syncthreads();
-
-    int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    __shared__ float s_tile[256];
+    int warps_per_block = blockDim.x / 32;
+    int row = blockIdx.x * warps_per_block + (threadIdx.x / 32);
     int lane = threadIdx.x % 32;
-    if (row >= n_rows) return;
-
     int blocks_per_row = (n_cols + 255) / 256;
-    const BlockQ4K *row_blocks = weights + row * blocks_per_row;
 
     float sum = 0.0f;
-    for (int b = lane; b < blocks_per_row; b += 32) {
-        const BlockQ4K &blk = row_blocks[b];
-        float d   = f16_to_f32(blk.d);
-        float dmin = f16_to_f32(blk.dmin);
-        const uint8_t *q = blk.qs;
+
+    for (int b = 0; b < blocks_per_row; b++) {
         int base = b * 256;
-        int is = 0;
-        for (int j = 0; j < 256; j += 64) {
-            uint8_t sc1, m1, sc2, m2;
-            get_scale_min_k4(is, blk.scales, sc1, m1);
-            float d1 = d * sc1, m1f = dmin * m1;
-            get_scale_min_k4(is + 1, blk.scales, sc2, m2);
-            float d2 = d * sc2, m2f = dmin * m2;
-            for (int l = 0; l < 32 && (base + j + l) < n_cols; l++)
-                sum += (d1 * (q[l] & 0xF) - m1f) * s_x[base + j + l];
-            for (int l = 0; l < 32 && (base + j + 32 + l) < n_cols; l++)
-                sum += (d2 * (q[l] >> 4) - m2f) * s_x[base + j + 32 + l];
-            q += 32;
-            is += 2;
+        for (int i = threadIdx.x; i < 256 && (base + i) < n_cols; i += blockDim.x)
+            s_tile[i] = x[base + i];
+        __syncthreads();
+
+        if (row < n_rows) {
+            const BlockQ4K &blk = weights[row * blocks_per_row + b];
+            float d   = f16_to_f32(blk.d);
+            float dmin = f16_to_f32(blk.dmin);
+            const uint8_t *q = blk.qs;
+
+            for (int j = lane; j < 256 && (base + j) < n_cols; j += 32) {
+                int grp64 = j / 64, within = j % 64;
+                int qs_off = grp64 * 32;
+                uint8_t sc, m, q_val;
+                if (within < 32) {
+                    q_val = q[qs_off + within] & 0xF;
+                    get_scale_min_k4(grp64 * 2, blk.scales, sc, m);
+                } else {
+                    q_val = q[qs_off + (within - 32)] >> 4;
+                    get_scale_min_k4(grp64 * 2 + 1, blk.scales, sc, m);
+                }
+                sum += (d * sc * q_val - dmin * m) * s_tile[j];
+            }
         }
+        __syncthreads();
     }
-    sum = warp_reduce_sum(sum);
-    if (lane == 0) y[row] += scale * sum;
+
+    if (row < n_rows) {
+        sum = warp_reduce_sum(sum);
+        if (lane == 0) y[row] += scale * sum;
+    }
 }
 
 // ── Q6_K Dequantized Matrix-Vector Multiply ──
@@ -858,8 +878,7 @@ void cuda_matvec_q4k(const void *weights, const float *x, float *y,
     int warps_per_block = 4;
     int threads = warps_per_block * 32;
     int blocks = (n_rows + warps_per_block - 1) / warps_per_block;
-    size_t smem = n_cols * sizeof(float);  // shared memory for x-vector cache
-    matvec_q4k<<<blocks, threads, smem, stream>>>(
+    matvec_q4k<<<blocks, threads, 0, stream>>>(
         (const BlockQ4K *)weights, x, y, n_rows, n_cols);
     KERNEL_LAUNCH_CHECK();
 }
@@ -870,8 +889,7 @@ void cuda_matvec_q4k_dual(const void *wa, const void *wb, const float *x,
     int warps_per_block = 4;
     int threads = warps_per_block * 32;
     int blocks = (n_rows + warps_per_block - 1) / warps_per_block;
-    size_t smem = n_cols * sizeof(float);
-    matvec_q4k_dual<<<blocks, threads, smem, stream>>>(
+    matvec_q4k_dual<<<blocks, threads, 0, stream>>>(
         (const BlockQ4K *)wa, (const BlockQ4K *)wb, x, ya, yb, n_rows, n_cols);
     KERNEL_LAUNCH_CHECK();
 }
@@ -882,8 +900,7 @@ void cuda_matvec_q4k_scaled_add(const void *weights, const float *x, float *y,
     int warps_per_block = 4;
     int threads = warps_per_block * 32;
     int blocks = (n_rows + warps_per_block - 1) / warps_per_block;
-    size_t smem = n_cols * sizeof(float);
-    matvec_q4k_scaled_add<<<blocks, threads, smem, stream>>>(
+    matvec_q4k_scaled_add<<<blocks, threads, 0, stream>>>(
         (const BlockQ4K *)weights, x, y, n_rows, n_cols, scale);
     KERNEL_LAUNCH_CHECK();
 }
