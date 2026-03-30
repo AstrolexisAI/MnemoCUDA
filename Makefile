@@ -30,6 +30,9 @@ $(BUILD_DIR):
 $(BUILD_DIR)/kernels.o: src/kernels.cu | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) -arch=$(GPU_ARCH) -Xcompiler -fPIC -c $< -o $@
 
+$(BUILD_DIR)/gemm_q4k.o: src/gemm_q4k.cu src/mma.cuh | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) -arch=$(GPU_ARCH) -Xcompiler -fPIC -c $< -o $@
+
 # Engine modules
 $(BUILD_DIR)/engine.o: src/engine.c src/engine.h src/engine_internal.h src/log.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -fPIC -c $< -o $@
@@ -50,16 +53,16 @@ $(BUILD_DIR)/json_helpers.o: src/json_helpers.c src/json_helpers.h | $(BUILD_DIR
 	$(CC) $(CFLAGS) -fPIC -c $< -o $@
 
 # Shared library
-$(BUILD_DIR)/libmnemo_cuda.so: $(BUILD_DIR)/kernels.o $(ENGINE_OBJS)
+$(BUILD_DIR)/libmnemo_cuda.so: $(BUILD_DIR)/kernels.o $(BUILD_DIR)/gemm_q4k.o $(ENGINE_OBJS)
 	$(NVCC) -shared -o $@ $^ $(NVCC_LDFLAGS)
 
 # Server binary
-$(BUILD_DIR)/mnemo_server: src/mnemo_server.c src/log.h $(BUILD_DIR)/kernels.o $(ENGINE_OBJS)
-	$(CC) $(CFLAGS) -o $@ $< $(BUILD_DIR)/kernels.o $(ENGINE_OBJS) $(LDFLAGS)
+$(BUILD_DIR)/mnemo_server: src/mnemo_server.c src/log.h $(BUILD_DIR)/kernels.o $(BUILD_DIR)/gemm_q4k.o $(ENGINE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $< $(BUILD_DIR)/kernels.o $(BUILD_DIR)/gemm_q4k.o $(ENGINE_OBJS) $(LDFLAGS)
 
 # Tests
-$(BUILD_DIR)/test_engine: tests/test_engine.c $(BUILD_DIR)/kernels.o $(ENGINE_OBJS)
-	$(CC) $(CFLAGS) -o $@ $< $(BUILD_DIR)/kernels.o $(ENGINE_OBJS) $(LDFLAGS)
+$(BUILD_DIR)/test_engine: tests/test_engine.c $(BUILD_DIR)/kernels.o $(BUILD_DIR)/gemm_q4k.o $(ENGINE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $< $(BUILD_DIR)/kernels.o $(BUILD_DIR)/gemm_q4k.o $(ENGINE_OBJS) $(LDFLAGS)
 
 $(BUILD_DIR)/test_heat: tests/test_heat.c
 	$(CC) -O2 -Wall -o $@ $< -lm
