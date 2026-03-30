@@ -1394,6 +1394,50 @@ void cuda_f32_to_int8_kv(const float *in, void *out, float *scales,
     KERNEL_LAUNCH_CHECK();
 }
 
+// Fused dual INT8 KV store: K and V in one launch (NKV*2 blocks)
+__global__ void f32_to_int8_kv_dual_kernel(
+    const float *__restrict__ in_a, const float *__restrict__ in_b,
+    int8_t *__restrict__ out_a, int8_t *__restrict__ out_b,
+    float *__restrict__ scales_a, float *__restrict__ scales_b,
+    int head_dim, int n_kv_heads
+) {
+    int head_idx = blockIdx.x;
+    int tid = threadIdx.x;
+    bool is_b = (head_idx >= n_kv_heads);
+    int head = is_b ? (head_idx - n_kv_heads) : head_idx;
+    const float *head_in = (is_b ? in_b : in_a) + head * head_dim;
+    int8_t *head_out = (is_b ? out_b : out_a) + head * head_dim;
+    float *scale_out = is_b ? scales_b : scales_a;
+
+    extern __shared__ float smem[];
+    float local_max = 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x)
+        local_max = fmaxf(local_max, fabsf(head_in[d]));
+    smem[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] = fmaxf(smem[tid], smem[tid + s]);
+        __syncthreads();
+    }
+    float absmax = smem[0];
+    float scale_inv = (absmax > 0.0f) ? 127.0f / absmax : 0.0f;
+    if (tid == 0) scale_out[head] = (absmax > 0.0f) ? absmax / 127.0f : 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        int iv = __float2int_rn(head_in[d] * scale_inv);
+        head_out[d] = (int8_t)(iv > 127 ? 127 : (iv < -127 ? -127 : iv));
+    }
+}
+
+void cuda_f32_to_int8_kv_dual(const float *k, const float *v,
+                               void *out_k, void *out_v,
+                               float *k_scales, float *v_scales,
+                               int head_dim, int n_kv_heads, cudaStream_t stream) {
+    int threads = (head_dim < 256) ? head_dim : 256;
+    f32_to_int8_kv_dual_kernel<<<n_kv_heads * 2, threads, threads * sizeof(float), stream>>>(
+        k, v, (int8_t *)out_k, (int8_t *)out_v, k_scales, v_scales, head_dim, n_kv_heads);
+    KERNEL_LAUNCH_CHECK();
+}
+
 void cuda_attention_int8kv(const float *q, const void *kv_k, const void *kv_v,
                            const float *k_scales, const float *v_scales,
                            float *out, int n_heads_q, int head_dim, int n_kv_heads,

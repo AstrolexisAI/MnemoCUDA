@@ -80,6 +80,10 @@ extern void cuda_rms_norm_batched(const float *input, const float *weight, float
 extern void cuda_kernels_init(void);
 extern void cuda_f32_to_int8_kv(const float *in, void *out, float *scales,
                                 int head_dim, int n_kv_heads, cudaStream_t stream);
+extern void cuda_f32_to_int8_kv_dual(const float *k, const float *v,
+                                     void *out_k, void *out_v,
+                                     float *k_scales, float *v_scales,
+                                     int head_dim, int n_kv_heads, cudaStream_t stream);
 extern void cuda_attention_int8kv(const float *q, const void *kv_k, const void *kv_v,
                                   const float *k_scales, const float *v_scales,
                                   float *out, int n_heads_q, int head_dim, int n_kv_heads,
@@ -682,8 +686,8 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
             size_t scale_offset = (size_t)(local_layer * ctx_len + pos) * NKV;
             float *k_sc_dst = gpu->d_kv_k_scales + scale_offset;
             float *v_sc_dst = gpu->d_kv_v_scales + scale_offset;
-            cuda_f32_to_int8_kv(gpu->d_k, kv_k_dst, k_sc_dst, HD, NKV, cs);
-            cuda_f32_to_int8_kv(gpu->d_v, kv_v_dst, v_sc_dst, HD, NKV, cs);
+            cuda_f32_to_int8_kv_dual(gpu->d_k, gpu->d_v, kv_k_dst, kv_v_dst,
+                                     k_sc_dst, v_sc_dst, HD, NKV, cs);
 
             // ── 6. Attention with INT8 KV ──
             void *kv_k_layer = (int8_t *)gpu->d_kv_k + local_layer * kv_layer_stride;
