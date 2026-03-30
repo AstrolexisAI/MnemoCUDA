@@ -114,6 +114,72 @@ __global__ void matvec_q4k(
     if (lane == 0) y[row] = sum;
 }
 
+// ── Q4_K Dual Matvec (gate + up projections in one kernel) ──
+// Computes two matvecs with the same input vector x: y_a = Wa @ x, y_b = Wb @ x.
+// Shares the x-vector read and shared memory load — halves global bandwidth for x.
+__global__ void matvec_q4k_dual(
+    const BlockQ4K *__restrict__ weights_a,
+    const BlockQ4K *__restrict__ weights_b,
+    const float    *__restrict__ x,
+    float          *__restrict__ y_a,
+    float          *__restrict__ y_b,
+    int n_rows, int n_cols
+) {
+    extern __shared__ float s_x[];
+    for (int i = threadIdx.x; i < n_cols; i += blockDim.x) s_x[i] = x[i];
+    __syncthreads();
+
+    int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    int lane = threadIdx.x % 32;
+    if (row >= n_rows) return;
+
+    int blocks_per_row = (n_cols + 255) / 256;
+    const BlockQ4K *row_a = weights_a + row * blocks_per_row;
+    const BlockQ4K *row_b = weights_b + row * blocks_per_row;
+
+    float sum_a = 0.0f, sum_b = 0.0f;
+
+    for (int b = lane; b < blocks_per_row; b += 32) {
+        const BlockQ4K &blk_a = row_a[b];
+        const BlockQ4K &blk_b = row_b[b];
+        float da = f16_to_f32(blk_a.d), dmin_a = f16_to_f32(blk_a.dmin);
+        float db = f16_to_f32(blk_b.d), dmin_b = f16_to_f32(blk_b.dmin);
+        const uint8_t *qa = blk_a.qs, *qb = blk_b.qs;
+        int base = b * 256;
+        int is = 0;
+
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc1a, m1a, sc2a, m2a, sc1b, m1b, sc2b, m2b;
+            get_scale_min_k4(is,     blk_a.scales, sc1a, m1a);
+            get_scale_min_k4(is + 1, blk_a.scales, sc2a, m2a);
+            get_scale_min_k4(is,     blk_b.scales, sc1b, m1b);
+            get_scale_min_k4(is + 1, blk_b.scales, sc2b, m2b);
+
+            float d1a = da * sc1a, m1fa = dmin_a * m1a;
+            float d2a = da * sc2a, m2fa = dmin_a * m2a;
+            float d1b = db * sc1b, m1fb = dmin_b * m1b;
+            float d2b = db * sc2b, m2fb = dmin_b * m2b;
+
+            for (int l = 0; l < 32 && (base + j + l) < n_cols; l++) {
+                float xv = s_x[base + j + l];
+                sum_a += (d1a * (qa[l] & 0xF) - m1fa) * xv;
+                sum_b += (d1b * (qb[l] & 0xF) - m1fb) * xv;
+            }
+            for (int l = 0; l < 32 && (base + j + 32 + l) < n_cols; l++) {
+                float xv = s_x[base + j + 32 + l];
+                sum_a += (d2a * (qa[l] >> 4) - m2fa) * xv;
+                sum_b += (d2b * (qb[l] >> 4) - m2fb) * xv;
+            }
+            qa += 32; qb += 32;
+            is += 2;
+        }
+    }
+
+    sum_a = warp_reduce_sum(sum_a);
+    sum_b = warp_reduce_sum(sum_b);
+    if (lane == 0) { y_a[row] = sum_a; y_b[row] = sum_b; }
+}
+
 // ── Q4_K Matvec + Scaled Accumulate (fused down-projection + weighted add) ──
 // y[row] += scale * dot(weights[row], x) — avoids separate scaled_add kernel.
 __global__ void matvec_q4k_scaled_add(
@@ -176,6 +242,9 @@ __global__ void matvec_q6k(
     float          *__restrict__ y,
     int n_rows, int n_cols
 ) {
+    extern __shared__ float s_x[];
+    for (int i = threadIdx.x; i < n_cols; i += blockDim.x) s_x[i] = x[i];
+    __syncthreads();
     int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
     int lane = threadIdx.x % 32;
     if (row >= n_rows) return;
@@ -223,7 +292,7 @@ __global__ void matvec_q6k(
                     // Scale: 16 groups of 16, so scale index = val_within_half / 16
                     int si = sc_off + (grp * 32 + l) / 16;
                     float scale = d_all * sc[si];
-                    sum += scale * val * x[base + val_idx];
+                    sum += scale * val * s_x[base + val_idx];
                 }
             }
         }
@@ -251,6 +320,9 @@ __global__ void matvec_q3k(
     float          *__restrict__ y,
     int n_rows, int n_cols
 ) {
+    extern __shared__ float s_x[];
+    for (int i = threadIdx.x; i < n_cols; i += blockDim.x) s_x[i] = x[i];
+    __syncthreads();
     int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
     int lane = threadIdx.x % 32;
     if (row >= n_rows) return;
@@ -289,7 +361,7 @@ __global__ void matvec_q3k(
                     if (idx < n_cols) {
                         int8_t q2 = (q[l] >> shift) & 3;
                         int8_t val = q2 - ((blk.hmask[l] & m) ? 0 : 4);
-                        sum += dl * val * x[idx];
+                        sum += dl * val * s_x[idx];
                     }
                     val_idx++;
                 }
@@ -299,7 +371,7 @@ __global__ void matvec_q3k(
                     if (idx < n_cols) {
                         int8_t q2 = (q[l + 16] >> shift) & 3;
                         int8_t val = q2 - ((blk.hmask[l + 16] & m) ? 0 : 4);
-                        sum += dl2 * val * x[idx];
+                        sum += dl2 * val * s_x[idx];
                     }
                     val_idx++;
                 }
@@ -331,6 +403,9 @@ __global__ void matvec_q5k(
     float          *__restrict__ y,
     int n_rows, int n_cols
 ) {
+    extern __shared__ float s_x[];
+    for (int i = threadIdx.x; i < n_cols; i += blockDim.x) s_x[i] = x[i];
+    __syncthreads();
     int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
     int lane = threadIdx.x % 32;
     if (row >= n_rows) return;
@@ -359,12 +434,12 @@ __global__ void matvec_q5k(
             for (int l = 0; l < 32 && (base + j + l) < n_cols; l++) {
                 uint8_t lo4 = q[l] & 0xF;
                 uint8_t hi = (qh[(j + l) / 8] >> ((j + l) % 8)) & 1;
-                sum += (d1 * (lo4 | (hi << 4)) - m1f) * x[base + j + l];
+                sum += (d1 * (lo4 | (hi << 4)) - m1f) * s_x[base + j + l];
             }
             for (int l = 0; l < 32 && (base + j + 32 + l) < n_cols; l++) {
                 uint8_t lo4 = q[l] >> 4;
                 uint8_t hi = (qh[(j + 32 + l) / 8] >> ((j + 32 + l) % 8)) & 1;
-                sum += (d2 * (lo4 | (hi << 4)) - m2f) * x[base + j + 32 + l];
+                sum += (d2 * (lo4 | (hi << 4)) - m2f) * s_x[base + j + 32 + l];
             }
 
             q += 32;
@@ -384,6 +459,9 @@ __global__ void matvec_q8_0(
     float           *__restrict__ y,
     int n_rows, int n_cols
 ) {
+    extern __shared__ float s_x[];
+    for (int i = threadIdx.x; i < n_cols; i += blockDim.x) s_x[i] = x[i];
+    __syncthreads();
     int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
     int lane = threadIdx.x % 32;
     if (row >= n_rows) return;
@@ -399,7 +477,7 @@ __global__ void matvec_q8_0(
         int base = b * 32;
 
         for (int j = 0; j < 32 && (base + j) < n_cols; j++)
-            sum += d * blk.qs[j] * x[base + j];
+            sum += d * blk.qs[j] * s_x[base + j];
     }
 
     sum = warp_reduce_sum(sum);
@@ -518,6 +596,9 @@ __global__ void moe_combine_kernel(
 }
 
 // ── RoPE (Rotary Position Embedding) ──
+// Frequencies precalculated in constant memory (avoids powf per thread)
+__constant__ float d_rope_freqs[256];  // max head_dim/2 = 128
+static int d_rope_freqs_init = 0;
 
 __global__ void rope_kernel(
     float *__restrict__ q,     // [n_heads * head_dim]
@@ -530,7 +611,6 @@ __global__ void rope_kernel(
     int total = (n_heads_q + n_heads_k) * half_dim;
     if (tid >= total) return;
 
-    // Determine if this thread handles Q or K
     float *vec;
     int head, j;
     if (tid < n_heads_q * half_dim) {
@@ -544,10 +624,10 @@ __global__ void rope_kernel(
         j = offset % half_dim;
     }
 
-    float freq = 1.0f / powf(theta, (float)(2 * j) / (float)head_dim);
+    float freq = d_rope_freqs[j];
     float angle = (float)pos * freq;
-    float cos_a = cosf(angle);
-    float sin_a = sinf(angle);
+    float sin_a, cos_a;
+    __sincosf(angle, &sin_a, &cos_a);
 
     int idx = head * head_dim + j;
     float v0 = vec[idx];
@@ -620,12 +700,17 @@ __global__ void attention_kernel(
         if (tile_end > seq_len) tile_end = seq_len;
         int tile_len = tile_end - tile_start;
 
-        for (int i = tid; i < tile_len; i += blockDim.x) {
-            int p = tile_start + i;
-            const float *kp = kv_k + (size_t)p * kv_stride + (size_t)kv_head * head_dim;
-            float dot = 0.0f;
-            for (int d = 0; d < head_dim; d++) dot += s_q[d] * kp[d];
-            tile_scores[i] = dot * scale;
+        // Q @ K^T: warp-cooperative
+        {
+            int n_warps = blockDim.x / 32;
+            for (int pos_idx = warp_id; pos_idx < tile_len; pos_idx += n_warps) {
+                int p = tile_start + pos_idx;
+                const float *kp = kv_k + (size_t)p * kv_stride + (size_t)kv_head * head_dim;
+                float partial = 0.0f;
+                for (int d = lane; d < head_dim; d += 32) partial += s_q[d] * kp[d];
+                partial = warp_reduce_sum(partial);
+                if (lane == 0) tile_scores[pos_idx] = partial * scale;
+            }
         }
         __syncthreads();
 
@@ -779,6 +864,18 @@ void cuda_matvec_q4k(const void *weights, const float *x, float *y,
     KERNEL_LAUNCH_CHECK();
 }
 
+void cuda_matvec_q4k_dual(const void *wa, const void *wb, const float *x,
+                          float *ya, float *yb,
+                          int n_rows, int n_cols, cudaStream_t stream) {
+    int warps_per_block = 4;
+    int threads = warps_per_block * 32;
+    int blocks = (n_rows + warps_per_block - 1) / warps_per_block;
+    size_t smem = n_cols * sizeof(float);
+    matvec_q4k_dual<<<blocks, threads, smem, stream>>>(
+        (const BlockQ4K *)wa, (const BlockQ4K *)wb, x, ya, yb, n_rows, n_cols);
+    KERNEL_LAUNCH_CHECK();
+}
+
 void cuda_matvec_q4k_scaled_add(const void *weights, const float *x, float *y,
                                 int n_rows, int n_cols, float scale,
                                 cudaStream_t stream) {
@@ -796,7 +893,8 @@ void cuda_matvec_q6k(const void *weights, const float *x, float *y,
     int warps_per_block = 4;
     int threads = warps_per_block * 32;
     int blocks = (n_rows + warps_per_block - 1) / warps_per_block;
-    matvec_q6k<<<blocks, threads, 0, stream>>>(
+    size_t smem = n_cols * sizeof(float);
+    matvec_q6k<<<blocks, threads, smem, stream>>>(
         (const BlockQ6K *)weights, x, y, n_rows, n_cols);
     KERNEL_LAUNCH_CHECK();
 }
@@ -806,7 +904,8 @@ void cuda_matvec_q5k(const void *weights, const float *x, float *y,
     int warps_per_block = 4;
     int threads = warps_per_block * 32;
     int blocks = (n_rows + warps_per_block - 1) / warps_per_block;
-    matvec_q5k<<<blocks, threads, 0, stream>>>(
+    size_t smem = n_cols * sizeof(float);
+    matvec_q5k<<<blocks, threads, smem, stream>>>(
         (const BlockQ5K *)weights, x, y, n_rows, n_cols);
     KERNEL_LAUNCH_CHECK();
 }
@@ -816,7 +915,8 @@ void cuda_matvec_q3k(const void *weights, const float *x, float *y,
     int warps_per_block = 4;
     int threads = warps_per_block * 32;
     int blocks = (n_rows + warps_per_block - 1) / warps_per_block;
-    matvec_q3k<<<blocks, threads, 0, stream>>>(
+    size_t smem = n_cols * sizeof(float);
+    matvec_q3k<<<blocks, threads, smem, stream>>>(
         (const BlockQ3K *)weights, x, y, n_rows, n_cols);
     KERNEL_LAUNCH_CHECK();
 }
@@ -826,7 +926,8 @@ void cuda_matvec_q8_0(const void *weights, const float *x, float *y,
     int warps_per_block = 4;
     int threads = warps_per_block * 32;
     int blocks = (n_rows + warps_per_block - 1) / warps_per_block;
-    matvec_q8_0<<<blocks, threads, 0, stream>>>(
+    size_t smem = n_cols * sizeof(float);
+    matvec_q8_0<<<blocks, threads, smem, stream>>>(
         (const BlockQ8_0 *)weights, x, y, n_rows, n_cols);
     KERNEL_LAUNCH_CHECK();
 }
@@ -875,6 +976,15 @@ void cuda_moe_combine(const float *expert_outs, const float *weights_arr,
 
 void cuda_rope(float *q, float *k, int head_dim, int pos, float theta,
                int n_heads_q, int n_heads_k, cudaStream_t stream) {
+    // Lazy init: precompute frequencies in constant memory once
+    if (!d_rope_freqs_init) {
+        float freqs[256];
+        int half = head_dim / 2;
+        for (int j = 0; j < half && j < 256; j++)
+            freqs[j] = 1.0f / powf(theta, (float)(2 * j) / (float)head_dim);
+        cudaMemcpyToSymbol(d_rope_freqs, freqs, half * sizeof(float));
+        d_rope_freqs_init = 1;
+    }
     int total = (n_heads_q + n_heads_k) * (head_dim / 2);
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
@@ -1006,15 +1116,19 @@ __global__ void attention_kernel_int8kv(
         if (tile_end > seq_len) tile_end = seq_len;
         int tile_len = tile_end - tile_start;
 
-        // Q @ K^T with INT8 dequant
-        for (int i = tid; i < tile_len; i += blockDim.x) {
-            int p = tile_start + i;
-            const int8_t *kp = kv_k + (size_t)p * kv_elem_stride + (size_t)kv_head * head_dim;
-            float k_sc = k_scales[p * kv_scale_stride + kv_head];
-            float dot = 0.0f;
-            for (int d = 0; d < head_dim; d++)
-                dot += s_q[d] * ((float)kp[d] * k_sc);
-            tile_scores[i] = dot * scale;
+        // Q @ K^T with INT8 dequant: warp-cooperative
+        {
+            int n_warps = blockDim.x / 32;
+            for (int pos_idx = warp_id; pos_idx < tile_len; pos_idx += n_warps) {
+                int p = tile_start + pos_idx;
+                const int8_t *kp = kv_k + (size_t)p * kv_elem_stride + (size_t)kv_head * head_dim;
+                float k_sc = k_scales[p * kv_scale_stride + kv_head];
+                float partial = 0.0f;
+                for (int d = lane; d < head_dim; d += 32)
+                    partial += s_q[d] * ((float)kp[d] * k_sc);
+                partial = warp_reduce_sum(partial);
+                if (lane == 0) tile_scores[pos_idx] = partial * scale;
+            }
         }
         __syncthreads();
 
@@ -1125,13 +1239,18 @@ __global__ void attention_kernel_f16kv(
         if (tile_end > seq_len) tile_end = seq_len;
         int tile_len = tile_end - tile_start;
 
-        // Q @ K^T: each thread handles one position, reads Q from shared mem
-        for (int i = tid; i < tile_len; i += blockDim.x) {
-            int p = tile_start + i;
-            const __half *kp = kv_k + (size_t)p * kv_stride + (size_t)kv_head * head_dim;
-            float dot = 0.0f;
-            for (int d = 0; d < head_dim; d++) dot += s_q[d] * __half2float(kp[d]);
-            tile_scores[i] = dot * scale;
+        // Q @ K^T: warp-cooperative (32 threads per position, shuffle reduce)
+        {
+            int n_warps = blockDim.x / 32;
+            for (int pos_idx = warp_id; pos_idx < tile_len; pos_idx += n_warps) {
+                int p = tile_start + pos_idx;
+                const __half *kp = kv_k + (size_t)p * kv_stride + (size_t)kv_head * head_dim;
+                float partial = 0.0f;
+                for (int d = lane; d < head_dim; d += 32)
+                    partial += s_q[d] * __half2float(kp[d]);
+                partial = warp_reduce_sum(partial);
+                if (lane == 0) tile_scores[pos_idx] = partial * scale;
+            }
         }
         __syncthreads();
 
@@ -1343,6 +1462,7 @@ void cuda_gdn_recurrence(const float *q, const float *k, const float *v,
 }
 
 // RMSNorm + Gated: output = rms_norm(x, w) * silu(z)
+// Parallel reduction for sum-of-squares across all threads.
 __global__ void rms_norm_gated_kernel(
     const float *__restrict__ x,
     const float *__restrict__ z,
@@ -1350,21 +1470,29 @@ __global__ void rms_norm_gated_kernel(
     float *__restrict__ out,
     int head_dim, int n_heads
 ) {
+    extern __shared__ float smem[];
     int head = blockIdx.x;
     if (head >= n_heads) return;
+    int tid = threadIdx.x;
 
     const float *x_h = x + head * head_dim;
     const float *z_h = z + head * head_dim;
     float *out_h = out + head * head_dim;
 
-    // RMS norm over head_dim
-    float sum_sq = 0.0f;
-    for (int d = 0; d < head_dim; d++)
-        sum_sq += x_h[d] * x_h[d];
-    float rms = rsqrtf(sum_sq / head_dim + 1e-6f);
+    // Parallel RMS norm reduction
+    float local_sum = 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x)
+        local_sum += x_h[d] * x_h[d];
+    smem[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(smem[0] / head_dim + 1e-6f);
 
     // Norm * weight * silu(z)
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+    for (int d = tid; d < head_dim; d += blockDim.x) {
         float normed = x_h[d] * rms * w[d];
         float z_val = z_h[d];
         float silu_z = z_val / (1.0f + expf(-z_val));
@@ -1376,7 +1504,7 @@ void cuda_rms_norm_gated(const float *x, const float *z, const float *w,
                          float *out, int head_dim, int n_heads,
                          cudaStream_t stream) {
     int threads = (head_dim < 128) ? head_dim : 128;
-    rms_norm_gated_kernel<<<n_heads, threads, 0, stream>>>(
+    rms_norm_gated_kernel<<<n_heads, threads, threads * sizeof(float), stream>>>(
         x, z, w, out, head_dim, n_heads);
     KERNEL_LAUNCH_CHECK();
 }

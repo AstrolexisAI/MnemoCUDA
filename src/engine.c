@@ -1195,6 +1195,9 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
 
     io_pool_init(config.io_threads);
     ctx->extra_prefetch = config.extra_prefetch;
+    // Auto-enable deep prefetch for large MoE models with sufficient I/O threads
+    if (!ctx->extra_prefetch && cfg->num_experts >= 32 && config.io_threads >= 4)
+        ctx->extra_prefetch = 1;
     cfg->kv_int8 = config.kv_int8;
     ctx->profiling_enabled = (getenv("MNEMO_PROFILE") != NULL);
 

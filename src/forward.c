@@ -123,6 +123,9 @@ static void *tensor_ptr_on_gpu(MnemoCudaCtx *ctx, TensorEntry *e, int gpu_idx) {
 
 // ── Matvec dispatch by quantization type ──
 
+extern void cuda_matvec_q4k_dual(const void *wa, const void *wb, const float *x,
+                                 float *ya, float *yb,
+                                 int n_rows, int n_cols, cudaStream_t stream);
 extern void cuda_matvec_q4k_scaled_add(const void *weights, const float *x, float *y,
                                        int n_rows, int n_cols, float scale,
                                        cudaStream_t stream);
@@ -964,25 +967,13 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
 
         // If there were no misses batches but we have hits, compute them now
         if (!hits_computed) {
-            for (int h = 0; h < n_hits; h++) {
-                void *d = hit_ptrs[h];
-                matvec(d, gpu->d_normed, gpu->d_expert_gate, EFF, H, 12, cs);
-                matvec((char *)d + gate_sz, gpu->d_normed, gpu->d_expert_up, EFF, H, 12, cs);
-                cuda_swiglu(gpu->d_expert_gate, gpu->d_expert_up, gpu->d_expert_act, EFF, cs);
-                matvec((char *)d + gate_sz + up_sz, gpu->d_expert_act, gpu->d_expert_out, H, EFF, down_type_id, cs);
-                cuda_scaled_add(gpu->d_moe_out, gpu->d_expert_out, hit_weights[h], H, cs);
-            }
+            for (int h = 0; h < n_hits; h++)
+                expert_fwd(gpu, hit_ptrs[h], gate_sz, up_sz, H, EFF, down_type_id, hit_weights[h], cs);
         }
     } else {
         // All hits — just compute
-        for (int h = 0; h < n_hits; h++) {
-            void *d = hit_ptrs[h];
-            matvec(d, gpu->d_normed, gpu->d_expert_gate, EFF, H, 12, cs);
-            matvec((char *)d + gate_sz, gpu->d_normed, gpu->d_expert_up, EFF, H, 12, cs);
-            cuda_swiglu(gpu->d_expert_gate, gpu->d_expert_up, gpu->d_expert_act, EFF, cs);
-            matvec((char *)d + gate_sz + up_sz, gpu->d_expert_act, gpu->d_expert_out, H, EFF, down_type_id, cs);
-            cuda_scaled_add(gpu->d_moe_out, gpu->d_expert_out, hit_weights[h], H, cs);
-        }
+        for (int h = 0; h < n_hits; h++)
+            expert_fwd(gpu, hit_ptrs[h], gate_sz, up_sz, H, EFF, down_type_id, hit_weights[h], cs);
     }
 
     // Profile: expert I/O + compute done
@@ -1032,8 +1023,10 @@ static void expert_fwd(GPUState *gpu, const void *expert_data,
                        size_t gate_sz, size_t up_sz,
                        int H, int EFF, int down_type_id,
                        float weight, cudaStream_t cs) {
-    matvec(expert_data, gpu->d_normed, gpu->d_expert_gate, EFF, H, 12, cs);
-    matvec((const char *)expert_data + gate_sz, gpu->d_normed, gpu->d_expert_up, EFF, H, 12, cs);
+    // Fused gate+up: single kernel reads x once, produces both outputs
+    cuda_matvec_q4k_dual(expert_data, (const char *)expert_data + gate_sz,
+                         gpu->d_normed, gpu->d_expert_gate, gpu->d_expert_up,
+                         EFF, H, cs);
     cuda_swiglu(gpu->d_expert_gate, gpu->d_expert_up, gpu->d_expert_act, EFF, cs);
 
     if (down_type_id == 12) {
