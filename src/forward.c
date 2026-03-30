@@ -67,6 +67,12 @@ extern void cuda_sample_token(const float *logits, int vocab_size,
                               int *d_result, cudaStream_t stream);
 extern void cuda_rms_norm_batched(const float *input, const float *weight, float *output,
                                   int head_dim, int n_heads, float eps, cudaStream_t stream);
+extern void cuda_f32_to_int8_kv(const float *in, void *out, float *scales,
+                                int head_dim, int n_kv_heads, cudaStream_t stream);
+extern void cuda_attention_int8kv(const float *q, const void *kv_k, const void *kv_v,
+                                  const float *k_scales, const float *v_scales,
+                                  float *out, int n_heads_q, int head_dim, int n_kv_heads,
+                                  int seq_len, int gqa_ratio, float scale, cudaStream_t stream);
 extern void cuda_classify_experts(const int *expert_indices,
                                   const int *cache_layer, const int *cache_expert,
                                   int *hit_slots, int *miss_mask,
@@ -638,25 +644,46 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
         // ── 4. RoPE (GPU kernel) ──
         cuda_rope(gpu->d_q, gpu->d_k, HD, pos, cfg->rope_theta, NH, NKV, cs);
 
-        // ── 5. KV cache store (FP32 → FP16 on GPU) ──
+        // ── 5. KV cache store ──
         int local_layer = layer - gpu->layer_start;
         int ctx_len = cfg->max_position_embeddings;
         size_t kv_layer_stride = (size_t)ctx_len * NKV * HD;
-
-        void *kv_k_dst = (char *)gpu->d_kv_k + (local_layer * kv_layer_stride + (size_t)pos * NKV * HD) * sizeof(uint16_t);
-        void *kv_v_dst = (char *)gpu->d_kv_v + (local_layer * kv_layer_stride + (size_t)pos * NKV * HD) * sizeof(uint16_t);
-        cuda_f32_to_f16(gpu->d_k, kv_k_dst, NKV * HD, cs);
-        cuda_f32_to_f16(gpu->d_v, kv_v_dst, NKV * HD, cs);
-
-        // ── 6. Attention: Q@K^T → softmax → @V (FP16 KV — half bandwidth) ──
-        void *kv_k_layer = (char *)gpu->d_kv_k + local_layer * kv_layer_stride * sizeof(uint16_t);
-        void *kv_v_layer = (char *)gpu->d_kv_v + local_layer * kv_layer_stride * sizeof(uint16_t);
         int gqa_ratio = NH / NKV;
         float attn_scale = 1.0f / sqrtf((float)HD);
         int seq_len = pos + 1;
 
-        cuda_attention_f16kv(gpu->d_q, kv_k_layer, kv_v_layer, gpu->d_attn_out,
-                             NH, HD, NKV, seq_len, gqa_ratio, attn_scale, cs);
+        if (cfg->kv_int8) {
+            // INT8 KV cache: quantize K/V per-head with absmax scaling
+            size_t kv_elem_offset = (local_layer * kv_layer_stride + (size_t)pos * NKV * HD);
+            void *kv_k_dst = (int8_t *)gpu->d_kv_k + kv_elem_offset;
+            void *kv_v_dst = (int8_t *)gpu->d_kv_v + kv_elem_offset;
+            size_t scale_offset = (size_t)(local_layer * ctx_len + pos) * NKV;
+            float *k_sc_dst = gpu->d_kv_k_scales + scale_offset;
+            float *v_sc_dst = gpu->d_kv_v_scales + scale_offset;
+            cuda_f32_to_int8_kv(gpu->d_k, kv_k_dst, k_sc_dst, HD, NKV, cs);
+            cuda_f32_to_int8_kv(gpu->d_v, kv_v_dst, v_sc_dst, HD, NKV, cs);
+
+            // ── 6. Attention with INT8 KV ──
+            void *kv_k_layer = (int8_t *)gpu->d_kv_k + local_layer * kv_layer_stride;
+            void *kv_v_layer = (int8_t *)gpu->d_kv_v + local_layer * kv_layer_stride;
+            float *k_scales_layer = gpu->d_kv_k_scales + (size_t)local_layer * ctx_len * NKV;
+            float *v_scales_layer = gpu->d_kv_v_scales + (size_t)local_layer * ctx_len * NKV;
+            cuda_attention_int8kv(gpu->d_q, kv_k_layer, kv_v_layer,
+                                  k_scales_layer, v_scales_layer, gpu->d_attn_out,
+                                  NH, HD, NKV, seq_len, gqa_ratio, attn_scale, cs);
+        } else {
+            // FP16 KV cache (default)
+            void *kv_k_dst = (char *)gpu->d_kv_k + (local_layer * kv_layer_stride + (size_t)pos * NKV * HD) * sizeof(uint16_t);
+            void *kv_v_dst = (char *)gpu->d_kv_v + (local_layer * kv_layer_stride + (size_t)pos * NKV * HD) * sizeof(uint16_t);
+            cuda_f32_to_f16(gpu->d_k, kv_k_dst, NKV * HD, cs);
+            cuda_f32_to_f16(gpu->d_v, kv_v_dst, NKV * HD, cs);
+
+            // ── 6. Attention with FP16 KV ──
+            void *kv_k_layer = (char *)gpu->d_kv_k + local_layer * kv_layer_stride * sizeof(uint16_t);
+            void *kv_v_layer = (char *)gpu->d_kv_v + local_layer * kv_layer_stride * sizeof(uint16_t);
+            cuda_attention_f16kv(gpu->d_q, kv_k_layer, kv_v_layer, gpu->d_attn_out,
+                                 NH, HD, NKV, seq_len, gqa_ratio, attn_scale, cs);
+        }
 
         // ── 7. Output projection + residual (GPU) ──
         TensorEntry *wo = LT.attn_output;

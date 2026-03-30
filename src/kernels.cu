@@ -69,6 +69,13 @@ __global__ void matvec_q4k(
     float          *__restrict__ y,
     int n_rows, int n_cols
 ) {
+    // Cooperatively load x-vector into shared memory (all warps share it).
+    // For H=6144: 24KB shared mem — fits comfortably.
+    extern __shared__ float s_x[];
+    for (int i = threadIdx.x; i < n_cols; i += blockDim.x)
+        s_x[i] = x[i];
+    __syncthreads();
+
     int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
     int lane = threadIdx.x % 32;
     if (row >= n_rows) return;
@@ -94,9 +101,9 @@ __global__ void matvec_q4k(
             float d2 = d * sc2, m2f = dmin * m2;
 
             for (int l = 0; l < 32 && (base + j + l) < n_cols; l++)
-                sum += (d1 * (q[l] & 0xF) - m1f) * x[base + j + l];
+                sum += (d1 * (q[l] & 0xF) - m1f) * s_x[base + j + l];
             for (int l = 0; l < 32 && (base + j + 32 + l) < n_cols; l++)
-                sum += (d2 * (q[l] >> 4) - m2f) * x[base + j + 32 + l];
+                sum += (d2 * (q[l] >> 4) - m2f) * s_x[base + j + 32 + l];
 
             q += 32;
             is += 2;
@@ -115,6 +122,11 @@ __global__ void matvec_q4k_scaled_add(
     float          *__restrict__ y,
     int n_rows, int n_cols, float scale
 ) {
+    extern __shared__ float s_x[];
+    for (int i = threadIdx.x; i < n_cols; i += blockDim.x)
+        s_x[i] = x[i];
+    __syncthreads();
+
     int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
     int lane = threadIdx.x % 32;
     if (row >= n_rows) return;
@@ -137,9 +149,9 @@ __global__ void matvec_q4k_scaled_add(
             get_scale_min_k4(is + 1, blk.scales, sc2, m2);
             float d2 = d * sc2, m2f = dmin * m2;
             for (int l = 0; l < 32 && (base + j + l) < n_cols; l++)
-                sum += (d1 * (q[l] & 0xF) - m1f) * x[base + j + l];
+                sum += (d1 * (q[l] & 0xF) - m1f) * s_x[base + j + l];
             for (int l = 0; l < 32 && (base + j + 32 + l) < n_cols; l++)
-                sum += (d2 * (q[l] >> 4) - m2f) * x[base + j + 32 + l];
+                sum += (d2 * (q[l] >> 4) - m2f) * s_x[base + j + 32 + l];
             q += 32;
             is += 2;
         }
@@ -761,7 +773,8 @@ void cuda_matvec_q4k(const void *weights, const float *x, float *y,
     int warps_per_block = 4;
     int threads = warps_per_block * 32;
     int blocks = (n_rows + warps_per_block - 1) / warps_per_block;
-    matvec_q4k<<<blocks, threads, 0, stream>>>(
+    size_t smem = n_cols * sizeof(float);  // shared memory for x-vector cache
+    matvec_q4k<<<blocks, threads, smem, stream>>>(
         (const BlockQ4K *)weights, x, y, n_rows, n_cols);
     KERNEL_LAUNCH_CHECK();
 }
@@ -772,7 +785,8 @@ void cuda_matvec_q4k_scaled_add(const void *weights, const float *x, float *y,
     int warps_per_block = 4;
     int threads = warps_per_block * 32;
     int blocks = (n_rows + warps_per_block - 1) / warps_per_block;
-    matvec_q4k_scaled_add<<<blocks, threads, 0, stream>>>(
+    size_t smem = n_cols * sizeof(float);
+    matvec_q4k_scaled_add<<<blocks, threads, smem, stream>>>(
         (const BlockQ4K *)weights, x, y, n_rows, n_cols, scale);
     KERNEL_LAUNCH_CHECK();
 }
@@ -910,6 +924,170 @@ __global__ void f32_to_f16_kernel(const float *in, __half *out, int n) {
 
 void cuda_f32_to_f16(const float *in, void *out, int n, cudaStream_t stream) {
     f32_to_f16_kernel<<<(n+255)/256, 256, 0, stream>>>(in, (__half *)out, n);
+    KERNEL_LAUNCH_CHECK();
+}
+
+// ── FP32 → INT8 conversion with per-head absmax scaling ──
+// For each head: find absmax, scale = absmax / 127, store int8 + scale.
+// scales[pos * n_kv_heads + head] = absmax / 127
+
+__global__ void f32_to_int8_kv_kernel(
+    const float *__restrict__ in,  // [n_kv_heads * head_dim]
+    int8_t      *__restrict__ out, // [n_kv_heads * head_dim]
+    float       *__restrict__ scales, // [n_kv_heads] — one scale per head
+    int head_dim, int n_kv_heads
+) {
+    int head = blockIdx.x;
+    if (head >= n_kv_heads) return;
+    int tid = threadIdx.x;
+    const float *head_in = in + head * head_dim;
+    int8_t *head_out = out + head * head_dim;
+
+    // Find absmax within this head
+    extern __shared__ float smem[];
+    float local_max = 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x)
+        local_max = fmaxf(local_max, fabsf(head_in[d]));
+    smem[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] = fmaxf(smem[tid], smem[tid + s]);
+        __syncthreads();
+    }
+    float absmax = smem[0];
+    float scale_inv = (absmax > 0.0f) ? 127.0f / absmax : 0.0f;
+
+    // Store scale
+    if (tid == 0) scales[head] = (absmax > 0.0f) ? absmax / 127.0f : 0.0f;
+
+    // Quantize
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float v = head_in[d] * scale_inv;
+        int iv = __float2int_rn(v);
+        if (iv > 127) iv = 127;
+        if (iv < -127) iv = -127;
+        head_out[d] = (int8_t)iv;
+    }
+}
+
+// ── Attention with INT8 KV cache ──
+// Same online softmax tiled approach as FP16 version, but dequantizes
+// K and V from INT8 using per-position per-head scale factors.
+
+__global__ void attention_kernel_int8kv(
+    const float  *__restrict__ q,
+    const int8_t *__restrict__ kv_k,     // [seq_len, n_kv_heads, head_dim] int8
+    const int8_t *__restrict__ kv_v,     // [seq_len, n_kv_heads, head_dim] int8
+    const float  *__restrict__ k_scales, // [seq_len, n_kv_heads]
+    const float  *__restrict__ v_scales, // [seq_len, n_kv_heads]
+    float *__restrict__ out,
+    int head_dim, int n_kv_heads, int seq_len, int gqa_ratio, float scale
+) {
+    int head = blockIdx.x, kv_head = head / gqa_ratio, tid = threadIdx.x;
+    extern __shared__ float shared[];
+    float *tile_scores = shared;
+    float *s_q = shared + ATTN_TILE;
+    __shared__ float smax[32], ssum[32];
+    int warp_id = tid / 32, lane = tid % 32;
+    const float *qh = q + head * head_dim;
+    int kv_elem_stride = n_kv_heads * head_dim;
+    int kv_scale_stride = n_kv_heads;
+    float *out_h = out + head * head_dim;
+
+    for (int d = tid; d < head_dim; d += blockDim.x)
+        s_q[d] = qh[d];
+    __syncthreads();
+
+    float global_max = -1e30f, global_sum = 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x) out_h[d] = 0.0f;
+
+    for (int tile_start = 0; tile_start < seq_len; tile_start += ATTN_TILE) {
+        int tile_end = tile_start + ATTN_TILE;
+        if (tile_end > seq_len) tile_end = seq_len;
+        int tile_len = tile_end - tile_start;
+
+        // Q @ K^T with INT8 dequant
+        for (int i = tid; i < tile_len; i += blockDim.x) {
+            int p = tile_start + i;
+            const int8_t *kp = kv_k + (size_t)p * kv_elem_stride + (size_t)kv_head * head_dim;
+            float k_sc = k_scales[p * kv_scale_stride + kv_head];
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++)
+                dot += s_q[d] * ((float)kp[d] * k_sc);
+            tile_scores[i] = dot * scale;
+        }
+        __syncthreads();
+
+        // Find tile max
+        float tile_max = -1e30f;
+        for (int i = tid; i < tile_len; i += blockDim.x)
+            if (tile_scores[i] > tile_max) tile_max = tile_scores[i];
+        for (int o = 16; o > 0; o >>= 1)
+            tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, o));
+        if (lane == 0 && warp_id < 32) smax[warp_id] = tile_max;
+        __syncthreads();
+        if (tid == 0) { float m = smax[0]; for (int i = 1; i < (blockDim.x+31)/32; i++) m = fmaxf(m, smax[i]); smax[0] = m; }
+        __syncthreads();
+        tile_max = smax[0];
+
+        float new_max = fmaxf(global_max, tile_max);
+        float rescale = (global_sum > 0.0f) ? expf(global_max - new_max) : 0.0f;
+        __syncthreads();
+        for (int d = tid; d < head_dim; d += blockDim.x) out_h[d] *= rescale;
+        float new_sum = global_sum * rescale;
+
+        for (int i = tid; i < tile_len; i += blockDim.x)
+            tile_scores[i] = expf(tile_scores[i] - new_max);
+        __syncthreads();
+
+        float local_sum = 0.0f;
+        for (int i = tid; i < tile_len; i += blockDim.x) local_sum += tile_scores[i];
+        for (int o = 16; o > 0; o >>= 1) local_sum += __shfl_xor_sync(0xffffffff, local_sum, o);
+        if (lane == 0 && warp_id < 32) ssum[warp_id] = local_sum;
+        __syncthreads();
+        if (tid == 0) { float s = ssum[0]; for (int i = 1; i < (blockDim.x+31)/32; i++) s += ssum[i]; ssum[0] = s; }
+        __syncthreads();
+
+        // V accumulation with INT8 dequant
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            float val = 0.0f;
+            for (int i = 0; i < tile_len; i++) {
+                int p = tile_start + i;
+                float v_sc = v_scales[p * kv_scale_stride + kv_head];
+                val += tile_scores[i] * ((float)kv_v[(size_t)p * kv_elem_stride + (size_t)kv_head * head_dim + d] * v_sc);
+            }
+            out_h[d] += val;
+        }
+
+        global_max = new_max;
+        global_sum = new_sum + ssum[0];
+        __syncthreads();
+    }
+
+    if (global_sum > 0.0f) {
+        for (int d = tid; d < head_dim; d += blockDim.x)
+            out_h[d] /= global_sum;
+    }
+}
+
+// ── INT8 KV cache wrappers ──
+
+void cuda_f32_to_int8_kv(const float *in, void *out, float *scales,
+                         int head_dim, int n_kv_heads, cudaStream_t stream) {
+    int threads = (head_dim < 256) ? head_dim : 256;
+    f32_to_int8_kv_kernel<<<n_kv_heads, threads, threads * sizeof(float), stream>>>(
+        in, (int8_t *)out, scales, head_dim, n_kv_heads);
+    KERNEL_LAUNCH_CHECK();
+}
+
+void cuda_attention_int8kv(const float *q, const void *kv_k, const void *kv_v,
+                           const float *k_scales, const float *v_scales,
+                           float *out, int n_heads_q, int head_dim, int n_kv_heads,
+                           int seq_len, int gqa_ratio, float scale, cudaStream_t stream) {
+    size_t smem = (ATTN_TILE + head_dim + 64) * sizeof(float);
+    attention_kernel_int8kv<<<n_heads_q, 256, smem, stream>>>(
+        q, (const int8_t *)kv_k, (const int8_t *)kv_v, k_scales, v_scales,
+        out, head_dim, n_kv_heads, seq_len, gqa_ratio, scale);
     KERNEL_LAUNCH_CHECK();
 }
 

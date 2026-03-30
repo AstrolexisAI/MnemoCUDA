@@ -970,12 +970,20 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
 
         // KV cache — FP16 (half the VRAM of FP32)
         int n_layers = gpu->layer_end - gpu->layer_start;
-        size_t kv_per_tok = (size_t)NKV * HD * sizeof(uint16_t);
+        size_t kv_bytes_per_elem = config.kv_int8 ? sizeof(int8_t) : sizeof(uint16_t);
+        size_t kv_per_tok = (size_t)NKV * HD * kv_bytes_per_elem;
         size_t kv_size = (size_t)n_layers * config.context_length * kv_per_tok;
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_kv_k, kv_size));
         CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_kv_v, kv_size));
         CUDA_LOAD_CHECK(cudaMemset(gpu->d_kv_k, 0, kv_size));
         CUDA_LOAD_CHECK(cudaMemset(gpu->d_kv_v, 0, kv_size));
+        if (config.kv_int8) {
+            size_t scales_size = (size_t)n_layers * config.context_length * NKV * sizeof(float);
+            CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_kv_k_scales, scales_size));
+            CUDA_LOAD_CHECK(cudaMalloc((void**)&gpu->d_kv_v_scales, scales_size));
+            CUDA_LOAD_CHECK(cudaMemset(gpu->d_kv_k_scales, 0, scales_size));
+            CUDA_LOAD_CHECK(cudaMemset(gpu->d_kv_v_scales, 0, scales_size));
+        }
 
         LOG_INFO("GPU %d: KV cache %.1f MB FP16 (%d ctx), expert buf %.1f MB",
                 gpu->gpu_id, (double)kv_size*2 / (1024*1024), config.context_length,
@@ -1187,6 +1195,7 @@ int mnemo_cuda_load(MnemoCudaCtx *ctx, MnemoCudaConfig config) {
 
     io_pool_init(config.io_threads);
     ctx->extra_prefetch = config.extra_prefetch;
+    cfg->kv_int8 = config.kv_int8;
     ctx->profiling_enabled = (getenv("MNEMO_PROFILE") != NULL);
 
     // Pre-cache per-layer tensor pointers (avoids snprintf+hash per layer per token)
@@ -1272,6 +1281,7 @@ void mnemo_cuda_unload(MnemoCudaCtx *ctx) {
         cudaFree(gpu->d_sampled_token);
         if (gpu->h_sampled_token) cudaFreeHost(gpu->h_sampled_token);
         cudaFree(gpu->d_kv_k); cudaFree(gpu->d_kv_v);
+        cudaFree(gpu->d_kv_k_scales); cudaFree(gpu->d_kv_v_scales);
         cudaFree(gpu->d_expert_buf);
         cudaFree(gpu->d_expert_cache);
         cudaFree(gpu->d_cache_layer);

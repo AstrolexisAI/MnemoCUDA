@@ -668,6 +668,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  --io-threads N  I/O pool threads (default 8, max 16)\n");
         fprintf(stderr, "  --cache-pct N   VRAM %% for expert cache (default: auto)\n");
         fprintf(stderr, "  --extra-prefetch  Enable 2-layer-ahead prefetch for higher throughput\n");
+        fprintf(stderr, "  --kv-int8         Use INT8 KV cache (half bandwidth vs FP16)\n");
         return 1;
     }
 
@@ -682,6 +683,10 @@ int main(int argc, char **argv) {
     const char *auth_token = getenv("MNEMO_AUTH_TOKEN");
     int warmup_mode = 2;  // 0=off, 1=light, 2=full
     for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--kv-int8") == 0) {
+            config.kv_int8 = 1;
+            continue;
+        }
         if (strcmp(argv[i], "--extra-prefetch") == 0) {
             config.extra_prefetch = 1;
             continue;

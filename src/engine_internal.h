@@ -41,6 +41,7 @@ typedef struct {
     int ssm_conv_kernel;          // Causal conv kernel size (e.g., 4)
     int ssm_group_count;          // num_key_heads (e.g., 16)
     int ssm_dt_rank;              // num_value_heads (e.g., 64)
+    int kv_int8;                  // 1 = use INT8 KV cache (half bandwidth vs FP16)
 } ModelConfig;
 
 // ── Expert layer file ──
@@ -97,6 +98,7 @@ typedef struct {
     size_t expert_buf_size;
 
     void *d_kv_k, *d_kv_v;
+    float *d_kv_k_scales, *d_kv_v_scales;  // INT8 KV per-position per-head scales
 
     float *d_router_out;
     int   *d_expert_indices;
