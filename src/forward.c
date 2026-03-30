@@ -31,6 +31,16 @@ extern void cuda_matvec_f32(const float *weights, const float *x, float *y,
                             int n_rows, int n_cols, cudaStream_t stream);
 extern void cuda_matvec_q4k(const void *weights, const float *x, float *y,
                             int n_rows, int n_cols, cudaStream_t stream);
+extern void cuda_matvec_q4k_add(const void *weights, const float *x, const float *residual,
+                                float *y, int n_rows, int n_cols, cudaStream_t stream);
+extern void cuda_f32_to_f16_dual(const float *a, const float *b,
+                                 void *oa, void *ob, int n, cudaStream_t stream);
+extern void cuda_rms_norm_qk(float *q, float *k,
+                              const float *q_weight, const float *k_weight,
+                              int head_dim, int n_q, int n_k, float eps, cudaStream_t stream);
+extern void cuda_rms_norm_residual(const float *input, const float *weight,
+                                   float *normed_output, float *residual_output,
+                                   int n, float eps, cudaStream_t stream);
 extern void cuda_matvec_q6k(const void *weights, const float *x, float *y,
                             int n_rows, int n_cols, cudaStream_t stream);
 extern void cuda_swiglu(const float *gate, const float *up, float *out,
@@ -610,16 +620,13 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
 
     t0 = now_ms();
     if (is_attention_layer) {
-        // ── 1. Pre-attention RMS norm ──
+        // ── 1. Pre-attention RMS norm + residual save (fused: 1 launch instead of 2) ──
         TensorEntry *an = LT.attn_norm;
         if (an) {
             void *norm_w = tensor_ptr_on_gpu(ctx, an, gpu_idx);
-            cuda_rms_norm(gpu->d_hidden, (float *)norm_w, gpu->d_normed, H, eps, cs);
+            cuda_rms_norm_residual(gpu->d_hidden, (float *)norm_w,
+                                   gpu->d_normed, gpu->d_residual, H, eps, cs);
         }
-
-        // Save residual
-        cudaMemcpyAsync(gpu->d_residual, gpu->d_hidden, H * sizeof(float),
-                        cudaMemcpyDeviceToDevice, cs);
 
         // ── 2. Q/K/V projections (GPU dequant matvec) ──
         TensorEntry *wq = LT.attn_q;
@@ -641,16 +648,20 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
                             gpu->d_normed, gpu->d_v, NKV * HD, H, wv->type_id, cs);
         }
 
-        // ── 3. QK norms (optional, Qwen3 uses them) — batched: 1 launch per Q, 1 per K ──
+        // ── 3. QK norms (fused: Q+K in 1 launch) ──
         TensorEntry *qn = LT.attn_q_norm;
-        if (qn)
-            cuda_rms_norm_batched(gpu->d_q, (float *)tensor_ptr_on_gpu(ctx, qn, gpu_idx),
-                                  gpu->d_q, HD, NH, eps, cs);
-
         TensorEntry *kn = LT.attn_k_norm;
-        if (kn)
-            cuda_rms_norm_batched(gpu->d_k, (float *)tensor_ptr_on_gpu(ctx, kn, gpu_idx),
-                                  gpu->d_k, HD, NKV, eps, cs);
+        if (qn && kn) {
+            cuda_rms_norm_qk(gpu->d_q, gpu->d_k,
+                             (float *)tensor_ptr_on_gpu(ctx, qn, gpu_idx),
+                             (float *)tensor_ptr_on_gpu(ctx, kn, gpu_idx),
+                             HD, NH, NKV, eps, cs);
+        } else {
+            if (qn) cuda_rms_norm_batched(gpu->d_q, (float *)tensor_ptr_on_gpu(ctx, qn, gpu_idx),
+                                          gpu->d_q, HD, NH, eps, cs);
+            if (kn) cuda_rms_norm_batched(gpu->d_k, (float *)tensor_ptr_on_gpu(ctx, kn, gpu_idx),
+                                          gpu->d_k, HD, NKV, eps, cs);
+        }
 
         // ── 4. RoPE (GPU kernel) ──
         cuda_rope(gpu->d_q, gpu->d_k, HD, pos, cfg->rope_theta, NH, NKV, cs);
@@ -686,8 +697,7 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
             // FP16 KV cache (default)
             void *kv_k_dst = (char *)gpu->d_kv_k + (local_layer * kv_layer_stride + (size_t)pos * NKV * HD) * sizeof(uint16_t);
             void *kv_v_dst = (char *)gpu->d_kv_v + (local_layer * kv_layer_stride + (size_t)pos * NKV * HD) * sizeof(uint16_t);
-            cuda_f32_to_f16(gpu->d_k, kv_k_dst, NKV * HD, cs);
-            cuda_f32_to_f16(gpu->d_v, kv_v_dst, NKV * HD, cs);
+            cuda_f32_to_f16_dual(gpu->d_k, gpu->d_v, kv_k_dst, kv_v_dst, NKV * HD, cs);
 
             // ── 6. Attention with FP16 KV ──
             void *kv_k_layer = (char *)gpu->d_kv_k + local_layer * kv_layer_stride * sizeof(uint16_t);
@@ -696,12 +706,17 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
                                  NH, HD, NKV, seq_len, gqa_ratio, attn_scale, cs);
         }
 
-        // ── 7. Output projection + residual (GPU) ──
+        // ── 7. Output projection + residual (fused: 1 launch instead of 2) ──
         TensorEntry *wo = LT.attn_output;
-        if (wo) matvec(tensor_ptr_on_gpu(ctx, wo, gpu_idx),
-                        gpu->d_attn_out, gpu->d_hidden, H, NH * HD, wo->type_id, cs);
-
-        cuda_residual_add(gpu->d_hidden, gpu->d_residual, gpu->d_hidden, H, cs);
+        if (wo && wo->type_id == 12) {
+            cuda_matvec_q4k_add(tensor_ptr_on_gpu(ctx, wo, gpu_idx),
+                                gpu->d_attn_out, gpu->d_residual, gpu->d_hidden,
+                                H, NH * HD, cs);
+        } else {
+            if (wo) matvec(tensor_ptr_on_gpu(ctx, wo, gpu_idx),
+                            gpu->d_attn_out, gpu->d_hidden, H, NH * HD, wo->type_id, cs);
+            cuda_residual_add(gpu->d_hidden, gpu->d_residual, gpu->d_hidden, H, cs);
+        }
     } else {
         // Gated Delta Net layer: linear attention with delta rule
         forward_gdn_block(ctx, layer, gpu_idx);
@@ -720,11 +735,8 @@ void forward_layer(MnemoCudaCtx *ctx, int layer, int gpu_idx, int pos) {
     if (!fn) return;
     void *ffn_norm_w = tensor_ptr_on_gpu(ctx, fn, gpu_idx);
     if (!ffn_norm_w) return;
-    cuda_rms_norm(gpu->d_hidden, (float *)ffn_norm_w, gpu->d_normed, H, eps, cs);
-
-    // Save residual for MoE skip connection
-    cudaMemcpyAsync(gpu->d_residual, gpu->d_hidden, H * sizeof(float),
-                    cudaMemcpyDeviceToDevice, cs);
+    cuda_rms_norm_residual(gpu->d_hidden, (float *)ffn_norm_w,
+                           gpu->d_normed, gpu->d_residual, H, eps, cs);
 
     // ── 9. Router: F32 matvec on GPU ──
     TensorEntry *wr = LT.ffn_gate_inp;

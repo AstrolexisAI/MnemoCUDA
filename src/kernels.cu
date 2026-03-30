@@ -137,6 +137,60 @@ __global__ void matvec_q4k(
     }
 }
 
+// ── Q4_K Matvec + Residual Add (O_proj + skip connection fused) ──
+// y[row] = dot(weights[row], x) + residual[row]
+__global__ void matvec_q4k_add(
+    const BlockQ4K *__restrict__ weights,
+    const float    *__restrict__ x,
+    const float    *__restrict__ residual,
+    float          *__restrict__ y,
+    int n_rows, int n_cols
+) {
+    __shared__ float s_tile[256];
+    int warps_per_block = blockDim.x / 32;
+    int row = blockIdx.x * warps_per_block + (threadIdx.x / 32);
+    int lane = threadIdx.x % 32;
+    int blocks_per_row = (n_cols + 255) / 256;
+    float sum = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; b++) {
+        int base = b * 256;
+        for (int i = threadIdx.x; i < 256 && (base + i) < n_cols; i += blockDim.x)
+            s_tile[i] = x[base + i];
+        __syncthreads();
+        if (row < n_rows) {
+            const BlockQ4K *blk_ptr = &weights[(size_t)row * blocks_per_row + b];
+            float d = f16_to_f32(blk_ptr->d), dmin = f16_to_f32(blk_ptr->dmin);
+            uint32_t my_qs = ((const uint32_t *)blk_ptr->qs)[lane];
+            int grp = lane / 8, pos = (lane % 8) * 4;
+            uint8_t sc_lo, m_lo, sc_hi, m_hi;
+            get_scale_min_k4(grp * 2,     blk_ptr->scales, sc_lo, m_lo);
+            get_scale_min_k4(grp * 2 + 1, blk_ptr->scales, sc_hi, m_hi);
+            float d_lo = d * sc_lo, mf_lo = dmin * m_lo;
+            float d_hi = d * sc_hi, mf_hi = dmin * m_hi;
+            int lo_base = grp * 64 + pos;
+            if (lo_base + 3 < n_cols - base) {
+                sum += (d_lo * ((my_qs)       & 0xF) - mf_lo) * s_tile[lo_base];
+                sum += (d_lo * ((my_qs >> 8)  & 0xF) - mf_lo) * s_tile[lo_base + 1];
+                sum += (d_lo * ((my_qs >> 16) & 0xF) - mf_lo) * s_tile[lo_base + 2];
+                sum += (d_lo * ((my_qs >> 24) & 0xF) - mf_lo) * s_tile[lo_base + 3];
+            }
+            int hi_base = grp * 64 + 32 + pos;
+            if (hi_base + 3 < n_cols - base) {
+                sum += (d_hi * ((my_qs >> 4)  & 0xF) - mf_hi) * s_tile[hi_base];
+                sum += (d_hi * ((my_qs >> 12) & 0xF) - mf_hi) * s_tile[hi_base + 1];
+                sum += (d_hi * ((my_qs >> 20) & 0xF) - mf_hi) * s_tile[hi_base + 2];
+                sum += (d_hi * ((my_qs >> 28) & 0xF) - mf_hi) * s_tile[hi_base + 3];
+            }
+        }
+        __syncthreads();
+    }
+    if (row < n_rows) {
+        sum = warp_reduce_sum(sum);
+        if (lane == 0) y[row] = sum + residual[row];
+    }
+}
+
 // ── Q4_K Dual Matvec (gate + up projections in one kernel) ──
 // Vectorized uint32_t loads, same pattern as matvec_q4k.
 __global__ void matvec_q4k_dual(
@@ -585,6 +639,33 @@ __global__ void rms_norm_kernel(
         output[i] = input[i] * scale * weight[i];
 }
 
+// ── RMS Norm + Residual Save (fused: saves input to residual during norm pass) ──
+__global__ void rms_norm_residual_kernel(
+    const float *__restrict__ input,
+    const float *__restrict__ weight,
+    float       *__restrict__ normed_output,
+    float       *__restrict__ residual_output,
+    int n, float eps
+) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    float local_sum = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float v = input[i];
+        local_sum += v * v;
+        residual_output[i] = v;  // save residual during same read
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float scale = rsqrtf(sdata[0] / (float)n + eps);
+    for (int i = tid; i < n; i += blockDim.x)
+        normed_output[i] = input[i] * scale * weight[i];
+}
+
 // ── Batched RMS Norm (all heads in one launch) ──
 // Each block processes one head: input[block_id * head_dim .. (block_id+1) * head_dim]
 // Weight is shared across all heads (same norm weight vector of length head_dim).
@@ -915,6 +996,16 @@ void cuda_matvec_q4k(const void *weights, const float *x, float *y,
     KERNEL_LAUNCH_CHECK();
 }
 
+void cuda_matvec_q4k_add(const void *weights, const float *x, const float *residual,
+                         float *y, int n_rows, int n_cols, cudaStream_t stream) {
+    int warps_per_block = 4;
+    int threads = warps_per_block * 32;
+    int blocks = (n_rows + warps_per_block - 1) / warps_per_block;
+    matvec_q4k_add<<<blocks, threads, 0, stream>>>(
+        (const BlockQ4K *)weights, x, residual, y, n_rows, n_cols);
+    KERNEL_LAUNCH_CHECK();
+}
+
 void cuda_matvec_q4k_dual(const void *wa, const void *wb, const float *x,
                           float *ya, float *yb,
                           int n_rows, int n_cols, cudaStream_t stream) {
@@ -989,6 +1080,15 @@ void cuda_swiglu(const float *gate, const float *up, float *out,
     KERNEL_LAUNCH_CHECK();
 }
 
+void cuda_rms_norm_residual(const float *input, const float *weight,
+                            float *normed_output, float *residual_output,
+                            int n, float eps, cudaStream_t stream) {
+    int threads = 256;
+    rms_norm_residual_kernel<<<1, threads, threads * sizeof(float), stream>>>(
+        input, weight, normed_output, residual_output, n, eps);
+    KERNEL_LAUNCH_CHECK();
+}
+
 void cuda_rms_norm(const float *input, const float *weight, float *output,
                    int n, float eps, cudaStream_t stream) {
     int threads = 256;
@@ -997,11 +1097,46 @@ void cuda_rms_norm(const float *input, const float *weight, float *output,
     KERNEL_LAUNCH_CHECK();
 }
 
+// Fused Q+K norm: blocks 0..n_q-1 normalize Q, blocks n_q..n_q+n_k-1 normalize K
+__global__ void rms_norm_qk_kernel(
+    float *__restrict__ q, float *__restrict__ k,
+    const float *__restrict__ q_weight, const float *__restrict__ k_weight,
+    int head_dim, int n_q, int n_k, float eps
+) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int head = blockIdx.x;
+    float *data;
+    const float *weight;
+    if (head < n_q) { data = q + head * head_dim; weight = q_weight; }
+    else { data = k + (head - n_q) * head_dim; weight = k_weight; }
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x) { float v = data[i]; local_sum += v * v; }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads();
+    }
+    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);
+    for (int i = tid; i < head_dim; i += blockDim.x)
+        data[i] = data[i] * scale * weight[i];
+}
+
 void cuda_rms_norm_batched(const float *input, const float *weight, float *output,
                            int head_dim, int n_heads, float eps, cudaStream_t stream) {
     int threads = (head_dim < 256) ? head_dim : 256;
     rms_norm_batched_kernel<<<n_heads, threads, threads * sizeof(float), stream>>>(
         input, weight, output, head_dim, eps);
+    KERNEL_LAUNCH_CHECK();
+}
+
+void cuda_rms_norm_qk(float *q, float *k,
+                       const float *q_weight, const float *k_weight,
+                       int head_dim, int n_q, int n_k, float eps, cudaStream_t stream) {
+    int threads = (head_dim < 256) ? head_dim : 256;
+    rms_norm_qk_kernel<<<n_q + n_k, threads, threads * sizeof(float), stream>>>(
+        q, k, q_weight, k_weight, head_dim, n_q, n_k, eps);
     KERNEL_LAUNCH_CHECK();
 }
 
@@ -1083,6 +1218,22 @@ __global__ void f32_to_f16_kernel(const float *in, __half *out, int n) {
 
 void cuda_f32_to_f16(const float *in, void *out, int n, cudaStream_t stream) {
     f32_to_f16_kernel<<<(n+255)/256, 256, 0, stream>>>(in, (__half *)out, n);
+    KERNEL_LAUNCH_CHECK();
+}
+
+// Fused dual: converts K and V to FP16 in one launch
+__global__ void f32_to_f16_dual_kernel(
+    const float *__restrict__ a, const float *__restrict__ b,
+    __half *__restrict__ oa, __half *__restrict__ ob, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { oa[i] = __float2half(a[i]); ob[i] = __float2half(b[i]); }
+}
+
+void cuda_f32_to_f16_dual(const float *a, const float *b,
+                           void *oa, void *ob, int n, cudaStream_t stream) {
+    f32_to_f16_dual_kernel<<<(n+255)/256, 256, 0, stream>>>(
+        a, b, (__half *)oa, (__half *)ob, n);
     KERNEL_LAUNCH_CHECK();
 }
 
